@@ -63,6 +63,10 @@ struct Target {
 struct Selected {
     package: Package,
     package_id: String,
+    /// Canonicalized package root. `entry` and `host_src_path` are canonical
+    /// too, so this is the only prefix that can be stripped from them; the
+    /// manifest path from Cargo metadata is not canonical and does not match.
+    package_root: PathBuf,
     entry: PathBuf,
     host_bin: String,
     host_src_path: PathBuf,
@@ -670,7 +674,7 @@ fn select_package_optional(
         .ok_or_else(|| CliError("package manifest has no parent".into()))?;
     let package_root = fs::canonicalize(package_root).map_err(io_error)?;
     let entry = fs::canonicalize(package_root.join(&entry)).map_err(io_error)?;
-    if !entry.starts_with(package_root) || !entry.is_file() {
+    if !entry.starts_with(&package_root) || !entry.is_file() {
         return Err(CliError("Snacc entry must be a package-owned file".into()));
     }
     let host_target = package
@@ -688,6 +692,7 @@ fn select_package_optional(
     Ok(Some(Selected {
         package,
         package_id,
+        package_root,
         entry,
         host_bin,
         host_src_path,
@@ -791,13 +796,7 @@ fn emit_cached(selected: &Selected, source: &str, options: &Options) -> Result<P
 fn package_relative_entry(selected: &Selected) -> &Path {
     selected
         .entry
-        .strip_prefix(
-            selected
-                .package
-                .manifest_path
-                .parent()
-                .unwrap_or(Path::new(".")),
-        )
+        .strip_prefix(&selected.package_root)
         .unwrap_or(&selected.entry)
 }
 
@@ -1289,6 +1288,7 @@ mod tests {
                 metadata: None,
             },
             package_id: "path+file:///workspace#app@0.1.0".into(),
+            package_root: PathBuf::from("C:/workspace"),
             entry: PathBuf::from("C:/workspace/src/main.nrs"),
             host_bin: "app".into(),
             host_src_path: PathBuf::from("C:/workspace/src/main.rs"),
@@ -1325,6 +1325,57 @@ mod tests {
         assert_eq!(
             cargo_executable(messages, &selected(), "app", "bin"),
             Some(PathBuf::from("right.exe"))
+        );
+    }
+
+    /// Builds a `Selected` the way package selection does: from a real
+    /// directory, with `package_root` and `entry` both canonicalized. On
+    /// Windows that produces `\\?\C:\...` extended-length paths, which a plain
+    /// `C:/...` fixture never reproduces.
+    fn canonical_selected(root: &Path) -> Selected {
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.nrs"), "print(0)\n").unwrap();
+        fs::write(root.join("Cargo.toml"), "").unwrap();
+        let package_root = fs::canonicalize(root).unwrap();
+        let entry = fs::canonicalize(package_root.join("src/main.nrs")).unwrap();
+        let mut selected = selected();
+        // The manifest path stays as Cargo metadata reports it: not canonical.
+        selected.package.manifest_path = root.join("Cargo.toml");
+        selected.package_root = package_root;
+        selected.entry = entry;
+        selected
+    }
+
+    #[test]
+    fn package_relative_entry_strips_a_canonicalized_package_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let selected = canonical_selected(directory.path());
+        assert_eq!(
+            package_relative_entry(&selected),
+            Path::new("src").join("main.nrs")
+        );
+    }
+
+    #[test]
+    fn rendered_assertions_name_the_entry_relative_to_the_package() {
+        let directory = tempfile::tempdir().unwrap();
+        let selected = canonical_selected(directory.path());
+        let source =
+            "extern rust \"snacc_user_double\" fun double(value: Int64): Int64\nprint(double(2))";
+        let checked = snacc_compiler::check(source).expect("bridge declaration should check");
+        let rendered =
+            render_bridge_assertions(&checked, package_relative_entry(&selected), source);
+
+        assert!(
+            rendered.contains("// snacc: double (src\\main.nrs:1:1)")
+                || rendered.contains("// snacc: double (src/main.nrs:1:1)"),
+            "assertion comment must name the entry relative to the package, got:\n{rendered}"
+        );
+        // A leaked absolute path pushes the `line:column` suffix past the width
+        // rustc renders, which is the whole point of the trailing comment.
+        assert!(
+            !rendered.contains("\\\\?\\"),
+            "assertion comment leaked an extended-length path:\n{rendered}"
         );
     }
 
