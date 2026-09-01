@@ -1,11 +1,21 @@
-temp/
-bin/
-
+.tmp/
+/bin/
+/target/
 *.exe
 *.a
 *.o
 
 node_modules/
 
-bin/
 oven/
+
+*.dll
+*.lib
+
+# Only the four paths the build actually needs are vendored. Headers carry no
+# ignored extension and come along on their own; these three negations are what
+# rescue the binaries from the rules above. Re-extracting a full LLVM release
+# here will not stage the other ~3.7 GB.
+!vendor/clang+llvm-22.1.8-x86_64-pc-windows-msvc/bin/llvm-config.exe
+!vendor/clang+llvm-22.1.8-x86_64-pc-windows-msvc/bin/LLVM-C.dll
+!vendor/clang+llvm-22.1.8-x86_64-pc-windows-msvc/lib/LLVM-C.lib

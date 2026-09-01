@@ -1,0 +1,5 @@
+fun double(value: Int64): Int64 do
+    value * 2
+end
+
+print(double(6))

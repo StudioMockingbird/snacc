@@ -1,0 +1,60 @@
+(* This file is a convenience copy of the grammar in LANGUAGE.md.
+   LANGUAGE.md is the normative language contract. *)
+
+program              = { item } ;
+item                 = function-declaration
+                     | rust-declaration
+                     | expression ;
+
+function-declaration = "fun", identifier, parameters, ":", type, "do",
+                       expression, "end" ;
+rust-declaration     = "extern", "rust", string-literal, "fun", identifier,
+                       parameters, ":", type ;
+parameters           = "(", [ parameter, { ",", parameter }, [ "," ] ], ")" ;
+parameter            = identifier, ":", type ;
+type                 = "Int64" | "Dec64" | "Bool" | "Nil" ;
+
+expression           = non-sequence-expression,
+                       { ";", [ non-sequence-expression ] } ;
+non-sequence-expression
+                     = if-expression | while-expression | comparison ;
+if-expression        = "if", expression, "then", expression,
+                       { "elseif", expression, "then", expression },
+                       "else", expression, "end" ;
+while-expression     = "while", expression, "do", expression, "end" ;
+
+comparison           = additive, { comparison-operator, additive } ;
+comparison-operator  = "==" | "!=" | "<" | "<=" | ">" | ">=" ;
+additive             = multiplicative, { ( "+" | "-" ), multiplicative } ;
+multiplicative       = postfix, { ( "*" | "/" ), postfix } ;
+postfix              = atom, { arguments } ;
+arguments            = "(", [ expression, { ",", expression }, [ "," ] ], ")" ;
+
+atom                 = literal
+                     | identifier
+                     | binding-expression
+                     | list-literal
+                     | print-expression
+                     | "(", expression, ")" ;
+binding-expression   = "let", identifier, ":", type, "=", comparison, ";",
+                       expression ;
+print-expression     = "print", "(", expression, ")" ;
+list-literal         = "[", [ expression, { ",", expression }, [ "," ] ], "]" ;
+literal              = decimal-literal | integer-literal | boolean-literal
+                     | nil-literal | string-literal ;
+boolean-literal      = "true" | "false" ;
+nil-literal          = "nil" | "null" ;
+
+decimal-literal      = digit, { digit }, ".", digit, { digit } ;
+integer-literal      = digit, { digit } ;
+string-literal       = '"', { string-character }, '"' ;
+identifier           = identifier-start, { identifier-continue } ;
+identifier-start     = ASCII-letter | "_" ;
+identifier-continue  = identifier-start | digit ;
+digit                = "0" | "1" | "2" | "3" | "4"
+                     | "5" | "6" | "7" | "8" | "9" ;
+
+(* ASCII-letter is A-Z or a-z. string-character is any character except '"'.
+   Whitespace is insignificant. A comment begins with // and ends immediately
+   before the next line feed or at end of input. Keywords are reserved and
+   cannot be identifiers. *)

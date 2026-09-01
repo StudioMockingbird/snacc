@@ -1,0 +1,8 @@
+fun isfoo(a: Int64): Bool do
+    a == "foo"
+end
+
+if x > 0 then "yes"
+elseif x == 0 then "maybe"
+else "no"
+end

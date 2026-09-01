@@ -1,0 +1,1 @@
+C:\Users\Rishav\Forge\agents\snacc\tests\fixtures\cargo-hosted\target\debug\cargo-hosted-fixture.exe: C:\Users\Rishav\Forge\agents\snacc\crates\snacc-runtime\src\lib.rs C:\Users\Rishav\Forge\agents\snacc\tests\fixtures\cargo-hosted\src\interop.rs C:\Users\Rishav\Forge\agents\snacc\tests\fixtures\cargo-hosted\src\main.rs

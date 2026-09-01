@@ -1,0 +1,15 @@
+[package]
+name = "cargo-hosted-fixture"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+itoa = "1"
+snacc-runtime = { path = "../../../crates/snacc-runtime" }
+
+[package.metadata.snacc]
+schema-version = 1
+entry = "src/main.nrs"
+host-bin = "cargo-hosted-fixture"

@@ -1,0 +1,20 @@
+[package]
+name = "snacc-workbench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "snacc-workbench"
+path = "src/main.rs"
+
+[dependencies]
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+snacc-compiler = { path = "../../crates/snacc-compiler" }
+snacc-driver = { path = "../../crates/snacc-driver" }
+
+[build-dependencies]
+serde_json.workspace = true

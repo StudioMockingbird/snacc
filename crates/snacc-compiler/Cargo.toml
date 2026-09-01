@@ -1,0 +1,15 @@
+[package]
+name = "snacc-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+chumsky.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+inkwell = { workspace = true, features = ["llvm22-1-no-llvm-linking", "target-x86"] }
+
+[target.'cfg(not(windows))'.dependencies]
+inkwell = { workspace = true, features = ["llvm22-1-prefer-dynamic", "target-x86"] }

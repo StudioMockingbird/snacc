@@ -1,4 +1,0 @@
-interface
-
-type
-    PxList

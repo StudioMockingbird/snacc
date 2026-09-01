@@ -1,0 +1,1 @@
+print(while false do 7 end)

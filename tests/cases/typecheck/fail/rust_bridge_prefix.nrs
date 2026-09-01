@@ -1,0 +1,3 @@
+extern rust "double" fun rust_double(value: Int64): Int64
+
+print(rust_double(21))

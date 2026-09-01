@@ -1,0 +1,26 @@
+[
+  {
+    "id": "arithmetic",
+    "name": "Arithmetic",
+    "description": "Evaluate a small arithmetic expression.",
+    "case": "arithmetic"
+  },
+  {
+    "id": "printing",
+    "name": "Printing",
+    "description": "Print the built-in scalar values.",
+    "case": "printing"
+  },
+  {
+    "id": "functions",
+    "name": "Functions",
+    "description": "Call a top-level typed function.",
+    "case": "functions"
+  },
+  {
+    "id": "control-flow",
+    "name": "Control flow",
+    "description": "Use a conditional and a loop expression.",
+    "case": "control-flow"
+  }
+]

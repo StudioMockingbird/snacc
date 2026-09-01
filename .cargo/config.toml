@@ -1,0 +1,2 @@
+[env]
+LLVM_SYS_221_PREFIX = { value = "vendor/clang+llvm-22.1.8-x86_64-pc-windows-msvc", relative = true }

@@ -1,0 +1,17 @@
+[package]
+name = "snacc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "snacc"
+path = "src/main.rs"
+
+[dependencies]
+ariadne.workspace = true
+snacc-driver = { path = "../../crates/snacc-driver" }
+snacc-compiler = { path = "../../crates/snacc-compiler" }
+
+[dev-dependencies]
+tempfile.workspace = true
