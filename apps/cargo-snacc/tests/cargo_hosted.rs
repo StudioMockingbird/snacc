@@ -179,6 +179,8 @@ fn init_creates_the_complete_host_contract() {
     assert!(package.join("src/interop.rs").is_file());
     let host = fs::read_to_string(package.join("src/main.rs")).unwrap();
     assert!(host.contains("fn snacc_entry_succeeds()"));
+    assert!(host.contains("#[cfg(snacc_bridge_assertions)]"));
+    assert!(host.contains("include!(env!(\"SNACC_BRIDGE_ASSERTIONS\"))"));
 }
 
 #[test]
