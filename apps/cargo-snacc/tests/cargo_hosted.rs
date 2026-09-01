@@ -215,6 +215,7 @@ fn init_creates_the_complete_host_contract() {
     let manifest = fs::read_to_string(package.join("Cargo.toml")).unwrap();
     assert!(manifest.contains("schema-version = 1"));
     assert!(manifest.contains("snacc-runtime = \"0.1\""));
+    assert!(manifest.contains("check-cfg"));
     assert!(package.join("src/main.nrs").is_file());
     assert!(package.join("src/interop.rs").is_file());
     let host = fs::read_to_string(package.join("src/main.rs")).unwrap();
@@ -318,8 +319,8 @@ fn bridge_missing_interop_item_fails_with_a_name_resolution_error() {
     );
     let rendered = combined(&output);
     assert!(
-        rendered.contains("cannot find") || rendered.contains("unresolved"),
-        "expected a name-resolution error, got:\n{rendered}"
+        rendered.contains("E0425"),
+        "expected a name-resolution error (E0425), got:\n{rendered}"
     );
 }
 
@@ -461,8 +462,8 @@ fn host_without_an_interop_module_fails_with_a_module_resolution_error() {
     );
     let rendered = combined(&output);
     assert!(
-        rendered.contains("cannot find") || rendered.contains("unresolved"),
-        "expected a module-resolution error, got:\n{rendered}"
+        rendered.contains("E0433"),
+        "expected a module-resolution error (E0433), got:\n{rendered}"
     );
 }
 
@@ -553,6 +554,27 @@ fn plain_cargo_check_succeeds_without_cargo_snacc() {
     assert!(
         output.status.success(),
         "plain cargo check should succeed without cargo-snacc's cfg/env:\n{}",
+        combined(&output)
+    );
+    assert!(
+        !combined(&output).contains("unexpected `cfg` condition name"),
+        "plain cargo check should not warn about the assertion cfg:\n{}",
+        combined(&output)
+    );
+}
+
+#[test]
+fn check_rejects_release_and_profile_flags() {
+    let target = tempfile::tempdir().expect("failed to create fixture target directory");
+    let output = cargo_snacc(target.path(), &["check", "--offline", "--release"]);
+    assert!(
+        !output.status.success(),
+        "check --release should be rejected:\n{}",
+        combined(&output)
+    );
+    assert!(
+        combined(&output).contains("check does not support --release or --profile"),
+        "expected the --release/--profile rejection message:\n{}",
         combined(&output)
     );
 }

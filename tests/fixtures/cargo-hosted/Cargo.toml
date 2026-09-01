@@ -13,3 +13,6 @@ snacc-runtime = { path = "../../../crates/snacc-runtime" }
 schema-version = 1
 entry = "src/main.nrs"
 host-bin = "cargo-hosted-fixture"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(snacc_bridge_assertions)'] }

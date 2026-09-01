@@ -1477,3 +1477,21 @@ git mv docs/specs/007-bridge-signature-verification-plan.md docs/specs/archive/0
 git add TODO.md docs/specs/archive/007-bridge-signature-verification.md docs/specs/archive/007-bridge-signature-verification-plan.md
 git commit -m "chore: close RFC 007 now bridge signatures are verified before linking"
 ```
+
+## Post-implementation note: `check` command CLI deviation
+
+The implementation deviates in one small way from RFC 007's stated non-goal
+"Changing `cargo-snacc` command names, arguments, or successful output":
+`check_command` now rejects `--release`/`--profile` with an explicit error, and
+narrows its Cargo invocation to a single `--bin <host_bin>` target (previously
+it checked the whole package). Both changes are required because `cargo rustc
+--profile check` — the only Cargo invocation that both behaves like `cargo
+check` (fast, non-linking) and accepts a trailing `-- <rustc-args>` section for
+the `--cfg snacc_bridge_assertions` passthrough — cannot combine with a
+user-supplied `--profile`, and `cargo rustc` requires a single target
+selection. The alternative (silently dropping a user's `--release`/`--profile`
+flag, or letting Cargo's own conflicting-flag error surface unexplained) was
+judged worse than a small, explicit, fail-closed narrowing of `check`'s
+contract. See the "Task 4 post-hoc defect" and its ruling in this plan's SDD
+ledger (`.superpowers/sdd/007-bridge-signature-verification-plan/progress.md`)
+for the full empirical verification behind this decision.

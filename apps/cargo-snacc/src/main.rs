@@ -192,6 +192,9 @@ fn init(args: &[String]) -> Result<(), CliError> {
         .ok_or_else(|| CliError("cannot determine package name".into()))?;
     cargo_toml.push_str(&package_name);
     cargo_toml.push_str("\"\n");
+    cargo_toml.push_str(
+        "\n[lints.rust]\nunexpected_cfgs = { level = \"warn\", check-cfg = ['cfg(snacc_bridge_assertions)'] }\n",
+    );
     fs::write(&manifest, cargo_toml).map_err(io_error)?;
     fs::write(&main_nrs, "print(0)\n").map_err(io_error)?;
     fs::write(&main_rs, HOST_MAIN_TEMPLATE).map_err(io_error)?;

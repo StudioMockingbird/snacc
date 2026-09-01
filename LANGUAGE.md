@@ -146,8 +146,8 @@ link symbol must begin with `snacc_user_`. The declaration is the complete Snacc
 view of that function; a signature mismatch in the host is invalid and need not
 be diagnosed by the Snacc compiler.
 
-The ABI representation is `i64` for `Int64`, IEEE binary64 for `Dec64`, and an
-8-bit integer for `Bool` and `Nil`. A host must encode `false` as zero, `true` as
+The ABI representation is `i64` for `Int64`, IEEE binary64 for `Dec64`, and
+`u8` for `Bool` and `Nil`. A host must encode `false` as zero, `true` as
 one, and `nil` as zero. Rust bridges must not unwind across the ABI boundary.
 
 A bridge function is a `pub` item of the host crate's `interop` module, reachable
