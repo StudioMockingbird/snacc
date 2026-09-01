@@ -51,6 +51,7 @@ struct Package {
 struct Target {
     name: String,
     kind: Vec<String>,
+    src_path: PathBuf,
 }
 
 struct Selected {
@@ -58,6 +59,7 @@ struct Selected {
     package_id: String,
     entry: PathBuf,
     host_bin: String,
+    host_src_path: PathBuf,
     target_directory: PathBuf,
 }
 
@@ -646,22 +648,24 @@ fn select_package_optional(
     if !entry.starts_with(package_root) || !entry.is_file() {
         return Err(CliError("Snacc entry must be a package-owned file".into()));
     }
-    let host_count = package
+    let host_target = package
         .targets
         .iter()
         .filter(|target| target.name == host_bin && target.kind.iter().any(|kind| kind == "bin"))
-        .count();
-    if host_count != 1 {
+        .collect::<Vec<_>>();
+    if host_target.len() != 1 {
         return Err(CliError(format!(
             "host binary '{host_bin}' does not resolve to exactly one binary target"
         )));
     }
+    let host_src_path = host_target[0].src_path.clone();
     let package_id = package.id.clone();
     Ok(Some(Selected {
         package,
         package_id,
         entry,
         host_bin,
+        host_src_path,
         target_directory: metadata.target_directory,
     }))
 }
@@ -1134,12 +1138,14 @@ mod tests {
                 targets: vec![Target {
                     name: "app".into(),
                     kind: vec!["bin".into()],
+                    src_path: PathBuf::from("C:/workspace/src/main.rs"),
                 }],
                 metadata: None,
             },
             package_id: "path+file:///workspace#app@0.1.0".into(),
             entry: PathBuf::from("C:/workspace/src/main.nrs"),
             host_bin: "app".into(),
+            host_src_path: PathBuf::from("C:/workspace/src/main.rs"),
             target_directory: PathBuf::from("C:/workspace/target"),
         }
     }
@@ -1173,6 +1179,14 @@ mod tests {
         assert_eq!(
             cargo_executable(messages, &selected(), "app", "bin"),
             Some(PathBuf::from("right.exe"))
+        );
+    }
+
+    #[test]
+    fn selected_test_helper_carries_a_host_src_path() {
+        assert_eq!(
+            selected().host_src_path,
+            PathBuf::from("C:/workspace/src/main.rs")
         );
     }
 
