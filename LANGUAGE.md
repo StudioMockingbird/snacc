@@ -149,3 +149,11 @@ be diagnosed by the Snacc compiler.
 The ABI representation is `i64` for `Int64`, IEEE binary64 for `Dec64`, and an
 8-bit integer for `Bool` and `Nil`. A host must encode `false` as zero, `true` as
 one, and `nil` as zero. Rust bridges must not unwind across the ABI boundary.
+
+A bridge function is a `pub` item of the host crate's `interop` module, reachable
+at `crate::interop::<symbol>`. Its Rust item name is exactly the declared link
+symbol. It carries `#[unsafe(no_mangle)]` and uses the `extern "C"` ABI, and it
+does not carry `#[export_name]`. `cargo-snacc` verifies the item's Rust type
+against the Snacc declaration's implied ABI signature before linking; it does not
+verify that the item is exported under its symbol, which remains the final
+linker's responsibility.
