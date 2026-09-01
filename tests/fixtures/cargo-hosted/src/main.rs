@@ -1,5 +1,8 @@
 mod interop;
 
+#[cfg(snacc_bridge_assertions)]
+include!(env!("SNACC_BRIDGE_ASSERTIONS"));
+
 unsafe extern "C" {
     fn snacc_main() -> i32;
 }

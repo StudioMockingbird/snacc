@@ -10,6 +10,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+const HOST_MAIN_TEMPLATE: &str = "mod interop;\n\n#[cfg(snacc_bridge_assertions)]\ninclude!(env!(\"SNACC_BRIDGE_ASSERTIONS\"));\n\nunsafe extern \"C\" {\n    fn snacc_main() -> i32;\n}\n\nfn main() {\n    snacc_runtime::force_link();\n    // SAFETY: cargo-snacc links this host with the object defining this ABI.\n    let status = unsafe { snacc_main() };\n    std::process::exit(status);\n}\n\n#[test]\nfn snacc_entry_succeeds() {\n    snacc_runtime::force_link();\n    // SAFETY: cargo-snacc links this harness with the object defining this ABI.\n    assert_eq!(unsafe { snacc_main() }, 0);\n}\n";
+
+const HOST_MAIN_TEMPLATE_PRE_RFC_007: &str = "mod interop;\n\nunsafe extern \"C\" {\n    fn snacc_main() -> i32;\n}\n\nfn main() {\n    snacc_runtime::force_link();\n    // SAFETY: cargo-snacc links this host with the object defining this ABI.\n    let status = unsafe { snacc_main() };\n    std::process::exit(status);\n}\n\n#[test]\nfn snacc_entry_succeeds() {\n    snacc_runtime::force_link();\n    // SAFETY: cargo-snacc links this harness with the object defining this ABI.\n    assert_eq!(unsafe { snacc_main() }, 0);\n}\n";
+
 #[derive(Debug)]
 struct CliError(String);
 
@@ -190,11 +194,7 @@ fn init(args: &[String]) -> Result<(), CliError> {
     cargo_toml.push_str("\"\n");
     fs::write(&manifest, cargo_toml).map_err(io_error)?;
     fs::write(&main_nrs, "print(0)\n").map_err(io_error)?;
-    fs::write(
-        &main_rs,
-        "mod interop;\n\nunsafe extern \"C\" {\n    fn snacc_main() -> i32;\n}\n\nfn main() {\n    snacc_runtime::force_link();\n    // SAFETY: cargo-snacc links this host with the object defining this ABI.\n    let status = unsafe { snacc_main() };\n    std::process::exit(status);\n}\n\n#[test]\nfn snacc_entry_succeeds() {\n    snacc_runtime::force_link();\n    // SAFETY: cargo-snacc links this harness with the object defining this ABI.\n    assert_eq!(unsafe { snacc_main() }, 0);\n}\n",
-    )
-    .map_err(io_error)?;
+    fs::write(&main_rs, HOST_MAIN_TEMPLATE).map_err(io_error)?;
     fs::write(
         &interop_rs,
         "// This module exports explicitly selected Rust APIs through Snacc's C-compatible ABI.\n",
@@ -1238,7 +1238,13 @@ fn ensure_new_path(path: &Path) -> Result<(), CliError> {
 fn ensure_cargo_main_template(path: &Path) -> Result<(), CliError> {
     if path.is_file() {
         let existing = fs::read_to_string(path).map_err(io_error)?;
-        if existing.trim() != "fn main() {\n    println!(\"Hello, world!\");\n}" {
+        let trimmed = existing.trim();
+        let known = [
+            "fn main() {\n    println!(\"Hello, world!\");\n}",
+            HOST_MAIN_TEMPLATE_PRE_RFC_007.trim(),
+            HOST_MAIN_TEMPLATE.trim(),
+        ];
+        if !known.contains(&trimmed) {
             return Err(CliError(format!(
                 "refusing to overwrite non-template Rust host '{}'",
                 path.display()
