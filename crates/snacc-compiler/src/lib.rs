@@ -6,7 +6,7 @@ mod syntax;
 use chumsky::prelude::*;
 
 pub use diagnostics::{Diagnostic, DiagnosticPhase, Diagnostics};
-pub use semantics::checker::Program;
+pub use semantics::checker::{Program, Ty};
 pub use syntax::ast::Program as AstProgram;
 
 pub const ABI_VERSION: u32 = 1;

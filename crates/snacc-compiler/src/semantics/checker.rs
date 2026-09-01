@@ -31,11 +31,13 @@ impl std::fmt::Display for Ty {
     }
 }
 
+#[derive(Debug)]
 pub struct Error {
     pub span: Span,
     pub msg: String,
 }
 
+#[derive(Debug)]
 pub enum Failure {
     Source(Vec<Error>),
     Unknown(&'static str),
@@ -94,6 +96,7 @@ pub struct TExtern {
     pub symbol: String,
     pub params: Vec<(String, Ty)>,
     pub ret: Ty,
+    pub span: std::ops::Range<usize>,
 }
 
 pub struct Program {
@@ -145,6 +148,11 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
                 span: function.span,
                 msg: "Rust bridge symbols must start with 'snacc_user_'".into(),
             });
+        } else if !is_rust_identifier(function.symbol) {
+            ctx.errors.push(Error {
+                span: function.span,
+                msg: "Rust bridge symbols must be valid Rust identifiers".into(),
+            });
         }
     }
 
@@ -182,6 +190,7 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
                 symbol: function.symbol.to_string(),
                 params,
                 ret: function.ret.into(),
+                span: function.span.into_range(),
             },
         );
     }
@@ -203,6 +212,15 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
     } else {
         Err(Failure::Source(ctx.errors))
     }
+}
+
+fn is_rust_identifier(symbol: &str) -> bool {
+    let mut chars = symbol.chars();
+    match chars.next() {
+        Some(first) if first == '_' || first.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 fn numeric(ty: Ty) -> bool {
@@ -501,5 +519,39 @@ mod tests {
             Err(_) => panic!("bridge call should type check"),
         };
         assert_eq!(program.externs["rust_double"].symbol, "snacc_user_double");
+    }
+
+    #[test]
+    fn checked_externs_carry_their_declaration_span() {
+        let source = "extern rust \"snacc_user_double\" fun rust_double(value: Int64): Int64\nprint(rust_double(2))";
+        let syntax = crate::parse(source).expect("bridge declaration should parse");
+        let program = check(&syntax).expect("bridge call should type check");
+        let span = &program.externs["rust_double"].span;
+        assert_eq!(span.start, 0);
+        assert!(span.end > span.start && span.end <= source.find('\n').unwrap());
+    }
+
+    #[test]
+    fn rejects_bridge_symbols_that_are_not_rust_identifiers() {
+        let source = "extern rust \"snacc_user_bad-name\" fun bad(): Nil\nprint(0)";
+        let syntax = crate::parse(source).expect("declaration should parse");
+        match check(&syntax) {
+            Err(Failure::Source(errors)) => {
+                assert!(
+                    errors
+                        .iter()
+                        .any(|error| error.msg.contains("valid Rust identifiers")),
+                    "expected a Rust-identifier diagnostic"
+                );
+            }
+            _ => panic!("a non-identifier bridge symbol should fail type checking"),
+        }
+    }
+
+    #[test]
+    fn accepts_bridge_symbols_with_digits_and_underscores() {
+        let source = "extern rust \"snacc_user_v2_ok\" fun ok(): Nil\nprint(0)";
+        let syntax = crate::parse(source).expect("declaration should parse");
+        assert!(check(&syntax).is_ok());
     }
 }
