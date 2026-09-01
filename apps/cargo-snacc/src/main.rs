@@ -719,7 +719,11 @@ fn emit_cached(selected: &Selected, source: &str, options: &Options) -> Result<P
     hash.update(&target_triple);
     hash.update(compile_options.optimization.as_str());
     hash.update(profile);
-    hash.update(package_relative_entry(selected).to_string_lossy().as_bytes());
+    hash.update(
+        package_relative_entry(selected)
+            .to_string_lossy()
+            .as_bytes(),
+    );
     hash.update(source.as_bytes());
     let identity = format!("{:x}", hash.finalize());
     let directory = selected
@@ -807,10 +811,7 @@ fn declares_bridge_assertion_include(host_source: &str) -> bool {
     })
 }
 
-fn validate_host_assertion_include(
-    selected: &Selected,
-    checked: &Program,
-) -> Result<(), CliError> {
+fn validate_host_assertion_include(selected: &Selected, checked: &Program) -> Result<(), CliError> {
     if checked.externs.is_empty() {
         return Ok(());
     }

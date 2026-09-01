@@ -186,7 +186,11 @@ fn cargo_hosted_bridge_builds_runs_tests_and_validates_cache() {
     let bridges_dir = target.path().join("snacc").join("bridges");
     assert!(bridges_dir.is_dir(), "bridge assertions were not generated");
     let cleaned = cargo_snacc(target.path(), &["clean", "--offline"]);
-    assert!(cleaned.status.success(), "clean failed:\n{}", combined(&cleaned));
+    assert!(
+        cleaned.status.success(),
+        "clean failed:\n{}",
+        combined(&cleaned)
+    );
     assert!(
         !bridges_dir.exists(),
         "clean should remove generated bridge assertions"
