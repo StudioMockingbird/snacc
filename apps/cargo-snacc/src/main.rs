@@ -210,8 +210,9 @@ fn check_command(args: &[String]) -> Result<(), CliError> {
     let options = parsed.options;
     let selected = select_package(options.package.as_deref(), Some(&options))?;
     let source = fs::read_to_string(&selected.entry).map_err(io_error)?;
-    check(&source)
+    let checked = check(&source)
         .map_err(|diagnostics| diagnostic_error(&selected.entry, &source, &diagnostics))?;
+    let assertions = prepare_bridge_assertions(&selected, &checked, &source)?;
     let mut command = Command::new(cargo());
     command
         .arg("check")
@@ -220,6 +221,8 @@ fn check_command(args: &[String]) -> Result<(), CliError> {
         .arg("--package")
         .arg(&selected.package.name);
     append_cargo_options(&mut command, &options);
+    command.arg("--");
+    apply_bridge_assertions(&mut command, &assertions);
     run_forwarded(command, "cargo check")
 }
 
@@ -240,6 +243,9 @@ fn build_command(args: &[String], run_program: bool) -> Result<(), CliError> {
     let program_args = parsed.trailing;
     let selected = select_package(options.package.as_deref(), Some(&options))?;
     let source = fs::read_to_string(&selected.entry).map_err(io_error)?;
+    let checked = check(&source)
+        .map_err(|diagnostics| diagnostic_error(&selected.entry, &source, &diagnostics))?;
+    let assertions = prepare_bridge_assertions(&selected, &checked, &source)?;
     let object = emit_cached(&selected, &source, &options)?;
 
     let mut command = Command::new(cargo());
@@ -253,8 +259,9 @@ fn build_command(args: &[String], run_program: bool) -> Result<(), CliError> {
         .arg("--bin")
         .arg(&selected.host_bin);
     append_cargo_options(&mut command, &options);
+    command.arg("--");
+    apply_bridge_assertions(&mut command, &assertions);
     command
-        .arg("--")
         .arg("-C")
         .arg(format!("link-arg={}", object.display()));
     let output = command
@@ -316,6 +323,9 @@ fn test_command(args: &[String]) -> Result<(), CliError> {
     let options = parsed.options;
     let selected = select_package(options.package.as_deref(), Some(&options))?;
     let source = fs::read_to_string(&selected.entry).map_err(io_error)?;
+    let checked = check(&source)
+        .map_err(|diagnostics| diagnostic_error(&selected.entry, &source, &diagnostics))?;
+    let assertions = prepare_bridge_assertions(&selected, &checked, &source)?;
     let object = emit_cached(&selected, &source, &options)?;
 
     let mut command = Command::new(cargo());
@@ -329,8 +339,9 @@ fn test_command(args: &[String]) -> Result<(), CliError> {
         .arg("--bin")
         .arg(&selected.host_bin);
     append_cargo_options(&mut command, &options);
+    command.arg("--");
+    apply_bridge_assertions(&mut command, &assertions);
     command
-        .arg("--")
         .arg("--test")
         .arg("-C")
         .arg(format!("link-arg={}", object.display()));
@@ -772,6 +783,52 @@ fn package_relative_entry(selected: &Selected) -> &Path {
                 .unwrap_or(Path::new(".")),
         )
         .unwrap_or(&selected.entry)
+}
+
+struct BridgeAssertions {
+    path: PathBuf,
+}
+
+fn declares_bridge_assertion_include(host_source: &str) -> bool {
+    let lines: Vec<&str> = host_source.lines().map(str::trim).collect();
+    lines.windows(2).any(|pair| {
+        pair[0] == "#[cfg(snacc_bridge_assertions)]"
+            && pair[1].starts_with("include!")
+            && pair[1].contains("SNACC_BRIDGE_ASSERTIONS")
+    })
+}
+
+fn validate_host_assertion_include(
+    selected: &Selected,
+    checked: &Program,
+) -> Result<(), CliError> {
+    if checked.externs.is_empty() {
+        return Ok(());
+    }
+    let host_source = fs::read_to_string(&selected.host_src_path).map_err(io_error)?;
+    if declares_bridge_assertion_include(&host_source) {
+        Ok(())
+    } else {
+        Err(CliError(format!(
+            "host '{}' is missing the bridge assertion include; add these two lines after 'mod interop;':\n#[cfg(snacc_bridge_assertions)]\ninclude!(env!(\"SNACC_BRIDGE_ASSERTIONS\"));",
+            selected.host_src_path.display()
+        )))
+    }
+}
+
+fn prepare_bridge_assertions(
+    selected: &Selected,
+    checked: &Program,
+    source: &str,
+) -> Result<BridgeAssertions, CliError> {
+    validate_host_assertion_include(selected, checked)?;
+    let path = write_bridge_assertions(selected, checked, source)?;
+    Ok(BridgeAssertions { path })
+}
+
+fn apply_bridge_assertions(command: &mut Command, assertions: &BridgeAssertions) {
+    command.env("SNACC_BRIDGE_ASSERTIONS", &assertions.path);
+    command.arg("--cfg").arg("snacc_bridge_assertions");
 }
 
 fn rust_abi_type(ty: Ty) -> &'static str {
@@ -1250,6 +1307,17 @@ mod tests {
             cargo_executable(messages, &selected(), "app", "bin"),
             Some(PathBuf::from("right.exe"))
         );
+    }
+
+    #[test]
+    fn declares_bridge_assertion_include_requires_the_exact_pair() {
+        assert!(declares_bridge_assertion_include(
+            "mod interop;\n\n#[cfg(snacc_bridge_assertions)]\ninclude!(env!(\"SNACC_BRIDGE_ASSERTIONS\"));\n"
+        ));
+        assert!(!declares_bridge_assertion_include("mod interop;\n"));
+        assert!(!declares_bridge_assertion_include(
+            "#[cfg(snacc_bridge_assertions)]\nfn unrelated() {}\n"
+        ));
     }
 
     #[test]
