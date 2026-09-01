@@ -633,6 +633,11 @@ fn check_command(args: &[String]) -> Result<(), CliError> {
     let parsed = parse_options(args)?;
     reject_extra(&parsed, "check")?;
     let options = parsed.options;
+    if options.release || options.profile.is_some() {
+        return Err(CliError(
+            "check does not support --release or --profile; use build --release to check in release mode".into(),
+        ));
+    }
     let selected = select_package(options.package.as_deref(), Some(&options))?;
     let source = fs::read_to_string(&selected.entry).map_err(io_error)?;
     let checked = check(&source)
@@ -640,17 +645,23 @@ fn check_command(args: &[String]) -> Result<(), CliError> {
     let assertions = prepare_bridge_assertions(&selected, &checked, &source)?;
     let mut command = Command::new(cargo());
     command
+        .arg("rustc")
+        .arg("--profile")
         .arg("check")
         .arg("--manifest-path")
         .arg(selected.package.manifest_path)
         .arg("--package")
-        .arg(&selected.package.name);
-    append_cargo_options(&mut command, &options);
+        .arg(&selected.package.name)
+        .arg("--bin")
+        .arg(&selected.host_bin);
+    append_metadata_options(&mut command, &options);
     command.arg("--");
     apply_bridge_assertions(&mut command, &assertions);
     run_forwarded(command, "cargo check")
 }
 ```
+
+**Correction discovered during Task 5's verification (not in the original plan text):** plain `cargo check` does not accept a trailing `-- <rustc-args>` section at all — `cargo check -- --cfg foo` fails with `error: unexpected argument '--cfg' found`, verified empirically. Only `cargo rustc` accepts rustc-passthrough args after `--`. `cargo rustc --profile check --bin <name>` reproduces `cargo check`'s fast, non-linking behavior while still accepting the passthrough. `--profile check` cannot combine with `--release` or a user `--profile` (both verified to error), so `check_command` now rejects those up front instead of silently dropping them or hitting Cargo's own conflict error, and uses `append_metadata_options` (the existing helper that forwards `--all-features`/`--no-default-features`/`--features`/`--locked`/`--frozen`/`--offline`, already used for the `cargo metadata` call in `select_package_optional`) instead of `append_cargo_options` (which would re-add the now-forbidden `--release`/`--profile`).
 
 - [ ] **Step 5: Wire `build_command`**
 

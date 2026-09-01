@@ -1,6 +1,6 @@
 # RFC 007: Rust Bridge Signature Verification
 
-Status: Proposed
+Status: Closed
 
 ## Summary
 
