@@ -1,2 +1,9 @@
-print(if 1 == 1 then 10 else 20 end)
-print(while false do 7 end)
+if 1 == 1 then
+    print(10)
+else
+    print(20)
+end
+
+while false do
+    print(7)
+end

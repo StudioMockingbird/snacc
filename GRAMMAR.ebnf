@@ -1,28 +1,39 @@
 (* This file is a convenience copy of the grammar in LANGUAGE.md.
    LANGUAGE.md is the normative language contract. *)
 
-program              = { item } ;
-item                 = function-declaration
-                     | rust-declaration
-                     | expression ;
+program              = { top-level-declaration | block-element } ;
 
-function-declaration = "fun", identifier, parameters, ":", type, "do",
-                       expression, "end" ;
+top-level-declaration
+                     = function-declaration
+                     | rust-declaration ;
+
+function-declaration = "fun", identifier, parameters, [ ":", type ], "do",
+                       block, "end" ;
 rust-declaration     = "extern", "rust", string-literal, "fun", identifier,
-                       parameters, ":", type ;
+                       parameters, [ ":", type ] ;
 parameters           = "(", [ parameter, { ",", parameter }, [ "," ] ], ")" ;
 parameter            = identifier, ":", type ;
 type                 = "Int64" | "Dec64" | "Bool" | "Nil" ;
 
-expression           = non-sequence-expression,
-                       { ";", [ non-sequence-expression ] } ;
-non-sequence-expression
-                     = if-expression | while-expression | comparison ;
-if-expression        = "if", expression, "then", expression,
-                       { "elseif", expression, "then", expression },
-                       "else", expression, "end" ;
-while-expression     = "while", expression, "do", expression, "end" ;
+block                = { block-element } ;
+block-element        = variable-declaration
+                     | assignment
+                     | while-statement
+                     | break-statement
+                     | if-form
+                     | expression ;
 
+variable-declaration = "let", [ "mut" ], identifier, ":", type,
+                       "=", expression ;
+assignment           = identifier, "=", expression ;
+
+while-statement      = "while", expression, "do", block, "end" ;
+break-statement      = "break" ;
+if-form              = "if", expression, "then", block,
+                       { "elseif", expression, "then", block },
+                       [ "else", block ], "end" ;
+
+expression           = comparison ;
 comparison           = additive, { comparison-operator, additive } ;
 comparison-operator  = "==" | "!=" | "<" | "<=" | ">" | ">=" ;
 additive             = multiplicative, { ( "+" | "-" ), multiplicative } ;
@@ -32,12 +43,9 @@ arguments            = "(", [ expression, { ",", expression }, [ "," ] ], ")" ;
 
 atom                 = literal
                      | identifier
-                     | binding-expression
                      | list-literal
                      | print-expression
                      | "(", expression, ")" ;
-binding-expression   = "let", identifier, ":", type, "=", comparison, ";",
-                       expression ;
 print-expression     = "print", "(", expression, ")" ;
 list-literal         = "[", [ expression, { ",", expression }, [ "," ] ], "]" ;
 literal              = decimal-literal | integer-literal | boolean-literal
@@ -55,6 +63,8 @@ digit                = "0" | "1" | "2" | "3" | "4"
                      | "5" | "6" | "7" | "8" | "9" ;
 
 (* ASCII-letter is A-Z or a-z. string-character is any character except '"'.
-   Whitespace is insignificant. A comment begins with // and ends immediately
-   before the next line feed or at end of input. Keywords are reserved and
-   cannot be identifiers. *)
+   Whitespace, including line breaks, separates tokens but has no other
+   grammatical meaning. A comment begins with // and ends immediately before
+   the next line feed or at end of input. Keywords are reserved and cannot be
+   identifiers. The semicolons above terminate EBNF productions; Snacc has no
+   semicolon token. *)

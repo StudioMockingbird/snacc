@@ -41,7 +41,7 @@ fn run(path: &Path) -> Output {
 #[test]
 fn compile_error_yields_structured_diagnostics() {
     let _guard = lock_guard();
-    let source = "let x: Int64 = true;\nprint(x)\n";
+    let source = "let x: Int64 = true\nprint(x)\n";
 
     let error = match build(source) {
         Ok(_) => panic!("ill-typed source must not build"),

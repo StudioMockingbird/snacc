@@ -20,7 +20,7 @@
   {
     "id": "control-flow",
     "name": "Control flow",
-    "description": "Use a conditional and a loop expression.",
+    "description": "Use a conditional and a loop statement.",
     "case": "control-flow"
   }
 ]

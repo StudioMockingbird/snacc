@@ -2,8 +2,8 @@ fun square(x: Int64): Int64 do
     x * x
 end
 
-let x: Int64 = square(5);
-print(x);
+let x: Int64 = square(5)
+print(x)
 if x > 25 then
     print(false)
 elseif x == 25 then
