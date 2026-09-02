@@ -1,6 +1,6 @@
 # RFC 004: Local Web Workbench
 
-Status: Completed
+Status: Closed
 
 ## Summary
 

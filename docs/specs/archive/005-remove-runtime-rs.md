@@ -1,6 +1,6 @@
 # RFC 005: Remove `runtime.rs` in Favor of `snacc-runtime`
 
-Status: Completed
+Status: Closed
 
 ## Summary
 

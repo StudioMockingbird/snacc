@@ -1,6 +1,6 @@
 # RFC 006: Rust Workspace Organization
 
-Status: Completed
+Status: Closed
 
 ## Summary
 
