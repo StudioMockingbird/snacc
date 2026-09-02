@@ -55,14 +55,9 @@ no test exercises. Each one can regress silently today.
    each exported `snacc_print_*` symbol and the `force_link` retention
    contract.
 
-9. [ ] Extend `tools/package-windows.ps1` so `-IncludeDirectCompiler` compiles
-   and runs a Snacc program from the staged package before publication, with no
-   repository runtime source, Cargo, registry, or network access available.
-   Verified by hand once; not automated.
-
 ## Housekeeping
 
-10. [ ] After all acceptance criteria are verified, change RFCs 004, 005, and
-    006 to `Status: Closed` and move them to `docs/specs/archive/` in the same
-    change. `Status: Completed` is not a permitted terminal status.
+9. [ ] After all acceptance criteria are verified, change RFCs 004, 005, and
+   006 to `Status: Closed` and move them to `docs/specs/archive/` in the same
+   change. `Status: Completed` is not a permitted terminal status.
 
