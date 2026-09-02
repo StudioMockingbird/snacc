@@ -115,6 +115,60 @@ try {
         $env:Path = $oldPath
     }
 
+    if ($IncludeDirectCompiler) {
+        $isolated = Join-Path ([System.IO.Path]::GetTempPath()) ('snacc-hermetic-' + [Guid]::NewGuid().ToString('N'))
+        [System.IO.Directory]::CreateDirectory($isolated) | Out-Null
+        try {
+            Copy-Item -LiteralPath (Join-Path $temporary 'snacc.exe') -Destination (Join-Path $isolated 'snacc.exe')
+            Copy-Item -LiteralPath (Join-Path $temporary 'LLVM-C.dll') -Destination (Join-Path $isolated 'LLVM-C.dll')
+
+            $sourcePath = Join-Path $isolated 'hermetic-check.nrs'
+            Set-Content -LiteralPath $sourcePath -Value 'print(21 + 21)' -Encoding ascii
+
+            $rustc = Get-Command rustc.exe -ErrorAction SilentlyContinue
+            if ($null -eq $rustc) {
+                throw 'rustc.exe is required to verify the staged direct compiler is hermetic. Install a Rust toolchain so rustc.exe is on PATH.'
+            }
+            $rustcDirectory = Split-Path -Parent $rustc.Source
+            $exePath = Join-Path $isolated 'hermetic-check.exe'
+
+            $oldHermeticPath = $env:Path
+            try {
+                $env:Path = "$isolated;$rustcDirectory;$env:SystemRoot;$env:SystemRoot\System32"
+                Push-Location $isolated
+                try {
+                    & (Join-Path $isolated 'snacc.exe') $sourcePath -o $exePath
+                    $compileExitCode = $LASTEXITCODE
+                } finally {
+                    Pop-Location
+                }
+            } finally {
+                $env:Path = $oldHermeticPath
+            }
+            if ($compileExitCode -ne 0) {
+                throw 'The staged direct compiler (snacc.exe) failed to compile a test program using only the staged package and a system rustc; it is not hermetic.'
+            }
+            if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
+                throw 'The staged direct compiler reported success but did not produce an executable.'
+            }
+
+            $actualOutput = & $exePath
+            $runExitCode = $LASTEXITCODE
+            if ($runExitCode -ne 0) {
+                throw "The program compiled by the staged direct compiler exited with code $runExitCode instead of 0."
+            }
+            $expectedOutput = '42'
+            $normalizedOutput = ($actualOutput -join "`n").Trim()
+            if ($normalizedOutput -ne $expectedOutput) {
+                throw "The staged direct compiler produced incorrect output. Expected '$expectedOutput', got '$normalizedOutput'."
+            }
+        } finally {
+            if (Test-Path -LiteralPath $isolated) {
+                Remove-Item -LiteralPath $isolated -Recurse -Force
+            }
+        }
+    }
+
     Move-Item -LiteralPath $temporary -Destination $output
     Write-Output "Created Windows package: $output"
 } finally {
