@@ -69,12 +69,7 @@ no test exercises. Each one can regress silently today.
 
 ## Housekeeping
 
-11. [ ] `LANGUAGE.md` and `GRAMMAR.ebnf` are both empty while RFCs 005 and 006
-    cite `LANGUAGE.md` as the sole normative language contract and RFC 006's
-    motivation describes a pipeline it claims that file defines. The real rules
-    currently live in `docs/types.md`.
-
-12. [ ] After all acceptance criteria are verified, change RFCs 004, 005, and
+11. [ ] After all acceptance criteria are verified, change RFCs 004, 005, and
     006 to `Status: Closed` and move them to `docs/specs/archive/` in the same
     change. `Status: Completed` is not a permitted terminal status.
 
