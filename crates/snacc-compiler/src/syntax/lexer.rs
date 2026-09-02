@@ -27,6 +27,7 @@ pub enum Token<'src> {
     ElseIf,
     Else,
     End,
+    Break,
 }
 
 impl fmt::Display for Token<'_> {
@@ -55,6 +56,7 @@ impl fmt::Display for Token<'_> {
             Token::ElseIf => write!(f, "elseif"),
             Token::Else => write!(f, "else"),
             Token::End => write!(f, "end"),
+            Token::Break => write!(f, "break"),
         }
     }
 }
@@ -94,7 +96,7 @@ pub fn lexer<'src>()
         .to_slice()
         .map(Token::Op);
 
-    let ctrl = one_of("()[];,:").map(Token::Ctrl);
+    let ctrl = one_of("()[],:").map(Token::Ctrl);
 
     let ident = text::ascii::ident().map(|ident: &str| match ident {
         "fun" => Token::Fun,
@@ -114,6 +116,7 @@ pub fn lexer<'src>()
         "elseif" => Token::ElseIf,
         "else" => Token::Else,
         "end" => Token::End,
+        "break" => Token::Break,
         "true" => Token::Bool(true),
         "false" => Token::Bool(false),
         _ => Token::Ident(ident),
@@ -132,4 +135,66 @@ pub fn lexer<'src>()
         .recover_with(skip_then_retry_until(any().ignored(), end()))
         .repeated()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lex(source: &str) -> Vec<Token<'_>> {
+        let (tokens, errors) = lexer().parse(source).into_output_errors();
+        assert!(errors.is_empty(), "lex errors: {errors:?}");
+        tokens
+            .unwrap()
+            .into_iter()
+            .map(|(token, _span)| token)
+            .collect()
+    }
+
+    #[test]
+    fn break_lexes_to_its_own_token() {
+        assert_eq!(lex("break"), vec![Token::Break]);
+    }
+
+    #[test]
+    fn break_is_unavailable_as_an_identifier_regardless_of_context() {
+        // `break` must never surface as Token::Ident("break"), matching how
+        // `while`/`if`/etc. are reserved regardless of surrounding context.
+        assert_eq!(
+            lex("while break do break end"),
+            vec![
+                Token::While,
+                Token::Break,
+                Token::Do,
+                Token::Break,
+                Token::End,
+            ]
+        );
+    }
+
+    #[test]
+    fn semicolon_is_a_lex_error() {
+        let (_, errors) = lexer().parse("let x: Int64 = 1;").into_output_errors();
+        assert!(
+            !errors.is_empty(),
+            "expected a lex error for a bare semicolon"
+        );
+        // The error must clearly name the offending character (not just fail
+        // silently) so it's diagnosable as "no semicolon syntax" at this span.
+        assert!(
+            errors.iter().any(|e| e.to_string().contains("';'")),
+            "expected the error to name the semicolon, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn semicolon_is_a_lex_error_via_parse_entrypoint() {
+        let diagnostics = crate::parse("let x: Int64 = 1;")
+            .err()
+            .expect("snacc has no semicolon syntax; `crate::parse` should report a diagnostic");
+        let diagnostic = diagnostics
+            .first()
+            .expect("expected at least one diagnostic");
+        assert_eq!(diagnostic.phase, crate::DiagnosticPhase::Lex);
+    }
 }
