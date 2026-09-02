@@ -1,9 +1,13 @@
+use crate::semantics::types::{self, FuncSig, MethodId, MethodSig, TypeDef, TypeId, Types};
 use crate::syntax::ast::{
-    BinaryOp, Block, BlockElement, Expr, IfForm, NumLiteral, Param, Program as AstProgram, Span,
-    Spanned, TypeName, Value,
+    Arg, BinaryOp, Block, BlockElement, Condition, Expr, IfForm, NumLiteral, Param, PlacePath,
+    PlaceRootName, Program as AstProgram, Span, Spanned, TypeName, TypeRef, TypeTest, Value,
 };
 use std::collections::HashMap;
 
+/// Every checked type. User-defined types have exactly one variant here --
+/// their category (represented, struct, union, union member) lives in the type
+/// table, never in this enum (Specification 010 section 19 phase 3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Ty {
     Dec64,
@@ -15,6 +19,7 @@ pub enum Ty {
     UInt32,
     UInt64,
     Float32,
+    User(TypeId),
 }
 
 impl From<TypeName> for Ty {
@@ -34,6 +39,9 @@ impl From<TypeName> for Ty {
 }
 
 impl std::fmt::Display for Ty {
+    /// A user-defined type has no name without its table, so every diagnostic
+    /// renders types through [`Types::display`] instead. The placeholder below
+    /// exists only so `Ty` stays printable for debugging.
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::Dec64 => write!(f, "Dec64"),
@@ -45,6 +53,7 @@ impl std::fmt::Display for Ty {
             Self::UInt32 => write!(f, "UInt32"),
             Self::UInt64 => write!(f, "UInt64"),
             Self::Float32 => write!(f, "Float32"),
+            Self::User(id) => write!(f, "<user type #{}>", id.0),
         }
     }
 }
@@ -59,27 +68,6 @@ pub struct Error {
 pub enum Failure {
     Source(Vec<Error>),
     Unknown(&'static str),
-}
-
-impl Error {
-    fn mismatch(span: Span, expected: Ty, found: Ty) -> Self {
-        Self {
-            span,
-            msg: format!("expected '{expected}', found '{found}'"),
-        }
-    }
-
-    /// Specification 009 section 6: a rejected operand pair names both types
-    /// and the exact-match requirement.
-    fn operands(span: Span, what: &str, left: Ty, right: Ty) -> Self {
-        Self {
-            span,
-            msg: format!(
-                "{what} operands must be two numbers of the same type, \
-                 found '{left}' and '{right}'"
-            ),
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -100,28 +88,122 @@ pub enum CmpOp {
     GreaterEq,
 }
 
+/// The root of a checked place. Local names are unique for a whole function or
+/// method (Specification 012 section 5.2), so a name is the binding identity;
+/// no separate ID table is needed to tell two roots apart.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PlaceRoot {
+    Local(String),
+    /// The implicit method receiver.
+    SelfRef,
+}
+
+impl std::fmt::Display for PlaceRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::Local(name) => f.write_str(name),
+            Self::SelfRef => f.write_str("self"),
+        }
+    }
+}
+
+/// A resolved place: a root plus field selectors. Assignment, type tests, and
+/// receiver places all share this shape, and Specification 011's reference
+/// arguments reuse it unchanged.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Place {
+    pub root: PlaceRoot,
+    pub root_ty: Ty,
+    /// Field indices in selection order; empty selects the root itself.
+    pub path: Vec<usize>,
+    /// The type reached after applying `path`.
+    pub ty: Ty,
+}
+
+/// How a method call reaches its receiver. A call that may write through `self`
+/// requires the `Place` form; a read-only call may use a temporary, which the
+/// backend gives compiler-owned storage (Specification 010 section 15.3).
+pub enum TReceiver {
+    Place(Place),
+    Value(TExpr),
+}
+
+pub struct TMethodCall {
+    pub receiver: TReceiver,
+    pub method: MethodId,
+    pub args: Vec<TExpr>,
+}
+
 /// Value-producing checked nodes. Nothing here may stand for a construct
 /// without a result: no sentinel type, dummy value, or fallback expression.
 pub enum TExpr {
     Num(NumLiteral),
     Bool(bool),
     Nil,
-    Local(String),
+    /// Reads a place.
+    Place(Place),
+    /// Reads one field of a value that has no addressable storage.
+    FieldRead {
+        base: Box<TExpr>,
+        index: usize,
+        ty: Ty,
+    },
+    /// Builds a struct or union-member value. Entries appear in written
+    /// evaluation order; each `usize` is the destination field's declaration
+    /// index, so lowering evaluates left to right and stores in field order.
+    Construct {
+        type_id: TypeId,
+        fields: Vec<(usize, TExpr)>,
+    },
+    /// Adds or removes exactly one represented-type layer. Identity at runtime;
+    /// the node exists so the nominal change is explicit before lowering.
+    Represent {
+        value: Box<TExpr>,
+        ty: Ty,
+    },
+    /// Injects a direct member value into its containing union.
+    Inject {
+        member: TypeId,
+        into_union: TypeId,
+        value: Box<TExpr>,
+    },
     Arith(Box<TExpr>, ArithOp, Box<TExpr>, Ty),
     Cmp(Box<TExpr>, CmpOp, Box<TExpr>, Ty),
     /// A call to a declaration that has a result.
     Call(String, Vec<TExpr>),
-    /// An `if` classified as value-form: every branch is a value block and an
-    /// `else` is present, so the form produces a value on every path.
+    /// A method call that has a result.
+    MethodCall(Box<TMethodCall>),
+    /// An `if` classified as value-form: every path produces a value, either
+    /// through an `else` or through a proven-exhaustive type-test chain.
     If(Box<TValueIf>),
     Print(Box<TExpr>, Ty),
     Cast(Box<TExpr>, Ty),
 }
 
+/// A proven type test. `tag` is the member's deterministic union tag, so
+/// lowering compares stored tags without consulting the type table.
+pub struct TTypeTest {
+    pub place: Place,
+    pub member: TypeId,
+    pub tag: u32,
+    /// The name and exact member type bound on the successful edge.
+    pub binding: Option<(String, Ty)>,
+}
+
+/// An `if`/`elseif` condition: an ordinary `Bool` value or a type test.
+pub enum TCondition {
+    Expr(TExpr),
+    Test(TTypeTest),
+}
+
 pub struct TValueIf {
     /// First arm is the `if`; remaining arms are `elseif`s, in source order.
-    pub arms: Vec<(TExpr, TBlock)>,
-    pub else_branch: TBlock,
+    pub arms: Vec<(TCondition, TBlock)>,
+    /// `None` only when `exhaustive` proved every path is covered.
+    pub else_branch: Option<TBlock>,
+    /// Every arm tests the same place and every direct member of its union
+    /// appears exactly once, so the fall-through edge is unreachable.
+    pub exhaustive: bool,
     pub ty: Ty,
 }
 
@@ -135,7 +217,7 @@ pub enum TStmt {
         value: TExpr,
     },
     Assign {
-        name: String,
+        place: Place,
         value: TExpr,
     },
     While {
@@ -148,13 +230,17 @@ pub enum TStmt {
     If(TStmtIf),
     /// A call to a declaration without a result.
     Call(String, Vec<TExpr>),
+    /// A call to a method without a result.
+    MethodCall(TMethodCall),
     /// A value-producing expression whose result is discarded.
     Expr(TExpr),
 }
 
 pub struct TStmtIf {
-    pub arms: Vec<(TExpr, TBlock)>,
+    pub arms: Vec<(TCondition, TBlock)>,
     pub else_branch: Option<TBlock>,
+    /// Same meaning as [`TValueIf::exhaustive`].
+    pub exhaustive: bool,
 }
 
 /// A block's ordered checked elements plus its optional resulting value.
@@ -172,6 +258,17 @@ pub struct TFunc {
     pub body: TBlock,
 }
 
+pub struct TMethod {
+    pub receiver: TypeId,
+    pub name: String,
+    pub params: Vec<(String, Ty)>,
+    pub result: Option<Ty>,
+    /// The least-fixed-point receiver-write effect. Internal only: it creates
+    /// no source-level method category and is not part of the signature.
+    pub writes_receiver: bool,
+    pub body: TBlock,
+}
+
 pub struct TExtern {
     pub symbol: String,
     pub params: Vec<(String, Ty)>,
@@ -183,13 +280,11 @@ pub struct TExtern {
 pub struct Program {
     pub funcs: HashMap<String, TFunc>,
     pub externs: HashMap<String, TExtern>,
+    /// Every resolved user-defined type, indexed by `TypeId`.
+    pub types: Vec<TypeDef>,
+    /// Every checked method, indexed by `MethodId`.
+    pub methods: Vec<TMethod>,
     pub body: TBlock,
-}
-
-#[derive(Clone)]
-struct FuncSig {
-    params: Vec<Ty>,
-    result: Option<Ty>,
 }
 
 #[derive(Clone, Copy)]
@@ -199,59 +294,105 @@ struct Binding<'src> {
     mutable: bool,
 }
 
+/// One method call awaiting the receiver-write fixed point. Validation cannot
+/// run while bodies are checked because a callee's effect may not be known yet.
+struct ReceiverCall {
+    method: MethodId,
+    mutable_root: bool,
+    receiver: String,
+    span: Span,
+}
+
 struct Ctx<'src> {
-    sigs: HashMap<&'src str, FuncSig>,
+    sigs: HashMap<String, FuncSig>,
+    types: Types,
+    method_sigs: Vec<MethodSig>,
+    method_index: HashMap<(TypeId, String), MethodId>,
     /// Every name bound anywhere in the function or method being checked.
     /// Specification 012 section 5.2 makes this uniqueness rule function-wide,
     /// so nested blocks and sibling branches share one set.
     declared: Vec<&'src str>,
     /// One entry per enclosing `while` body. `break` needs a non-empty stack.
     loops: Vec<()>,
+    /// The receiver type while a method body is checked.
+    self_ty: Option<Ty>,
+    current_method: Option<MethodId>,
+    direct_writes: Vec<bool>,
+    effect_edges: Vec<(MethodId, MethodId)>,
+    receiver_calls: Vec<ReceiverCall>,
     errors: Vec<Error>,
     unknown: Option<&'static str>,
+}
+
+impl<'src> Ctx<'src> {
+    fn error(&mut self, span: Span, msg: String) {
+        self.errors.push(Error { span, msg });
+    }
+
+    /// The qualified name of a type, for diagnostics.
+    fn name(&self, ty: Ty) -> String {
+        self.types.display(ty)
+    }
+
+    fn mismatch(&mut self, span: Span, expected: Ty, found: Ty) {
+        let msg = format!(
+            "expected '{}', found '{}'",
+            self.name(expected),
+            self.name(found)
+        );
+        self.error(span, msg);
+    }
+
+    /// Specification 009 section 6: a rejected operand pair names both types
+    /// and the exact-match requirement.
+    fn operands(&mut self, span: Span, what: &str, left: Ty, right: Ty) {
+        let msg = format!(
+            "{what} operands must be two numbers of the same type, found '{}' and '{}'",
+            self.name(left),
+            self.name(right)
+        );
+        self.error(span, msg);
+    }
+
+    fn method_name(&self, method: MethodId) -> String {
+        self.method_sigs[method.index()].qualified(&self.types)
+    }
 }
 
 type Env<'src> = Vec<Binding<'src>>;
 
 pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
+    let mut errors = Vec::new();
+    let collected = types::collect(program, &mut errors);
+    let method_count = collected.methods.len();
     let mut ctx = Ctx {
-        sigs: HashMap::new(),
+        sigs: collected.sigs,
+        types: collected.types,
+        method_sigs: collected.methods,
+        method_index: collected.method_index,
         declared: Vec::new(),
         loops: Vec::new(),
-        errors: Vec::new(),
+        self_ty: None,
+        current_method: None,
+        direct_writes: vec![false; method_count],
+        effect_edges: Vec::new(),
+        receiver_calls: Vec::new(),
+        errors,
         unknown: None,
     };
 
-    for (name, function) in &program.funcs {
-        let params = function.args.iter().map(|param| param.ty.into()).collect();
-        ctx.sigs.insert(
-            *name,
-            FuncSig {
-                params,
-                result: function.ret.map(Into::into),
-            },
-        );
-    }
-    for (name, function) in &program.externs {
+    for function in program.externs.values() {
         check_duplicate_params(&mut ctx, &function.args);
-        let params = function.args.iter().map(|param| param.ty.into()).collect();
-        ctx.sigs.insert(
-            *name,
-            FuncSig {
-                params,
-                result: function.ret.map(Into::into),
-            },
-        );
         if !function.symbol.starts_with("snacc_user_") {
-            ctx.errors.push(Error {
-                span: function.span,
-                msg: "Rust bridge symbols must start with 'snacc_user_'".into(),
-            });
+            ctx.error(
+                function.span,
+                "Rust bridge symbols must start with 'snacc_user_'".into(),
+            );
         } else if !is_rust_identifier(function.symbol) {
-            ctx.errors.push(Error {
-                span: function.span,
-                msg: "Rust bridge symbols must be valid Rust identifiers".into(),
-            });
+            ctx.error(
+                function.span,
+                "Rust bridge symbols must be valid Rust identifiers".into(),
+            );
         }
     }
 
@@ -260,22 +401,10 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
     let mut typed_funcs = HashMap::new();
     for name in names {
         let function = &program.funcs[name];
-        // Parameters and locals share one function-wide binding namespace.
-        ctx.declared.clear();
-        ctx.loops.clear();
+        let signature = ctx.sigs[name].clone();
         let mut env = Env::new();
-        let mut params = Vec::new();
-        for param in &function.args {
-            let ty = param.ty.into();
-            declare(&mut ctx, param.name, param.span, "Parameter");
-            env.push(Binding {
-                name: param.name,
-                ty,
-                mutable: false,
-            });
-            params.push((param.name.to_string(), ty));
-        }
-        let result = function.ret.map(Ty::from);
+        let params = begin_region(&mut ctx, &mut env, &function.args, &signature.params, None);
+        let result = signature.result;
         let body = match result {
             Some(expected) => check_value_block(&mut ctx, &mut env, &function.body, expected),
             None => check_statement_block(&mut ctx, &mut env, &function.body),
@@ -290,22 +419,62 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
         );
     }
 
+    // Methods are checked in declaration order so `MethodId` and the checked
+    // vector agree, and so the effect analysis input is deterministic.
+    let mut typed_methods = Vec::with_capacity(method_count);
+    for index in 0..method_count {
+        let receiver = ctx.method_sigs[index].receiver;
+        let name = ctx.method_sigs[index].name.clone();
+        let result = ctx.method_sigs[index].result;
+        let declared_params = ctx.method_sigs[index].params.clone();
+        let declaration = &program.methods[ctx.method_sigs[index].decl];
+        let mut env = Env::new();
+        let self_ty = Ty::User(receiver);
+        let params = begin_region(
+            &mut ctx,
+            &mut env,
+            &declaration.args,
+            &declared_params
+                .iter()
+                .map(|(_, ty)| *ty)
+                .collect::<Vec<_>>(),
+            Some(self_ty),
+        );
+        ctx.current_method = Some(MethodId(index as u32));
+        let body = match result {
+            Some(expected) => check_value_block(&mut ctx, &mut env, &declaration.body, expected),
+            None => check_statement_block(&mut ctx, &mut env, &declaration.body),
+        };
+        ctx.current_method = None;
+        ctx.self_ty = None;
+        typed_methods.push(TMethod {
+            receiver,
+            name,
+            params,
+            result,
+            writes_receiver: false,
+            body,
+        });
+    }
+
     let mut typed_externs = HashMap::new();
     let mut extern_names: Vec<&str> = program.externs.keys().copied().collect();
     extern_names.sort_unstable();
     for name in extern_names {
         let function = &program.externs[name];
+        let signature = &ctx.sigs[name];
         let params = function
             .args
             .iter()
-            .map(|param| (param.name.to_string(), param.ty.into()))
+            .zip(&signature.params)
+            .map(|(param, ty)| (param.name.to_string(), *ty))
             .collect();
         typed_externs.insert(
             name.to_string(),
             TExtern {
                 symbol: function.symbol.to_string(),
                 params,
-                result: function.ret.map(Into::into),
+                result: signature.result,
                 span: function.span.into_range(),
             },
         );
@@ -318,6 +487,27 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
     let mut env = Env::new();
     let body = check_statement_block(&mut ctx, &mut env, &program.body);
 
+    // Specification 010 section 19 phase 4: solve the effect to its least fixed
+    // point, then validate every deferred receiver-writing call.
+    let writes = solve_receiver_writes(&ctx.direct_writes, &ctx.effect_edges);
+    for (index, method) in typed_methods.iter_mut().enumerate() {
+        method.writes_receiver = writes[index];
+    }
+    let pending = std::mem::take(&mut ctx.receiver_calls);
+    for call in pending {
+        if writes[call.method.index()] && !call.mutable_root {
+            let method = ctx.method_name(call.method);
+            ctx.error(
+                call.span,
+                format!(
+                    "'{method}' may assign through 'self', so its receiver requires a \
+                     mutable root, but '{}' is not mutable",
+                    call.receiver
+                ),
+            );
+        }
+    }
+
     if let Some(detail) = ctx.unknown {
         return Err(Failure::Unknown(detail));
     }
@@ -325,6 +515,8 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
         Ok(Program {
             funcs: typed_funcs,
             externs: typed_externs,
+            types: ctx.types.defs,
+            methods: typed_methods,
             body,
         })
     } else {
@@ -332,14 +524,60 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
     }
 }
 
+/// Starts one function-wide binding region: clears the reserved-name set, binds
+/// every parameter, and records the receiver type for a method.
+fn begin_region<'src>(
+    ctx: &mut Ctx<'src>,
+    env: &mut Env<'src>,
+    args: &[Param<'src>],
+    types: &[Ty],
+    self_ty: Option<Ty>,
+) -> Vec<(String, Ty)> {
+    ctx.declared.clear();
+    ctx.loops.clear();
+    ctx.self_ty = self_ty;
+    let mut params = Vec::new();
+    for (param, ty) in args.iter().zip(types) {
+        declare(ctx, param.name, param.span, "Parameter");
+        env.push(Binding {
+            name: param.name,
+            ty: *ty,
+            // Specification 012 section 8: ordinary parameters are immutable.
+            mutable: false,
+        });
+        params.push((param.name.to_string(), *ty));
+    }
+    params
+}
+
+/// The least fixed point of "this method may write its receiver": a method
+/// writes it when it writes directly, or when it calls -- transitively, and
+/// through cycles -- a receiver-writing method on a `self`-rooted receiver.
+/// Monotone and order-independent, so the result is deterministic.
+fn solve_receiver_writes(direct: &[bool], edges: &[(MethodId, MethodId)]) -> Vec<bool> {
+    let mut writes = direct.to_vec();
+    loop {
+        let mut changed = false;
+        for (caller, callee) in edges {
+            if writes[callee.index()] && !writes[caller.index()] {
+                writes[caller.index()] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            return writes;
+        }
+    }
+}
+
 fn check_duplicate_params(ctx: &mut Ctx<'_>, params: &[Param<'_>]) {
     let mut seen: Vec<&str> = Vec::new();
     for param in params {
         if seen.contains(&param.name) {
-            ctx.errors.push(Error {
-                span: param.span,
-                msg: format!("Parameter '{}' already exists", param.name),
-            });
+            ctx.error(
+                param.span,
+                format!("Parameter '{}' already exists", param.name),
+            );
         } else {
             seen.push(param.name);
         }
@@ -350,10 +588,7 @@ fn check_duplicate_params(ctx: &mut Ctx<'_>, params: &[Param<'_>]) {
 /// a second layer for the same name.
 fn declare<'src>(ctx: &mut Ctx<'src>, name: &'src str, span: Span, kind: &str) {
     if ctx.declared.contains(&name) {
-        ctx.errors.push(Error {
-            span,
-            msg: format!("{kind} '{name}' already exists"),
-        });
+        ctx.error(span, format!("{kind} '{name}' already exists"));
     } else {
         ctx.declared.push(name);
     }
@@ -368,24 +603,19 @@ fn is_rust_identifier(symbol: &str) -> bool {
     chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
-/// The two types the one surviving implicit conversion joins. Specification
-/// 009 section 4.4 adds no further promotion, so nothing else belongs here.
+/// The two types the one surviving implicit numeric conversion joins.
+/// Specification 009 section 4.4 adds no further promotion.
 fn numeric(ty: Ty) -> bool {
-    match ty {
-        Ty::Dec64 | Ty::Int64 => true,
-        Ty::Bool | Ty::Nil | Ty::UInt8 | Ty::UInt16 | Ty::UInt32 | Ty::UInt64 | Ty::Float32 => {
-            false
-        }
-    }
+    matches!(ty, Ty::Dec64 | Ty::Int64)
 }
 
 /// Numeric types that operate only on an exact type match (Specification 009
 /// sections 4.5-4.6): they never promote, not even to each other.
 fn exact_match_numeric(ty: Ty) -> bool {
-    match ty {
-        Ty::UInt8 | Ty::UInt16 | Ty::UInt32 | Ty::UInt64 | Ty::Float32 => true,
-        Ty::Dec64 | Ty::Int64 | Ty::Bool | Ty::Nil => false,
-    }
+    matches!(
+        ty,
+        Ty::UInt8 | Ty::UInt16 | Ty::UInt32 | Ty::UInt64 | Ty::Float32
+    )
 }
 
 fn common_numeric(left: Ty, right: Ty) -> Option<Ty> {
@@ -406,29 +636,207 @@ fn operand_numeric(left: Ty, right: Ty) -> Option<Ty> {
         .or_else(|| (left == right && exact_match_numeric(left)).then_some(left))
 }
 
-/// The one implicit conversion Snacc has. Every other assignment, argument,
-/// result, and branch requires an exact type match (Specification 009 4.4).
+/// Assignability. Beyond `Int64` to `Dec64`, Specification 010 section 13 adds
+/// exactly one implicit conversion: direct union-member injection, including
+/// the contextual `nil` spelling of a union's `Nil` member.
 fn coerce(ctx: &mut Ctx<'_>, value: TExpr, from: Ty, to: Ty, span: Span) -> TExpr {
     if from == to {
-        value
-    } else if from == Ty::Int64 && to == Ty::Dec64 {
-        TExpr::Cast(Box::new(value), Ty::Dec64)
-    } else {
-        ctx.errors.push(Error::mismatch(span, to, from));
-        value
+        return value;
+    }
+    if from == Ty::Int64 && to == Ty::Dec64 {
+        return TExpr::Cast(Box::new(value), Ty::Dec64);
+    }
+    if let Ty::User(union) = to {
+        if let Ty::User(member) = from
+            && ctx.types.containing_union(member) == Some(union)
+        {
+            return TExpr::Inject {
+                member,
+                into_union: union,
+                value: Box::new(value),
+            };
+        }
+        // Specification 012 section 10: `nil` names the `Nil` member of one
+        // expected union and never has the standalone type `Nil`.
+        if from == Ty::Nil
+            && let Some(member) = ctx.types.member(union, "Nil")
+        {
+            return TExpr::Inject {
+                member,
+                into_union: union,
+                value: Box::new(TExpr::Construct {
+                    type_id: member,
+                    fields: Vec::new(),
+                }),
+            };
+        }
+    }
+    ctx.mismatch(span, to, from);
+    value
+}
+
+/// A resolved place plus its root's mutability. Mutability is a property of the
+/// root alone (Specification 012 section 7); the struct definition is never
+/// consulted.
+struct Resolved {
+    place: Place,
+    mutable: bool,
+}
+
+/// Whether an expression resolves to a place.
+enum PlaceOutcome {
+    Resolved(Resolved),
+    /// The root was a binding or `self` but the field path failed; a diagnostic
+    /// has already been recorded.
+    Reported,
+    /// The root is not a binding, so the caller may treat this as a value or a
+    /// qualified type path.
+    NotAPlace,
+}
+
+/// Splits `a.b.c` into its innermost atom and the field names selected from it.
+fn flatten<'a, 'src>(
+    expr: &'a Spanned<Expr<'src>>,
+) -> (&'a Spanned<Expr<'src>>, Vec<Spanned<&'src str>>) {
+    let mut fields = Vec::new();
+    let mut current = expr;
+    while let Expr::Member(base, name) = &current.0 {
+        fields.push(*name);
+        current = base;
+    }
+    fields.reverse();
+    (current, fields)
+}
+
+/// Walks a field path from a root type, reporting the first failure.
+fn walk_fields(
+    ctx: &mut Ctx<'_>,
+    root_ty: Ty,
+    fields: &[Spanned<&str>],
+) -> Option<(Vec<usize>, Ty)> {
+    let mut path = Vec::new();
+    let mut current = root_ty;
+    for (name, span) in fields {
+        let Ty::User(id) = current else {
+            let owner = ctx.name(current);
+            ctx.error(
+                *span,
+                format!("'{owner}' is not a struct, so it has no field '{name}'"),
+            );
+            return None;
+        };
+        let Some((index, ty)) = ctx.types.field(id, name) else {
+            let owner = ctx.types.def(id).name().to_string();
+            let msg = if ctx.method_index.contains_key(&(id, (*name).to_string())) {
+                format!("'{owner}.{name}' is a method; a method requires a receiver call")
+            } else if ctx.types.def(id).fields().is_none() {
+                format!("'{owner}' is not a struct, so it has no field '{name}'")
+            } else {
+                format!("'{owner}' has no field '{name}'")
+            };
+            ctx.error(*span, msg);
+            return None;
+        };
+        path.push(index);
+        current = ty;
+    }
+    Some((path, current))
+}
+
+/// Resolves the root of a place without reporting anything, so a caller can
+/// fall back to value or type-path resolution.
+fn place_root<'src>(
+    ctx: &Ctx<'src>,
+    env: &Env<'src>,
+    root: &Expr<'src>,
+) -> Option<(PlaceRoot, Ty, bool)> {
+    match root {
+        Expr::SelfRef => ctx
+            .self_ty
+            // Specification 012 section 9: `self` is writable inside its own
+            // method body; caller permission is enforced at each call site.
+            .map(|ty| (PlaceRoot::SelfRef, ty, true)),
+        Expr::Local(name) => {
+            env.iter()
+                .rev()
+                .find(|binding| binding.name == *name)
+                .map(|binding| {
+                    (
+                        PlaceRoot::Local((*name).to_string()),
+                        binding.ty,
+                        binding.mutable,
+                    )
+                })
+        }
+        _ => None,
     }
 }
 
-fn check_condition<'src>(
+fn as_place<'src>(
     ctx: &mut Ctx<'src>,
-    env: &mut Env<'src>,
-    condition: &Spanned<Expr<'src>>,
-) -> TExpr {
-    let (value, ty) = check_expr(ctx, env, condition);
-    if ty != Ty::Bool {
-        ctx.errors.push(Error::mismatch(condition.1, Ty::Bool, ty));
-    }
-    value
+    env: &Env<'src>,
+    expr: &Spanned<Expr<'src>>,
+) -> PlaceOutcome {
+    let (root, fields) = flatten(expr);
+    let Some((place_root, root_ty, mutable)) = place_root(ctx, env, &root.0) else {
+        return PlaceOutcome::NotAPlace;
+    };
+    let Some((path, ty)) = walk_fields(ctx, root_ty, &fields) else {
+        return PlaceOutcome::Reported;
+    };
+    PlaceOutcome::Resolved(Resolved {
+        place: Place {
+            root: place_root,
+            root_ty,
+            path,
+            ty,
+        },
+        mutable,
+    })
+}
+
+/// Resolves a written place (an assignment target or an `is` subject).
+fn resolve_place<'src>(
+    ctx: &mut Ctx<'src>,
+    env: &Env<'src>,
+    path: &PlacePath<'src>,
+) -> Option<Resolved> {
+    let (root, root_ty, mutable) = match path.root {
+        PlaceRootName::SelfRef => match ctx.self_ty {
+            Some(ty) => (PlaceRoot::SelfRef, ty, true),
+            None => {
+                ctx.error(
+                    path.root_span,
+                    "'self' is only valid inside a method body".into(),
+                );
+                return None;
+            }
+        },
+        PlaceRootName::Name(name) => {
+            let Some(binding) = env.iter().rev().find(|binding| binding.name == name) else {
+                ctx.error(
+                    path.root_span,
+                    format!("No such variable '{name}' in scope"),
+                );
+                return None;
+            };
+            (
+                PlaceRoot::Local(name.to_string()),
+                binding.ty,
+                binding.mutable,
+            )
+        }
+    };
+    let (field_path, ty) = walk_fields(ctx, root_ty, &path.fields)?;
+    Some(Resolved {
+        place: Place {
+            root,
+            root_ty,
+            path: field_path,
+            ty,
+        },
+        mutable,
+    })
 }
 
 /// Checks a block that must supply a value of `expected`. Every element but
@@ -458,24 +866,24 @@ fn check_value_block<'src>(
                 result = Some(check_value_if(ctx, env, form, expected));
             }
             _ => {
-                ctx.errors.push(Error {
-                    span: element.1,
-                    msg: format!(
-                        "this block must end in an expression of type '{expected}', \
+                let name = ctx.name(expected);
+                ctx.error(
+                    element.1,
+                    format!(
+                        "this block must end in an expression of type '{name}', \
                          but it ends in a statement"
                     ),
-                });
+                );
                 statements.push(check_stmt(ctx, env, element));
             }
         }
     }
     if result.is_none() && block.elements.is_empty() {
-        ctx.errors.push(Error {
-            span: block.span,
-            msg: format!(
-                "this block must end in an expression of type '{expected}', but it is empty"
-            ),
-        });
+        let name = ctx.name(expected);
+        ctx.error(
+            block.span,
+            format!("this block must end in an expression of type '{name}', but it is empty"),
+        );
     }
     env.truncate(scope);
     TBlock { statements, result }
@@ -501,6 +909,116 @@ fn check_statement_block<'src>(
     }
 }
 
+/// Checks one arm's condition, leaving any type-test binding visible in `env`
+/// for the arm body only. The caller restores `env` after the body.
+fn check_arm_condition<'src>(
+    ctx: &mut Ctx<'src>,
+    env: &mut Env<'src>,
+    condition: &Condition<'src>,
+) -> TCondition {
+    match condition {
+        Condition::Expr(expression) => {
+            let (value, ty) = check_expr(ctx, env, expression);
+            if ty != Ty::Bool {
+                ctx.mismatch(expression.1, Ty::Bool, ty);
+            }
+            TCondition::Expr(value)
+        }
+        Condition::TypeTest(test) => match check_type_test(ctx, env, test) {
+            Some(checked) => {
+                if let (Some((name, _)), Some((_, ty))) = (test.binding, &checked.binding) {
+                    env.push(Binding {
+                        name,
+                        ty: *ty,
+                        // Specification 012 section 7: a type-test binding is an
+                        // immutable root.
+                        mutable: false,
+                    });
+                }
+                TCondition::Test(checked)
+            }
+            None => TCondition::Expr(TExpr::Bool(false)),
+        },
+    }
+}
+
+fn check_condition<'src>(
+    ctx: &mut Ctx<'src>,
+    env: &mut Env<'src>,
+    condition: &Spanned<Expr<'src>>,
+) -> TExpr {
+    let (value, ty) = check_expr(ctx, env, condition);
+    if ty != Ty::Bool {
+        ctx.mismatch(condition.1, Ty::Bool, ty);
+    }
+    value
+}
+
+/// What an `if`/`elseif` chain proves about union coverage.
+struct ChainFact {
+    /// Every arm is a type test over one syntactic place, and every direct
+    /// member of that place's union is tested exactly once.
+    exhaustive: bool,
+    /// The qualified names of members a same-place chain fails to handle.
+    missing: Vec<String>,
+}
+
+/// Specification 010 section 12.4. Proves -- never guesses -- whether a chain
+/// covers every member, and reports unreachable duplicate branches.
+fn analyze_chain(ctx: &mut Ctx<'_>, arms: &[(TCondition, TBlock)], spans: &[Span]) -> ChainFact {
+    let mut subject: Option<Place> = None;
+    let mut tested: Vec<TypeId> = Vec::new();
+    let mut chain = true;
+    for ((condition, _), span) in arms.iter().zip(spans) {
+        let TCondition::Test(test) = condition else {
+            chain = false;
+            break;
+        };
+        match &subject {
+            None => subject = Some(test.place.clone()),
+            Some(first) if *first == test.place => {}
+            Some(_) => {
+                chain = false;
+                break;
+            }
+        }
+        if tested.contains(&test.member) {
+            let name = ctx.types.def(test.member).name().to_string();
+            ctx.error(
+                *span,
+                format!(
+                    "'{name}' is already handled by an earlier branch, so this branch \
+                     is unreachable"
+                ),
+            );
+        } else {
+            tested.push(test.member);
+        }
+    }
+    let covered = chain
+        .then(|| subject.as_ref())
+        .flatten()
+        .and_then(|place| match place.ty {
+            Ty::User(id) => ctx.types.union_members(id).map(<[TypeId]>::to_vec),
+            _ => None,
+        });
+    let Some(members) = covered else {
+        return ChainFact {
+            exhaustive: false,
+            missing: Vec::new(),
+        };
+    };
+    let missing: Vec<String> = members
+        .iter()
+        .filter(|member| !tested.contains(member))
+        .map(|member| ctx.types.def(*member).name().to_string())
+        .collect();
+    ChainFact {
+        exhaustive: missing.is_empty() && !members.is_empty(),
+        missing,
+    }
+}
+
 fn check_value_if<'src>(
     ctx: &mut Ctx<'src>,
     env: &mut Env<'src>,
@@ -508,32 +1026,48 @@ fn check_value_if<'src>(
     expected: Ty,
 ) -> TExpr {
     let mut arms = Vec::new();
+    let mut spans = Vec::new();
     for (condition, body) in &form.arms {
-        let condition = check_condition(ctx, env, condition);
+        let scope = env.len();
+        let checked = check_arm_condition(ctx, env, condition);
         let body = check_value_block(ctx, env, body, expected);
-        arms.push((condition, body));
+        env.truncate(scope);
+        spans.push(condition.span());
+        arms.push((checked, body));
     }
-    // Specification 010 will add an exhaustive union type-test chain as the
-    // second way to cover every path; until unions exist, `else` is the only
-    // one.
+    let fact = analyze_chain(ctx, &arms, &spans);
     let else_branch = match &form.else_branch {
-        Some(body) => check_value_block(ctx, env, body, expected),
-        None => {
-            ctx.errors.push(Error {
-                span: form.span,
-                msg: format!(
-                    "an 'if' that produces a value of type '{expected}' requires an 'else' branch"
-                ),
-            });
-            TBlock {
-                statements: Vec::new(),
-                result: None,
+        Some(body) => {
+            if fact.exhaustive {
+                ctx.error(
+                    form.span,
+                    "this type-test chain already covers every union member, so the \
+                     'else' branch is unreachable"
+                        .into(),
+                );
             }
+            Some(check_value_block(ctx, env, body, expected))
+        }
+        None if fact.exhaustive => None,
+        None => {
+            let name = ctx.name(expected);
+            let msg = if fact.missing.is_empty() {
+                format!("an 'if' that produces a value of type '{name}' requires an 'else' branch")
+            } else {
+                format!(
+                    "this type-test chain produces a value of type '{name}' without an \
+                     'else' branch, but does not handle {}",
+                    fact.missing.join(", ")
+                )
+            };
+            ctx.error(form.span, msg);
+            None
         }
     };
     TExpr::If(Box::new(TValueIf {
         arms,
         else_branch,
+        exhaustive: fact.exhaustive,
         ty: expected,
     }))
 }
@@ -551,7 +1085,7 @@ fn check_stmt<'src>(
             ty,
             value,
         } => {
-            let declared = Ty::from(*ty);
+            let declared = resolve_type(ctx, ty);
             // The initializer is checked before the name is in scope, so it can
             // never refer to the variable being created.
             let (checked, value_ty) = check_expr(ctx, env, value);
@@ -569,38 +1103,32 @@ fn check_stmt<'src>(
                 value: checked,
             }
         }
-        BlockElement::Assign {
-            name,
-            name_span,
-            value,
-        } => {
-            let target = env
-                .iter()
-                .rev()
-                .find(|binding| binding.name == *name)
-                .copied();
+        BlockElement::Assign { place, value } => {
+            let target = resolve_place(ctx, env, place);
             let (checked, value_ty) = check_expr(ctx, env, value);
-            let checked = match target {
-                Some(binding) => {
-                    if !binding.mutable {
-                        ctx.errors.push(Error {
-                            span: *name_span,
-                            msg: format!("'{name}' is not declared 'mut' and cannot be assigned"),
-                        });
+            match target {
+                Some(resolved) => {
+                    if !resolved.mutable {
+                        ctx.error(
+                            place.root_span,
+                            format!(
+                                "'{}' is not declared 'mut' and cannot be assigned",
+                                place.root
+                            ),
+                        );
                     }
-                    coerce(ctx, checked, value_ty, binding.ty, value.1)
+                    let checked = coerce(ctx, checked, value_ty, resolved.place.ty, value.1);
+                    if resolved.place.root == PlaceRoot::SelfRef
+                        && let Some(method) = ctx.current_method
+                    {
+                        ctx.direct_writes[method.index()] = true;
+                    }
+                    TStmt::Assign {
+                        place: resolved.place,
+                        value: checked,
+                    }
                 }
-                None => {
-                    ctx.errors.push(Error {
-                        span: *name_span,
-                        msg: format!("No such variable '{name}' in scope"),
-                    });
-                    checked
-                }
-            };
-            TStmt::Assign {
-                name: (*name).to_string(),
-                value: checked,
+                None => TStmt::Expr(checked),
             }
         }
         BlockElement::While {
@@ -614,89 +1142,652 @@ fn check_stmt<'src>(
         }
         BlockElement::Break(span) => {
             if ctx.loops.is_empty() {
-                ctx.errors.push(Error {
-                    span: *span,
-                    msg: "'break' is only valid inside a 'while' body, which is the only \
-                          construct that establishes a loop target"
+                ctx.error(
+                    *span,
+                    "'break' is only valid inside a 'while' body, which is the only \
+                     construct that establishes a loop target"
                         .into(),
-                });
+                );
             }
             TStmt::Break
         }
         BlockElement::If(form) => {
             let mut arms = Vec::new();
+            let mut spans = Vec::new();
             for (condition, body) in &form.arms {
-                let condition = check_condition(ctx, env, condition);
+                let scope = env.len();
+                let checked = check_arm_condition(ctx, env, condition);
                 let body = check_statement_block(ctx, env, body);
-                arms.push((condition, body));
+                env.truncate(scope);
+                spans.push(condition.span());
+                arms.push((checked, body));
+            }
+            let fact = analyze_chain(ctx, &arms, &spans);
+            if fact.exhaustive && form.else_branch.is_some() {
+                ctx.error(
+                    form.span,
+                    "this type-test chain already covers every union member, so the \
+                     'else' branch is unreachable"
+                        .into(),
+                );
             }
             let else_branch = form
                 .else_branch
                 .as_ref()
                 .map(|body| check_statement_block(ctx, env, body));
-            TStmt::If(TStmtIf { arms, else_branch })
+            TStmt::If(TStmtIf {
+                arms,
+                else_branch,
+                exhaustive: fact.exhaustive,
+            })
         }
         BlockElement::Expr(expression) => {
             // A call to a declaration without a result is a call statement, not
             // an expression whose value is discarded.
-            if let Expr::Call(function, arguments) = &expression.0
-                && let Some((name, args, None)) =
-                    check_call(ctx, env, expression.1, function, arguments)
-            {
-                return TStmt::Call(name, args);
+            if let Expr::Call(callee, arguments) = &expression.0 {
+                return match check_call(ctx, env, expression.1, callee, arguments) {
+                    Some(CheckedCall::Function {
+                        name,
+                        args,
+                        result: None,
+                    }) => TStmt::Call(name, args),
+                    Some(CheckedCall::Function { name, args, .. }) => {
+                        TStmt::Expr(TExpr::Call(name, args))
+                    }
+                    Some(CheckedCall::Method { call, result: None }) => TStmt::MethodCall(call),
+                    Some(CheckedCall::Method { call, .. }) => {
+                        TStmt::Expr(TExpr::MethodCall(Box::new(call)))
+                    }
+                    Some(CheckedCall::Value(value, _)) => TStmt::Expr(value),
+                    None => TStmt::Expr(TExpr::Nil),
+                };
             }
             TStmt::Expr(check_expr(ctx, env, expression).0)
         }
     }
 }
 
-/// Checks a call's callee and arguments. Returns `None` when the callee is not
-/// a resolvable declaration (the diagnostic has already been recorded).
+/// Resolves a written type in a `let`. Function, method, field, and bridge
+/// types are resolved once during declaration collection.
+fn resolve_type(ctx: &mut Ctx<'_>, ty: &Spanned<TypeRef<'_>>) -> Ty {
+    match &ty.0 {
+        TypeRef::Builtin(name) => Ty::from(*name),
+        TypeRef::Named(segments) => {
+            let (first, first_span) = segments[0];
+            let Some(root) = ctx.types.top_level(first) else {
+                ctx.error(first_span, format!("Unknown type '{first}'"));
+                return Ty::Nil;
+            };
+            match segments.len() {
+                1 => Ty::User(root),
+                2 => {
+                    let (member, span) = segments[1];
+                    match ctx.types.member(root, member) {
+                        Some(id) => Ty::User(id),
+                        None => {
+                            ctx.error(span, format!("Unknown type '{first}.{member}'"));
+                            Ty::Nil
+                        }
+                    }
+                }
+                _ => {
+                    ctx.error(
+                        ty.1,
+                        "a qualified type name has at most two components".into(),
+                    );
+                    Ty::Nil
+                }
+            }
+        }
+    }
+}
+
+/// What a checked call turned out to be.
+enum CheckedCall {
+    Function {
+        name: String,
+        args: Vec<TExpr>,
+        result: Option<Ty>,
+    },
+    Method {
+        call: TMethodCall,
+        result: Option<Ty>,
+    },
+    /// A constructor, wrap, or unwrap. These always produce a value.
+    Value(TExpr, Ty),
+}
+
+/// Specification 010 section 6.1: resolves one call head. A qualified path
+/// whose first component is an in-scope local, parameter, or `self` is a
+/// receiver access; that test runs before any type or callable lookup. A bare
+/// `name(...)` never calls a local, because Snacc has no function values.
 fn check_call<'src>(
     ctx: &mut Ctx<'src>,
     env: &mut Env<'src>,
     span: Span,
-    function: &Spanned<Expr<'src>>,
-    arguments: &Spanned<Vec<Spanned<Expr<'src>>>>,
-) -> Option<(String, Vec<TExpr>, Option<Ty>)> {
-    let Expr::Local(name) = &function.0 else {
-        ctx.errors.push(Error {
-            span: function.1,
-            msg: "only calling a function by name is supported".into(),
-        });
-        return None;
-    };
-    let Some(signature) = ctx.sigs.get(name).cloned() else {
-        ctx.errors.push(Error {
-            span: function.1,
-            msg: format!("'{name}' is not callable"),
-        });
-        return None;
-    };
-    let mut checked = Vec::new();
-    for argument in &arguments.0 {
-        let (value, value_ty) = check_expr(ctx, env, argument);
-        checked.push((value, value_ty, argument.1));
+    callee: &Spanned<Expr<'src>>,
+    arguments: &Spanned<Vec<Arg<'src>>>,
+) -> Option<CheckedCall> {
+    let args = &arguments.0;
+    match &callee.0 {
+        // `Int64(id)` removes one represented layer.
+        Expr::BuiltinType(name) => Some(check_convert(ctx, env, span, Ty::from(*name), args)),
+        // A bare `name(...)` resolves only a top-level callable or a type
+        // constructor: it never reaches the local binding namespace, because
+        // Snacc has no function values.
+        Expr::Local(name) => {
+            if ctx.sigs.contains_key(*name) {
+                return check_function_call(ctx, env, span, name, args);
+            }
+            if let Some(id) = ctx.types.top_level(*name) {
+                return Some(check_type_call(ctx, env, span, id, args, callee.1));
+            }
+            let msg = if env.iter().any(|binding| binding.name == *name) {
+                format!(
+                    "'{name}' is a variable; Snacc has no function values, so it cannot be called"
+                )
+            } else {
+                format!("'{name}' is not callable")
+            };
+            ctx.error(callee.1, msg);
+            None
+        }
+        Expr::Member(base, (member, member_span)) => {
+            match as_place(ctx, env, base) {
+                PlaceOutcome::Resolved(resolved) => {
+                    let receiver_ty = resolved.place.ty;
+                    let self_rooted = resolved.place.root == PlaceRoot::SelfRef;
+                    let description = resolved.place.root.to_string();
+                    check_method_call(
+                        ctx,
+                        env,
+                        span,
+                        TReceiver::Place(resolved.place),
+                        receiver_ty,
+                        resolved.mutable,
+                        self_rooted,
+                        description,
+                        member,
+                        *member_span,
+                        args,
+                    )
+                }
+                PlaceOutcome::Reported => None,
+                PlaceOutcome::NotAPlace => {
+                    // `Union.Member(...)` names a member constructor.
+                    if let Expr::Local(first) = &base.0
+                        && let Some(root) = ctx.types.top_level(first)
+                    {
+                        return match ctx.types.member(root, member) {
+                            Some(id) => Some(check_type_call(ctx, env, span, id, args, callee.1)),
+                            None => {
+                                let owner = ctx.types.def(root).name().to_string();
+                                ctx.error(
+                                    *member_span,
+                                    format!("'{owner}' has no member type '{member}'"),
+                                );
+                                None
+                            }
+                        };
+                    }
+                    // Otherwise a method on a computed value.
+                    let before = ctx.errors.len();
+                    let (value, ty) = check_expr(ctx, env, base);
+                    if ctx.errors.len() != before {
+                        return None;
+                    }
+                    check_method_call(
+                        ctx,
+                        env,
+                        span,
+                        TReceiver::Value(value),
+                        ty,
+                        false,
+                        false,
+                        "a temporary".into(),
+                        member,
+                        *member_span,
+                        args,
+                    )
+                }
+            }
+        }
+        _ => {
+            ctx.error(
+                callee.1,
+                "only calling a function, type, or method by name is supported".into(),
+            );
+            None
+        }
     }
+}
+
+/// Rejects the named-argument form outside struct construction.
+fn reject_named_args(ctx: &mut Ctx<'_>, what: &str, args: &[Arg<'_>]) {
+    for arg in args {
+        if let Some((name, span)) = arg.name {
+            ctx.error(
+                span,
+                format!(
+                    "named argument '{name}' is not valid for {what}; named arguments \
+                     are only used to construct a struct"
+                ),
+            );
+        }
+    }
+}
+
+fn check_function_call<'src>(
+    ctx: &mut Ctx<'src>,
+    env: &mut Env<'src>,
+    span: Span,
+    name: &str,
+    args: &[Arg<'src>],
+) -> Option<CheckedCall> {
+    let signature = ctx.sigs.get(name).cloned()?;
+    reject_named_args(ctx, "a function call", args);
+    let checked = check_positional(ctx, env, args);
     if signature.params.len() != checked.len() {
-        ctx.errors.push(Error {
+        ctx.error(
             span,
-            msg: format!(
+            format!(
                 "'{name}' called with wrong number of arguments (expected {}, found {})",
                 signature.params.len(),
                 checked.len()
             ),
-        });
+        );
     }
-    let mut args = Vec::new();
+    let mut values = Vec::new();
     for (index, (value, value_ty, arg_span)) in checked.into_iter().enumerate() {
-        if let Some(expected) = signature.params.get(index) {
-            args.push(coerce(ctx, value, value_ty, *expected, arg_span));
-        } else {
-            args.push(value);
+        match signature.params.get(index) {
+            Some(expected) => values.push(coerce(ctx, value, value_ty, *expected, arg_span)),
+            None => values.push(value),
         }
     }
-    Some(((*name).to_string(), args, signature.result))
+    Some(CheckedCall::Function {
+        name: name.to_string(),
+        args: values,
+        result: signature.result,
+    })
+}
+
+fn check_positional<'src>(
+    ctx: &mut Ctx<'src>,
+    env: &mut Env<'src>,
+    args: &[Arg<'src>],
+) -> Vec<(TExpr, Ty, Span)> {
+    args.iter()
+        .map(|arg| {
+            let (value, ty) = check_expr(ctx, env, &arg.value);
+            (value, ty, arg.value.1)
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_method_call<'src>(
+    ctx: &mut Ctx<'src>,
+    env: &mut Env<'src>,
+    span: Span,
+    receiver: TReceiver,
+    receiver_ty: Ty,
+    mutable_root: bool,
+    self_rooted: bool,
+    description: String,
+    name: &str,
+    name_span: Span,
+    args: &[Arg<'src>],
+) -> Option<CheckedCall> {
+    let Ty::User(id) = receiver_ty else {
+        let owner = ctx.name(receiver_ty);
+        ctx.error(name_span, format!("'{owner}' has no method '{name}'"));
+        return None;
+    };
+    let Some(method) = ctx.method_index.get(&(id, name.to_string())).copied() else {
+        let owner = ctx.types.def(id).name().to_string();
+        let msg = if ctx.types.field(id, name).is_some() {
+            format!("'{owner}.{name}' is a field, not a method, so it cannot be called")
+        } else {
+            format!("'{owner}' has no method '{name}'")
+        };
+        ctx.error(name_span, msg);
+        return None;
+    };
+    reject_named_args(ctx, "a method call", args);
+    let signature_params = ctx.method_sigs[method.index()].params.clone();
+    let result = ctx.method_sigs[method.index()].result;
+    let checked = check_positional(ctx, env, args);
+    if signature_params.len() != checked.len() {
+        let qualified = ctx.method_name(method);
+        ctx.error(
+            span,
+            format!(
+                "'{qualified}' called with wrong number of arguments (expected {}, found {})",
+                signature_params.len(),
+                checked.len()
+            ),
+        );
+    }
+    let mut values = Vec::new();
+    for (index, (value, value_ty, arg_span)) in checked.into_iter().enumerate() {
+        match signature_params.get(index) {
+            Some((_, expected)) => values.push(coerce(ctx, value, value_ty, *expected, arg_span)),
+            None => values.push(value),
+        }
+    }
+    // The effect is not known yet, so the receiver check is deferred to the
+    // fixed point (Specification 010 section 19 phase 4).
+    ctx.receiver_calls.push(ReceiverCall {
+        method,
+        mutable_root: mutable_root && matches!(receiver, TReceiver::Place(_)),
+        receiver: description,
+        span,
+    });
+    if self_rooted && let Some(caller) = ctx.current_method {
+        ctx.effect_edges.push((caller, method));
+    }
+    Some(CheckedCall::Method {
+        call: TMethodCall {
+            receiver,
+            method,
+            args: values,
+        },
+        result,
+    })
+}
+
+/// Calling a user type: struct or member construction, or one represented
+/// wrap/unwrap layer.
+fn check_type_call<'src>(
+    ctx: &mut Ctx<'src>,
+    env: &mut Env<'src>,
+    span: Span,
+    id: TypeId,
+    args: &[Arg<'src>],
+    head_span: Span,
+) -> CheckedCall {
+    enum Head {
+        Represented,
+        Union(String),
+        Fields,
+    }
+    let head = match ctx.types.def(id) {
+        TypeDef::Represented { .. } => Head::Represented,
+        TypeDef::Union { name, .. } => Head::Union(name.clone()),
+        TypeDef::Struct { .. } | TypeDef::UnionMember { .. } => Head::Fields,
+    };
+    match head {
+        Head::Represented => check_convert(ctx, env, span, Ty::User(id), args),
+        Head::Union(name) => {
+            ctx.error(
+                head_span,
+                format!(
+                    "'{name}' is a union; construction names one member type, not the \
+                     union itself"
+                ),
+            );
+            for arg in args {
+                check_expr(ctx, env, &arg.value);
+            }
+            CheckedCall::Value(TExpr::Nil, Ty::Nil)
+        }
+        Head::Fields => check_construct(ctx, env, span, id, args),
+    }
+}
+
+/// Specification 010 section 7.2: exactly one layer, exact immediate type, no
+/// named arguments, and no general numeric cast.
+fn check_convert<'src>(
+    ctx: &mut Ctx<'src>,
+    env: &mut Env<'src>,
+    span: Span,
+    to: Ty,
+    args: &[Arg<'src>],
+) -> CheckedCall {
+    reject_named_args(ctx, "a represented-type conversion", args);
+    let [arg] = args else {
+        let name = ctx.name(to);
+        ctx.error(
+            span,
+            format!(
+                "'{name}' converts exactly one positional value, but {} were supplied",
+                args.len()
+            ),
+        );
+        for arg in args {
+            check_expr(ctx, env, &arg.value);
+        }
+        return CheckedCall::Value(TExpr::Nil, to);
+    };
+    let (value, from) = check_expr(ctx, env, &arg.value);
+    let wraps = matches!(to, Ty::User(id) if ctx.types.represented_target(id) == Some(from));
+    let unwraps = matches!(from, Ty::User(id) if ctx.types.represented_target(id) == Some(to));
+    if !wraps && !unwraps {
+        let target = ctx.name(to);
+        let found = ctx.name(from);
+        let msg = match to {
+            Ty::User(id) => {
+                let target_ty = ctx.types.represented_target(id);
+                let immediate = target_ty
+                    .map(|ty| ctx.name(ty))
+                    .unwrap_or_else(|| target.clone());
+                format!(
+                    "'{target}' wraps exactly its immediate representation '{immediate}', \
+                     found '{found}'"
+                )
+            }
+            _ => format!(
+                "'{target}' unwraps exactly one value of a type represented by \
+                 '{target}', found '{found}'"
+            ),
+        };
+        ctx.error(arg.value.1, msg);
+    }
+    CheckedCall::Value(
+        TExpr::Represent {
+            value: Box::new(value),
+            ty: to,
+        },
+        to,
+    )
+}
+
+/// Specification 010 sections 8.2-8.3: named fields, each exactly once, checked
+/// and evaluated in written order.
+fn check_construct<'src>(
+    ctx: &mut Ctx<'src>,
+    env: &mut Env<'src>,
+    span: Span,
+    id: TypeId,
+    args: &[Arg<'src>],
+) -> CheckedCall {
+    let type_name = ctx.types.def(id).name().to_string();
+    let fields: Vec<(String, Ty)> = ctx
+        .types
+        .def(id)
+        .fields()
+        .expect("a constructed type has fields")
+        .to_vec();
+    if fields.is_empty() {
+        if !args.is_empty() {
+            ctx.error(
+                span,
+                format!("'{type_name}' has no fields, so it is constructed with '()'"),
+            );
+            for arg in args {
+                check_expr(ctx, env, &arg.value);
+            }
+        }
+        return CheckedCall::Value(
+            TExpr::Construct {
+                type_id: id,
+                fields: Vec::new(),
+            },
+            Ty::User(id),
+        );
+    }
+
+    let mut checked: Vec<(usize, TExpr)> = Vec::new();
+    let mut filled = vec![false; fields.len()];
+    for arg in args {
+        let Some((name, name_span)) = arg.name else {
+            ctx.error(
+                arg.value.1,
+                format!(
+                    "'{type_name}' requires named fields; positional construction of a \
+                     non-empty struct is invalid"
+                ),
+            );
+            check_expr(ctx, env, &arg.value);
+            continue;
+        };
+        let Some(index) = fields.iter().position(|(field, _)| field == name) else {
+            ctx.error(name_span, format!("'{type_name}' has no field '{name}'"));
+            check_expr(ctx, env, &arg.value);
+            continue;
+        };
+        // Arguments evaluate left to right in written order; the destination
+        // index travels with the value so lowering can store in field order.
+        let (value, ty) = check_expr(ctx, env, &arg.value);
+        if filled[index] {
+            ctx.error(
+                name_span,
+                format!("Field '{type_name}.{name}' is supplied more than once"),
+            );
+            continue;
+        }
+        filled[index] = true;
+        let expected = fields[index].1;
+        let value = coerce(ctx, value, ty, expected, arg.value.1);
+        checked.push((index, value));
+    }
+
+    let missing: Vec<&str> = fields
+        .iter()
+        .zip(&filled)
+        .filter(|(_, supplied)| !**supplied)
+        .map(|((name, _), _)| name.as_str())
+        .collect();
+    if !missing.is_empty() {
+        ctx.error(
+            span,
+            format!(
+                "'{type_name}' is missing field {}",
+                missing
+                    .iter()
+                    .map(|name| format!("'{name}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
+    CheckedCall::Value(
+        TExpr::Construct {
+            type_id: id,
+            fields: checked,
+        },
+        Ty::User(id),
+    )
+}
+
+/// Specification 010 section 12: the subject is a place with a union type and
+/// the tested type is one direct member of that union.
+fn check_type_test<'src>(
+    ctx: &mut Ctx<'src>,
+    env: &mut Env<'src>,
+    test: &TypeTest<'src>,
+) -> Option<TTypeTest> {
+    let resolved = resolve_place(ctx, env, &test.place)?;
+    let place = resolved.place;
+    let subject_name = ctx.name(place.ty);
+    let union = match place.ty {
+        Ty::User(id) if ctx.types.union_members(id).is_some() => id,
+        _ => {
+            ctx.error(
+                test.place.span,
+                format!(
+                    "the left side of 'is' must have a union type, but '{}' has type \
+                     '{subject_name}'",
+                    test.place
+                ),
+            );
+            return None;
+        }
+    };
+
+    let member = match test.member.as_slice() {
+        [(name, _)] => match ctx.types.member(union, name) {
+            Some(id) => id,
+            None => {
+                let msg = if ctx.types.top_level(name) == Some(union) {
+                    format!(
+                        "'{}' already has type '{subject_name}', so this test is always true",
+                        test.place
+                    )
+                } else {
+                    format!("'{name}' is not a direct member of '{subject_name}'")
+                };
+                ctx.error(test.member_span, msg);
+                return None;
+            }
+        },
+        [(first, first_span), (second, _)] => {
+            let Some(root) = ctx.types.top_level(first) else {
+                ctx.error(*first_span, format!("Unknown type '{first}'"));
+                return None;
+            };
+            let Some(id) = ctx.types.member(root, second) else {
+                let owner = ctx.types.def(root).name().to_string();
+                ctx.error(
+                    test.member_span,
+                    format!("'{owner}' has no member type '{second}'"),
+                );
+                return None;
+            };
+            if root != union {
+                let named = ctx.types.def(id).name().to_string();
+                ctx.error(
+                    test.member_span,
+                    format!("'{named}' is not a direct member of '{subject_name}'"),
+                );
+                return None;
+            }
+            id
+        }
+        _ => {
+            ctx.error(
+                test.member_span,
+                "a tested member name has at most two components".into(),
+            );
+            return None;
+        }
+    };
+
+    let (tag, nil) = match ctx.types.def(member) {
+        TypeDef::UnionMember { tag, nil, .. } => (*tag, *nil),
+        _ => (0, false),
+    };
+    let binding = match test.binding {
+        Some((name, name_span)) if nil => {
+            let _ = name;
+            ctx.error(
+                name_span,
+                "'Nil' carries no value, so it cannot be bound by a type test".into(),
+            );
+            None
+        }
+        Some((name, name_span)) => {
+            declare(ctx, name, name_span, "Binding");
+            Some((name.to_string(), Ty::User(member)))
+        }
+        None => None,
+    };
+    Some(TTypeTest {
+        place,
+        member,
+        tag,
+        binding,
+    })
 }
 
 fn check_expr<'src>(
@@ -725,40 +1816,127 @@ fn check_expr<'src>(
         Expr::Value(Value::Bool(value)) => (TExpr::Bool(*value), Ty::Bool),
         Expr::Value(Value::Nil) => (TExpr::Nil, Ty::Nil),
         Expr::Value(Value::Str(_)) => {
-            ctx.errors.push(Error {
-                span,
-                msg: "strings are not supported by the AOT backend".into(),
-            });
+            ctx.error(span, "strings are not supported by the AOT backend".into());
             (TExpr::Nil, Ty::Nil)
         }
         Expr::List(items) => {
             for item in items {
                 check_expr(ctx, env, item);
             }
-            ctx.errors.push(Error {
+            ctx.error(span, "lists are not supported by the AOT backend".into());
+            (TExpr::Nil, Ty::Nil)
+        }
+        Expr::SelfRef => match ctx.self_ty {
+            Some(ty) => (
+                TExpr::Place(Place {
+                    root: PlaceRoot::SelfRef,
+                    root_ty: ty,
+                    path: Vec::new(),
+                    ty,
+                }),
+                ty,
+            ),
+            None => {
+                ctx.error(span, "'self' is only valid inside a method body".into());
+                (TExpr::Nil, Ty::Nil)
+            }
+        },
+        Expr::BuiltinType(name) => {
+            ctx.error(
                 span,
-                msg: "lists are not supported by the AOT backend".into(),
-            });
+                format!("'{name}' is a type name; a type name alone is never a value"),
+            );
             (TExpr::Nil, Ty::Nil)
         }
         Expr::Local(name) => {
             for binding in env.iter().rev() {
                 if binding.name == *name {
-                    return (TExpr::Local((*name).to_string()), binding.ty);
+                    return (
+                        TExpr::Place(Place {
+                            root: PlaceRoot::Local((*name).to_string()),
+                            root_ty: binding.ty,
+                            path: Vec::new(),
+                            ty: binding.ty,
+                        }),
+                        binding.ty,
+                    );
                 }
             }
-            if ctx.sigs.contains_key(name) {
-                ctx.errors.push(Error {
+            if ctx.sigs.contains_key(*name) {
+                ctx.error(
                     span,
-                    msg: format!("'{name}' is a function; functions cannot be used as values"),
-                });
+                    format!("'{name}' is a function; functions cannot be used as values"),
+                );
+            } else if ctx.types.top_level(name).is_some() {
+                ctx.error(
+                    span,
+                    format!("'{name}' is a type name; a type name alone is never a value"),
+                );
             } else {
-                ctx.errors.push(Error {
-                    span,
-                    msg: format!("No such variable '{name}' in scope"),
-                });
+                ctx.error(span, format!("No such variable '{name}' in scope"));
             }
             (TExpr::Nil, Ty::Nil)
+        }
+        Expr::Member(base, (field, field_span)) => {
+            match as_place(ctx, env, expression) {
+                PlaceOutcome::Resolved(resolved) => {
+                    let ty = resolved.place.ty;
+                    (TExpr::Place(resolved.place), ty)
+                }
+                PlaceOutcome::Reported => (TExpr::Nil, Ty::Nil),
+                PlaceOutcome::NotAPlace => {
+                    // A qualified type path is not a value on its own.
+                    if let Expr::Local(first) = &base.0
+                        && let Some(root) = ctx.types.top_level(first)
+                    {
+                        let owner = ctx.types.def(root).name().to_string();
+                        let msg = if ctx.types.member(root, field).is_some() {
+                            format!(
+                                "'{owner}.{field}' is a type name; a type name alone is never a value"
+                            )
+                        } else {
+                            format!("'{owner}' has no member type '{field}'")
+                        };
+                        ctx.error(span, msg);
+                        return (TExpr::Nil, Ty::Nil);
+                    }
+                    let before = ctx.errors.len();
+                    let (value, base_ty) = check_expr(ctx, env, base);
+                    if ctx.errors.len() != before {
+                        return (TExpr::Nil, Ty::Nil);
+                    }
+                    let Ty::User(id) = base_ty else {
+                        let owner = ctx.name(base_ty);
+                        ctx.error(
+                            *field_span,
+                            format!("'{owner}' is not a struct, so it has no field '{field}'"),
+                        );
+                        return (TExpr::Nil, Ty::Nil);
+                    };
+                    let Some((index, ty)) = ctx.types.field(id, field) else {
+                        let owner = ctx.types.def(id).name().to_string();
+                        let msg = if ctx.method_index.contains_key(&(id, (*field).to_string())) {
+                            format!(
+                                "'{owner}.{field}' is a method; a method requires a receiver call"
+                            )
+                        } else if ctx.types.def(id).fields().is_none() {
+                            format!("'{owner}' is not a struct, so it has no field '{field}'")
+                        } else {
+                            format!("'{owner}' has no field '{field}'")
+                        };
+                        ctx.error(*field_span, msg);
+                        return (TExpr::Nil, Ty::Nil);
+                    };
+                    (
+                        TExpr::FieldRead {
+                            base: Box::new(value),
+                            index,
+                            ty,
+                        },
+                        ty,
+                    )
+                }
+            }
         }
         Expr::Binary(left, op, right) => {
             let (left, left_ty) = check_expr(ctx, env, left);
@@ -769,15 +1947,13 @@ fn check_expr<'src>(
                         BinaryOp::Add => ArithOp::Add,
                         BinaryOp::Sub => ArithOp::Sub,
                         BinaryOp::Mul => ArithOp::Mul,
-                        BinaryOp::Div => ArithOp::Div,
-                        _ => unreachable!(),
+                        _ => ArithOp::Div,
                     };
                     // A rejected pair keeps its own operand types rather than
                     // being coerced to a guessed one, so one mixed-type
                     // expression reports one diagnostic.
                     let Some(ty) = operand_numeric(left_ty, right_ty) else {
-                        ctx.errors
-                            .push(Error::operands(span, "arithmetic", left_ty, right_ty));
+                        ctx.operands(span, "arithmetic", left_ty, right_ty);
                         return (
                             TExpr::Arith(Box::new(left), operation, Box::new(right), left_ty),
                             left_ty,
@@ -796,19 +1972,33 @@ fn check_expr<'src>(
                     } else {
                         CmpOp::NotEq
                     };
-                    // Equality joins the `Int64`/`Dec64` promotion pair; every
+                    // Equality joins the `Int64`/`Dec64` promotion pair; a
+                    // contextual `nil` joins one Nil-containing union; every
                     // other type compares only against itself.
                     let operand_ty = match common_numeric(left_ty, right_ty) {
                         Some(ty) => ty,
                         None if left_ty == right_ty => left_ty,
-                        None => {
-                            ctx.errors.push(Error::mismatch(span, left_ty, right_ty));
-                            return (
-                                TExpr::Cmp(Box::new(left), operation, Box::new(right), left_ty),
-                                Ty::Bool,
-                            );
-                        }
+                        None => match nil_union(ctx, left_ty, right_ty) {
+                            Some(ty) => ty,
+                            None => {
+                                ctx.mismatch(span, left_ty, right_ty);
+                                return (
+                                    TExpr::Cmp(Box::new(left), operation, Box::new(right), left_ty),
+                                    Ty::Bool,
+                                );
+                            }
+                        },
                     };
+                    if !ctx.types.supports_equality(operand_ty) {
+                        let name = ctx.name(operand_ty);
+                        ctx.error(
+                            span,
+                            format!(
+                                "'{name}' does not support equality because one of the \
+                                 types it contains does not"
+                            ),
+                        );
+                    }
                     let left = coerce(ctx, left, left_ty, operand_ty, span);
                     let right = coerce(ctx, right, right_ty, operand_ty, span);
                     (
@@ -821,16 +2011,10 @@ fn check_expr<'src>(
                         BinaryOp::Less => CmpOp::Less,
                         BinaryOp::LessEq => CmpOp::LessEq,
                         BinaryOp::Greater => CmpOp::Greater,
-                        BinaryOp::GreaterEq => CmpOp::GreaterEq,
-                        _ => unreachable!(),
+                        _ => CmpOp::GreaterEq,
                     };
                     let Some(operand_ty) = operand_numeric(left_ty, right_ty) else {
-                        ctx.errors.push(Error::operands(
-                            span,
-                            "ordered comparison",
-                            left_ty,
-                            right_ty,
-                        ));
+                        ctx.operands(span, "ordered comparison", left_ty, right_ty);
                         return (
                             TExpr::Cmp(Box::new(left), operation, Box::new(right), left_ty),
                             Ty::Bool,
@@ -845,28 +2029,69 @@ fn check_expr<'src>(
                 }
             }
         }
-        Expr::Call(function, arguments) => {
-            let Some((name, args, result)) = check_call(ctx, env, span, function, arguments) else {
+        Expr::Call(callee, arguments) => {
+            let Some(call) = check_call(ctx, env, span, callee, arguments) else {
                 return (TExpr::Nil, Ty::Nil);
             };
-            match result {
-                Some(ty) => (TExpr::Call(name, args), ty),
-                None => {
-                    ctx.errors.push(Error {
+            match call {
+                CheckedCall::Value(value, ty) => (value, ty),
+                CheckedCall::Function {
+                    name,
+                    args,
+                    result: Some(ty),
+                } => (TExpr::Call(name, args), ty),
+                CheckedCall::Function { name, .. } => {
+                    ctx.error(
                         span,
-                        msg: format!(
+                        format!(
                             "'{name}' declares no result, so its call cannot be used as a value"
                         ),
-                    });
+                    );
+                    (TExpr::Nil, Ty::Nil)
+                }
+                CheckedCall::Method {
+                    call,
+                    result: Some(ty),
+                } => (TExpr::MethodCall(Box::new(call)), ty),
+                CheckedCall::Method { call, .. } => {
+                    let name = ctx.method_name(call.method);
+                    ctx.error(
+                        span,
+                        format!(
+                            "'{name}' declares no result, so its call cannot be used as a value"
+                        ),
+                    );
                     (TExpr::Nil, Ty::Nil)
                 }
             }
         }
         Expr::Print(value) => {
             let (value, ty) = check_expr(ctx, env, value);
+            // Specification 010 section 14: printing a user-defined type is a
+            // separate future feature, not a silent no-op.
+            if matches!(ty, Ty::User(_)) {
+                let name = ctx.name(ty);
+                ctx.error(
+                    span,
+                    format!(
+                        "'print' does not support the user-defined type '{name}'; print a \
+                         scalar field or unwrap a represented scalar"
+                    ),
+                );
+            }
             (TExpr::Print(Box::new(value), ty), ty)
         }
     }
+}
+
+/// The union type a `value == nil` comparison takes, when exactly one operand
+/// is `nil` and the other is a union that directly contains `Nil`.
+fn nil_union(ctx: &Ctx<'_>, left: Ty, right: Ty) -> Option<Ty> {
+    let pair = |union: Ty, other: Ty| match (union, other) {
+        (Ty::User(id), Ty::Nil) => ctx.types.member(id, "Nil").map(|_| union),
+        _ => None,
+    };
+    pair(left, right).or_else(|| pair(right, left))
 }
 
 #[cfg(test)]
@@ -898,6 +2123,13 @@ mod tests {
         );
     }
 
+    fn assert_rejected_by_parser(source: &str) {
+        assert!(
+            crate::parse(source).is_err(),
+            "expected a parse error for: {source}"
+        );
+    }
+
     #[test]
     fn parser_recovery_nodes_are_compiler_bugs_after_parsing() {
         let span: Span = (0..0).into();
@@ -906,7 +2138,7 @@ mod tests {
             "recovered",
             crate::syntax::ast::Func {
                 args: Vec::new(),
-                ret: Some(TypeName::Nil),
+                ret: Some((TypeRef::Builtin(TypeName::Nil), span)),
                 span,
                 body: Block {
                     elements: vec![(BlockElement::Expr((Expr::Error, span)), span)],
@@ -917,6 +2149,8 @@ mod tests {
         let program = AstProgram {
             funcs,
             externs: HashMap::new(),
+            types: Vec::new(),
+            methods: Vec::new(),
             body: Block {
                 elements: Vec::new(),
                 span,
@@ -1058,7 +2292,6 @@ mod tests {
 
     #[test]
     fn accepts_a_statement_loop_followed_by_an_explicit_value() {
-        // RFC 008's migration pattern for the old loop zero-value fallback.
         assert_checks(
             "fun zero_after_loop(value: Int64): Int64 do while false do print(value) end 0 end",
         );
@@ -1082,8 +2315,6 @@ mod tests {
 
     #[test]
     fn a_loop_target_does_not_outlive_its_body() {
-        // The stack must pop when the body ends, so a `break` after the loop
-        // is still rejected.
         assert_error_contains(
             "while true do print(1) end break",
             "only valid inside a 'while' body",
@@ -1141,8 +2372,6 @@ mod tests {
 
     #[test]
     fn rejects_a_duplicate_local_declared_in_a_nested_branch() {
-        // Specification 012 section 5.2: uniqueness is function-wide, so a
-        // nested block cannot reuse an outer name.
         assert_error_contains(
             "fun f(ready: Bool) do let value: Int64 = 1 if ready then let value: Int64 = 2 print(value) end end",
             "Variable 'value' already exists",
@@ -1221,7 +2450,6 @@ mod tests {
 
     // Specification 009 sections 4.4-4.7: exact-match types.
 
-    /// Each new type paired with a literal of that exact type.
     const NEW_TYPES: [(&str, &str); 5] = [
         ("UInt8", "1u8"),
         ("UInt16", "1u16"),
@@ -1248,8 +2476,6 @@ mod tests {
 
     #[test]
     fn rejects_every_implicit_conversion_the_new_types_prohibit() {
-        // Specification 009 section 4.4: no width converts to another width, to
-        // or from Int64, to a float, and Float32 does not meet Dec64.
         for (source, needle) in [
             ("let byte: UInt8 = 1", "expected 'UInt8', found 'Int64'"),
             ("let byte: UInt8 = 1u16", "expected 'UInt8', found 'UInt16'"),
@@ -1288,20 +2514,18 @@ mod tests {
     fn accepts_same_type_arithmetic_and_comparison_for_every_new_type() {
         for (name, literal) in NEW_TYPES {
             for operator in ["+", "-", "*", "/"] {
-                let source = format!("let result: {name} = {literal} {operator} {literal}");
-                assert_checks(&source);
+                assert_checks(&format!(
+                    "let result: {name} = {literal} {operator} {literal}"
+                ));
             }
             for operator in ["<", "<=", ">", ">=", "==", "!="] {
-                let source = format!("let flag: Bool = {literal} {operator} {literal}");
-                assert_checks(&source);
+                assert_checks(&format!("let flag: Bool = {literal} {operator} {literal}"));
             }
         }
     }
 
     #[test]
     fn rejects_mixed_operands_in_every_category() {
-        // Every pairing of a new type with a different type, in arithmetic,
-        // ordered comparison, and equality.
         let others = ["1", "1.5", "1u8", "1u16", "1u32", "1u64", "1.5f32", "true"];
         for (_, literal) in NEW_TYPES {
             for other in others {
@@ -1330,8 +2554,6 @@ mod tests {
 
     #[test]
     fn arithmetic_and_comparison_keep_the_exact_operand_type() {
-        // The backend reads signedness and float width from this type, so it
-        // must survive checking rather than being inferred from a bit width.
         for (name, literal) in NEW_TYPES {
             let program = assert_checks(&format!(
                 "fun combine(): Bool do {literal} + {literal} < {literal} end\n\
@@ -1361,5 +2583,960 @@ mod tests {
         for (name, literal) in NEW_TYPES {
             assert_checks(&format!("let echoed: {name} = print({literal})"));
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Specification 010: nominal types, structs, unions, and methods.
+    // ---------------------------------------------------------------------
+
+    const POINT: &str = "type Point is struct x: Dec64, y: Dec64, end\n";
+    const SHAPE: &str = "type Shape is union\n\
+         | Circle is struct radius: Int64, end\n\
+         | Rectangle is struct length: Int64, width: Int64, end\n\
+         end\n";
+    const DIRECTION: &str = "type Direction is union | East | West end\n";
+
+    /// Conformance 1: represented types are nominal and wrap/unwrap one layer.
+    #[test]
+    fn a_represented_type_wraps_and_unwraps_exactly_one_layer() {
+        assert_checks(
+            "type UserId is Int64\n\
+             let id: UserId = UserId(42)\n\
+             let number: Int64 = Int64(id)\n\
+             print(number)",
+        );
+    }
+
+    #[test]
+    fn a_represented_type_is_not_its_representation() {
+        assert_error_contains(
+            "type UserId is Int64\nlet id: UserId = 42",
+            "expected 'UserId', found 'Int64'",
+        );
+        assert_error_contains(
+            "type UserId is Int64\nlet id: UserId = UserId(42)\nlet n: Int64 = id",
+            "expected 'Int64', found 'UserId'",
+        );
+        assert_error_contains(
+            "type UserId is Int64\nlet id: UserId = UserId(42)\nprint(id + id)",
+            "operands must be two numbers of the same type",
+        );
+    }
+
+    #[test]
+    fn represented_conversion_names_the_required_immediate_type() {
+        assert_error_contains(
+            "type UserId is Int64\nlet id: UserId = UserId(1.5)",
+            "wraps exactly its immediate representation 'Int64', found 'Dec64'",
+        );
+        assert_error_contains(
+            "type UserId is Int64\nprint(Int64(7))",
+            "unwraps exactly one value of a type represented by 'Int64', found 'Int64'",
+        );
+        assert_error_contains(
+            "type UserId is Int64\nlet id: UserId = UserId(1, 2)",
+            "converts exactly one positional value",
+        );
+        assert_error_contains(
+            "type UserId is Int64\nlet id: UserId = UserId(value: 1)",
+            "named arguments are only used to construct a struct",
+        );
+    }
+
+    /// Conformance 1: unwrapping skips no layer.
+    #[test]
+    fn represented_conversion_does_not_skip_a_layer() {
+        assert_error_contains(
+            "type Inner is Int64\ntype Outer is Inner\n\
+             let value: Outer = Outer(Inner(1))\n\
+             let flat: Int64 = Int64(value)",
+            "unwraps exactly one value of a type represented by 'Int64', found 'Outer'",
+        );
+        assert_checks(
+            "type Inner is Int64\ntype Outer is Inner\n\
+             let value: Outer = Outer(Inner(1))\n\
+             let one: Inner = Inner(value)\n\
+             let flat: Int64 = Int64(one)\n\
+             print(flat)",
+        );
+    }
+
+    /// Conformance 2: same-representation nominal types stay distinct.
+    #[test]
+    fn same_representation_nominal_types_are_not_assignable_or_comparable() {
+        assert_error_contains(
+            "type UserId is Int64\ntype OrderId is Int64\n\
+             let id: UserId = UserId(1)\nlet other: OrderId = id",
+            "expected 'OrderId', found 'UserId'",
+        );
+        assert_error_contains(
+            "type UserId is Int64\ntype OrderId is Int64\n\
+             let id: UserId = UserId(1)\nlet other: OrderId = OrderId(1)\n\
+             print(id == other)",
+            "expected 'UserId', found 'OrderId'",
+        );
+    }
+
+    /// Conformance 7: represented equality compares represented values.
+    #[test]
+    fn represented_values_compare_with_their_own_type_only() {
+        assert_checks(
+            "type UserId is Int64\n\
+             let a: UserId = UserId(1)\nlet b: UserId = UserId(2)\nprint(a == b)",
+        );
+        assert_error_contains(
+            "type UserId is Int64\nlet a: UserId = UserId(1)\nprint(a == 1)",
+            "expected 'UserId', found 'Int64'",
+        );
+    }
+
+    /// Conformance 3: reordered named fields and a trailing comma, checked and
+    /// stored so evaluation stays in written order.
+    #[test]
+    fn struct_construction_accepts_reordered_named_fields() {
+        let program = assert_checks(&format!(
+            "{POINT}let point: Point = Point(y: 4.0, x: 3.0,)\nprint(point.x)"
+        ));
+        let TStmt::Let { value, .. } = &program.body.statements[0] else {
+            panic!("expected a declaration");
+        };
+        let TExpr::Construct { fields, .. } = value else {
+            panic!("expected a constructor");
+        };
+        assert_eq!(
+            fields.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            vec![1, 0],
+            "constructor entries keep written evaluation order with declaration indices"
+        );
+    }
+
+    /// Conformance 4: missing, duplicate, unknown, and positional fields.
+    #[test]
+    fn rejects_malformed_struct_construction() {
+        for (source, needle) in [
+            ("let p: Point = Point(x: 1.0)", "is missing field 'y'"),
+            (
+                "let p: Point = Point(x: 1.0, x: 2.0, y: 3.0)",
+                "Field 'Point.x' is supplied more than once",
+            ),
+            (
+                "let p: Point = Point(x: 1.0, y: 2.0, z: 3.0)",
+                "'Point' has no field 'z'",
+            ),
+            (
+                "let p: Point = Point(1.0, 2.0)",
+                "positional construction of a non-empty struct is invalid",
+            ),
+        ] {
+            assert_error_contains(&format!("{POINT}{source}"), needle);
+        }
+    }
+
+    /// Conformance 5: empty top-level and union-member structs.
+    #[test]
+    fn empty_structs_construct_with_parentheses_and_stay_nominal() {
+        assert_checks(
+            "type Marker is struct end\ntype Other is struct end\n\
+             let marker: Marker = Marker()\nlet second: Marker = Marker()\n\
+             print(marker == second)",
+        );
+        assert_error_contains(
+            "type Marker is struct end\ntype Other is struct end\n\
+             let marker: Marker = Marker()\nlet other: Other = Other()\n\
+             print(marker == other)",
+            "expected 'Marker', found 'Other'",
+        );
+        assert_error_contains(
+            "type Marker is struct end\nlet marker: Marker = Marker(x: 1)",
+            "has no fields, so it is constructed with '()'",
+        );
+        assert_error_contains(
+            "type Marker is struct end\nlet marker: Marker = Marker",
+            "a type name alone is never a value",
+        );
+    }
+
+    /// Conformance 6: member names live only in their union's namespace.
+    #[test]
+    fn union_member_names_resolve_only_through_their_union() {
+        assert_checks(&format!(
+            "{SHAPE}let shape: Shape = Shape.Circle(radius: 10)\nprint(1)"
+        ));
+        assert_error_contains(
+            &format!("{SHAPE}let c: Circle = 1"),
+            "Unknown type 'Circle'",
+        );
+        assert_error_contains(
+            &format!("{SHAPE}print(Circle(radius: 1))"),
+            "'Circle' is not callable",
+        );
+        assert_error_contains(
+            &format!("{SHAPE}let s: Shape = Shape.Triangle()"),
+            "'Shape' has no member type 'Triangle'",
+        );
+    }
+
+    /// Conformance 8: a union takes each direct member and nothing else.
+    #[test]
+    fn a_union_accepts_its_direct_members_and_rejects_others() {
+        assert_checks(&format!(
+            "{SHAPE}{DIRECTION}\
+             let a: Shape = Shape.Circle(radius: 1)\n\
+             let b: Shape = Shape.Rectangle(length: 1, width: 2)\n\
+             let c: Direction = Direction.East()\nprint(1)"
+        ));
+        assert_error_contains(
+            &format!("{SHAPE}{DIRECTION}let bad: Shape = Direction.East()"),
+            "expected 'Shape', found 'Direction.East'",
+        );
+        assert_error_contains(
+            &format!("{SHAPE}let bad: Shape = Shape(1)"),
+            "construction names one member type, not the union itself",
+        );
+    }
+
+    /// Conformance 7: struct and union equality.
+    #[test]
+    fn struct_and_union_equality_follow_nominal_identity() {
+        assert_checks(&format!(
+            "{POINT}let a: Point = Point(x: 1.0, y: 2.0)\n\
+             let b: Point = Point(x: 1.0, y: 2.0)\nprint(a == b)"
+        ));
+        assert_checks(&format!(
+            "{SHAPE}let a: Shape = Shape.Circle(radius: 1)\n\
+             let b: Shape = Shape.Rectangle(length: 1, width: 2)\nprint(a != b)"
+        ));
+        // A union never compares directly with one of its member types.
+        assert_error_contains(
+            &format!(
+                "{SHAPE}let a: Shape = Shape.Circle(radius: 1)\n\
+                 let b: Shape.Circle = Shape.Circle(radius: 1)\nprint(a == b)"
+            ),
+            "expected 'Shape', found 'Shape.Circle'",
+        );
+        assert_error_contains(
+            &format!("{POINT}let a: Point = Point(x: 1.0, y: 2.0)\nprint(a < a)"),
+            "operands must be two numbers of the same type",
+        );
+    }
+
+    #[test]
+    fn union_tags_follow_source_order_from_zero() {
+        let program = assert_checks(&format!("{SHAPE}print(1)"));
+        let tags: Vec<(String, u32)> = program
+            .types
+            .iter()
+            .filter_map(|def| match def {
+                TypeDef::UnionMember { name, tag, .. } => Some((name.clone(), *tag)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tags,
+            vec![("Shape.Circle".into(), 0), ("Shape.Rectangle".into(), 1)]
+        );
+    }
+
+    /// Conformance 10: methods read `self` and work on values and temporaries.
+    #[test]
+    fn methods_read_self_and_return_values() {
+        let program = assert_checks(&format!(
+            "{POINT}\
+             method Point.sum(): Dec64 do self.x + self.y end\n\
+             method Point.scaled(factor: Dec64): Point do \
+                Point(x: self.x * factor, y: self.y * factor) end\n\
+             let point: Point = Point(x: 3.0, y: 4.0)\n\
+             print(point.sum())\n\
+             print(Point(x: 1.0, y: 2.0).sum())\n\
+             print(point.scaled(2.0).sum())"
+        ));
+        assert_eq!(program.methods.len(), 2);
+        assert!(program.methods.iter().all(|m| !m.writes_receiver));
+    }
+
+    /// Conformance 13: lookup is exact, namespaced, and non-overloaded.
+    #[test]
+    fn method_lookup_is_exact_and_namespaced_by_receiver_type() {
+        assert_checks(&format!(
+            "{POINT}type Other is struct x: Dec64, end\n\
+             method Point.width(): Dec64 do self.x end\n\
+             method Other.width(): Dec64 do self.x end\n\
+             let p: Point = Point(x: 1.0, y: 2.0)\n\
+             let o: Other = Other(x: 1.0)\n\
+             print(p.width())\nprint(o.width())"
+        ));
+        assert_error_contains(
+            &format!(
+                "{POINT}method Point.a(): Dec64 do 1.0 end\nmethod Point.a(): Dec64 do 2.0 end"
+            ),
+            "Method 'Point.a' already exists; methods are not overloaded",
+        );
+        assert_error_contains(
+            &format!("{POINT}let p: Point = Point(x: 1.0, y: 2.0)\nprint(p.missing())"),
+            "'Point' has no method 'missing'",
+        );
+        assert_error_contains(
+            &format!(
+                "{POINT}method Point.sum(): Dec64 do self.x end\n\
+                 let p: Point = Point(x: 1.0, y: 2.0)\nprint(p.sum)"
+            ),
+            "'Point.sum' is a method; a method requires a receiver call",
+        );
+        assert_error_contains(
+            &format!("{POINT}let p: Point = Point(x: 1.0, y: 2.0)\nprint(p.x())"),
+            "'Point.x' is a field, not a method, so it cannot be called",
+        );
+        assert_error_contains(
+            "method Missing.thing(): Int64 do 1 end",
+            "Unknown type 'Missing'",
+        );
+    }
+
+    /// Conformance 12: `self` is method-only.
+    #[test]
+    fn self_is_rejected_outside_a_method() {
+        assert_error_contains("print(self)", "'self' is only valid inside a method body");
+        assert_error_contains(
+            "fun f(): Int64 do self end",
+            "'self' is only valid inside a method body",
+        );
+        assert_error_contains("self = 1", "'self' is only valid inside a method body");
+        // `self` is a keyword, so it cannot be spelled as a binding at all.
+        assert_rejected_by_parser("let self: Int64 = 1");
+        assert_rejected_by_parser("fun f(self: Int64) do end");
+    }
+
+    /// Conformance 11 and 15, with Specification 012 sections 7 and 9.
+    #[test]
+    fn field_and_receiver_assignment_follow_root_mutability_only() {
+        assert_checks(&format!(
+            "{POINT}let mut point: Point = Point(x: 3.0, y: 4.0)\n\
+             point.x = 5.0\npoint = Point(x: 0.0, y: 0.0)"
+        ));
+        assert_error_contains(
+            &format!("{POINT}let point: Point = Point(x: 3.0, y: 4.0)\npoint.x = 5.0"),
+            "'point' is not declared 'mut' and cannot be assigned",
+        );
+        assert_error_contains(
+            &format!(
+                "{POINT}let point: Point = Point(x: 3.0, y: 4.0)\npoint = Point(x: 0.0, y: 0.0)"
+            ),
+            "'point' is not declared 'mut' and cannot be assigned",
+        );
+        // Ordinary parameters and their fields are immutable roots.
+        assert_error_contains(
+            &format!("{POINT}fun shift(point: Point) do point.x = 1.0 end"),
+            "'point' is not declared 'mut' and cannot be assigned",
+        );
+        // Root mutability applies through the complete field path, and never
+        // consults the struct definition.
+        assert_checks(&format!(
+            "{POINT}type Entity is struct position: Point, end\n\
+             let mut entity: Entity = Entity(position: Point(x: 1.0, y: 2.0))\n\
+             entity.position.x = 1.0"
+        ));
+        assert_error_contains(
+            &format!(
+                "{POINT}type Entity is struct position: Point, end\n\
+                 let entity: Entity = Entity(position: Point(x: 1.0, y: 2.0))\n\
+                 entity.position.x = 1.0"
+            ),
+            "'entity' is not declared 'mut' and cannot be assigned",
+        );
+        assert_error_contains(
+            &format!("{POINT}let mut point: Point = Point(x: 1.0, y: 2.0)\npoint.z = 1.0"),
+            "'Point' has no field 'z'",
+        );
+    }
+
+    /// Conformance 11: receiver-writing calls need a mutable root; whole-`self`
+    /// replacement is one of them, and no method-level marker exists.
+    #[test]
+    fn receiver_writing_calls_require_a_mutable_receiver_root() {
+        let program = assert_checks(&format!(
+            "{POINT}\
+             method Point.translate(dx: Dec64, dy: Dec64) do \
+                self.x = self.x + dx self.y = self.y + dy end\n\
+             method Point.reset() do self = Point(x: 0.0, y: 0.0) end\n\
+             method Point.sum(): Dec64 do self.x + self.y end\n\
+             let mut point: Point = Point(x: 3.0, y: 4.0)\n\
+             point.translate(1.0, 2.0)\npoint.reset()\nprint(point.sum())"
+        ));
+        let effects: Vec<(String, bool)> = program
+            .methods
+            .iter()
+            .map(|m| (m.name.clone(), m.writes_receiver))
+            .collect();
+        assert_eq!(
+            effects,
+            vec![
+                ("translate".into(), true),
+                ("reset".into(), true),
+                ("sum".into(), false)
+            ]
+        );
+        for call in ["point.translate(1.0, 2.0)", "point.reset()"] {
+            assert_error_contains(
+                &format!(
+                    "{POINT}\
+                     method Point.translate(dx: Dec64, dy: Dec64) do self.x = self.x + dx end\n\
+                     method Point.reset() do self = Point(x: 0.0, y: 0.0) end\n\
+                     let point: Point = Point(x: 3.0, y: 4.0)\n{call}"
+                ),
+                "requires a mutable root, but 'point' is not mutable",
+            );
+        }
+        // A read-only method is callable on a temporary; a writing one is not.
+        assert_error_contains(
+            &format!(
+                "{POINT}method Point.reset() do self = Point(x: 0.0, y: 0.0) end\n\
+                 Point(x: 1.0, y: 2.0).reset()"
+            ),
+            "requires a mutable root, but 'a temporary' is not mutable",
+        );
+    }
+
+    /// Conformance 27: the effect reaches its least fixed point through direct,
+    /// transitive, recursive, and mutually recursive calls, and marks nothing
+    /// for unrelated local writes.
+    #[test]
+    fn receiver_write_effects_reach_a_least_fixed_point() {
+        let source = format!(
+            "{POINT}\
+             method Point.bump() do self.x = self.x + 1.0 end\n\
+             method Point.outer() do self.middle() end\n\
+             method Point.middle() do self.bump() end\n\
+             method Point.ping() do self.pong() end\n\
+             method Point.pong() do self.ping() end\n\
+             method Point.local_only() do let mut n: Dec64 = 1.0 n = n + 1.0 end\n\
+             method Point.selfish() do self.selfish() end\n\
+             let mut point: Point = Point(x: 1.0, y: 2.0)\npoint.outer()"
+        );
+        let program = assert_checks(&source);
+        let effects: Vec<(String, bool)> = program
+            .methods
+            .iter()
+            .map(|m| (m.name.clone(), m.writes_receiver))
+            .collect();
+        assert_eq!(
+            effects,
+            vec![
+                ("bump".into(), true),
+                // Transitive through one intermediate method.
+                ("outer".into(), true),
+                ("middle".into(), true),
+                // A mutually recursive pair that never writes stays unmarked.
+                ("ping".into(), false),
+                ("pong".into(), false),
+                // An unrelated local write is not a receiver write.
+                ("local_only".into(), false),
+                ("selfish".into(), false),
+            ]
+        );
+        // The transitive fact is what rejects the call, not the direct one.
+        assert_error_contains(
+            &source.replace("let mut point", "let point"),
+            "'Point.outer' may assign through 'self', so its receiver requires a mutable root",
+        );
+        // Calling on a field of a mutable root is allowed.
+        assert_checks(&format!(
+            "{POINT}type Entity is struct position: Point, end\n\
+             method Point.bump() do self.x = self.x + 1.0 end\n\
+             let mut entity: Entity = Entity(position: Point(x: 1.0, y: 2.0))\n\
+             entity.position.bump()"
+        ));
+    }
+
+    /// A type-test binding is an immutable root (Specification 012 section 7).
+    #[test]
+    fn a_type_test_binding_is_an_immutable_root() {
+        assert_error_contains(
+            &format!(
+                "{SHAPE}let shape: Shape = Shape.Circle(radius: 1)\n\
+                 if shape is Shape.Circle(circle) then circle.radius = 2 end"
+            ),
+            "'circle' is not declared 'mut' and cannot be assigned",
+        );
+    }
+
+    /// Conformance 16: a no-result method call is a statement only.
+    #[test]
+    fn no_result_method_calls_are_rejected_in_value_positions() {
+        assert_checks(&format!(
+            "{POINT}method Point.noop() do print(1) end\n\
+             let mut p: Point = Point(x: 1.0, y: 2.0)\np.noop()"
+        ));
+        assert_error_contains(
+            &format!(
+                "{POINT}method Point.noop() do print(1) end\n\
+                 let mut p: Point = Point(x: 1.0, y: 2.0)\nlet n: Int64 = p.noop()"
+            ),
+            "'Point.noop' declares no result, so its call cannot be used as a value",
+        );
+    }
+
+    /// Conformance 26: call-head conflicts and section 6.1 resolution.
+    #[test]
+    fn a_type_name_may_not_share_a_call_head_with_a_callable() {
+        assert_error_contains(
+            "type Point is struct x: Int64, end\nfun Point(): Int64 do 1 end",
+            "shares a call head with the function or Rust bridge of the same name",
+        );
+        assert_error_contains(
+            "type Point is struct x: Int64, end\n\
+             extern rust \"snacc_user_point\" fun Point(): Int64",
+            "shares a call head with the function or Rust bridge of the same name",
+        );
+        assert_error_contains(
+            "type Point is struct x: Int64, end\ntype Point is Int64",
+            "Type 'Point' already exists",
+        );
+    }
+
+    /// Conformance 26: an in-scope binding wins a qualified call head, and a
+    /// bare `name(...)` never calls a local.
+    #[test]
+    fn a_binding_wins_a_qualified_call_head_over_a_type_path() {
+        // `Box` is both a union type and a parameter; the parameter wins.
+        assert_checks(
+            "type Box is union | Item is struct n: Int64, end end\n\
+             method Box.Item.get(): Int64 do self.n end\n\
+             fun read(Box: Box.Item): Int64 do Box.get() end\n\
+             print(read(Box.Item(n: 1)))",
+        );
+        // Without a binding of that name the same path is a constructor.
+        assert_checks(
+            "type Box is union | Item is struct n: Int64, end end\n\
+             let held: Box = Box.Item(n: 1)\nprint(1)",
+        );
+        assert_error_contains(
+            "fun f(value: Int64): Int64 do value(1) end",
+            "'value' is a variable; Snacc has no function values, so it cannot be called",
+        );
+        assert_error_contains("print(missing(1))", "'missing' is not callable");
+        // A bare call head skips the local namespace entirely, so a local that
+        // shares a callable's name does not hide it.
+        assert_checks(
+            "fun double(value: Int64): Int64 do value * 2 end\n\
+             fun use(double: Int64): Int64 do double(double) end\n\
+             print(use(3))",
+        );
+        // The same holds for a type constructor sharing a local's name.
+        assert_checks(
+            "type Wrapper is struct n: Int64, end\n\
+             fun build(Wrapper: Int64): Int64 do Wrapper(n: Wrapper).n end\n\
+             print(build(3))",
+        );
+    }
+
+    /// Conformance 17 and 18: `is` produces `Bool`, and its binding has the
+    /// exact member type only inside the successful branch.
+    #[test]
+    fn type_tests_narrow_only_inside_their_own_branch() {
+        assert_checks(&format!(
+            "{SHAPE}let shape: Shape = Shape.Circle(radius: 10)\n\
+             if shape is Shape.Circle(circle) then print(circle.radius) \
+             elseif shape is Shape.Rectangle(rectangle) then \
+             print(rectangle.length * rectangle.width) end"
+        ));
+        assert_error_contains(
+            &format!(
+                "{SHAPE}let shape: Shape = Shape.Circle(radius: 10)\n\
+                 if shape is Shape.Circle(circle) then print(1) else print(circle.radius) end"
+            ),
+            "No such variable 'circle' in scope",
+        );
+        assert_error_contains(
+            &format!(
+                "{SHAPE}let shape: Shape = Shape.Circle(radius: 10)\n\
+                 if shape is Shape.Circle(circle) then print(1) end\nprint(circle.radius)"
+            ),
+            "No such variable 'circle' in scope",
+        );
+        // Specification 012 section 5.2: the binding name is function-wide.
+        assert_error_contains(
+            &format!(
+                "{SHAPE}let circle: Int64 = 1\nlet shape: Shape = Shape.Circle(radius: 10)\n\
+                 if shape is Shape.Circle(circle) then print(1) end"
+            ),
+            "Binding 'circle' already exists",
+        );
+        assert_error_contains(
+            &format!(
+                "{SHAPE}let shape: Shape = Shape.Circle(radius: 10)\n\
+                 if shape is Shape.Circle(c) then print(1) elseif shape is Shape.Rectangle(c) \
+                 then print(2) end"
+            ),
+            "Binding 'c' already exists",
+        );
+    }
+
+    #[test]
+    fn a_bare_type_test_supplies_a_bool_condition() {
+        let program = assert_checks(&format!(
+            "{DIRECTION}let d: Direction = Direction.East()\n\
+             if d is Direction.East then print(1) elseif d is Direction.West then print(2) end"
+        ));
+        let TStmt::If(form) = &program.body.statements[1] else {
+            panic!("expected an if statement");
+        };
+        let tags: Vec<u32> = form
+            .arms
+            .iter()
+            .map(|(condition, _)| match condition {
+                TCondition::Test(test) => test.tag,
+                TCondition::Expr(_) => panic!("expected a type test"),
+            })
+            .collect();
+        assert_eq!(tags, vec![0, 1]);
+        assert!(form.exhaustive);
+    }
+
+    /// Conformance 19: unrelated, always-true, and non-place tests.
+    #[test]
+    fn invalid_type_tests_are_rejected() {
+        assert_error_contains(
+            &format!(
+                "{SHAPE}{DIRECTION}let shape: Shape = Shape.Circle(radius: 1)\n\
+                 if shape is Direction.East then print(1) end"
+            ),
+            "'Direction.East' is not a direct member of 'Shape'",
+        );
+        assert_error_contains(
+            &format!(
+                "{SHAPE}let shape: Shape = Shape.Circle(radius: 1)\n\
+                 if shape is Shape then print(1) end"
+            ),
+            "already has type 'Shape', so this test is always true",
+        );
+        assert_error_contains(
+            &format!(
+                "{POINT}let p: Point = Point(x: 1.0, y: 2.0)\nif p is Point then print(1) end"
+            ),
+            "the left side of 'is' must have a union type",
+        );
+        assert_error_contains(
+            &format!(
+                "{SHAPE}let c: Shape.Circle = Shape.Circle(radius: 1)\n\
+                 if c is Shape.Circle then print(1) end"
+            ),
+            "the left side of 'is' must have a union type",
+        );
+        // A call result is not a place, so it cannot be the subject of `is`.
+        assert_rejected_by_parser(&format!(
+            "{SHAPE}fun make(): Shape do Shape.Circle(radius: 1) end\n\
+             if make() is Shape.Circle then print(1) end"
+        ));
+    }
+
+    /// Conformance 20: exhaustive chains produce values without `else`, for
+    /// both empty and data-carrying members.
+    #[test]
+    fn an_exhaustive_chain_produces_a_value_without_an_else() {
+        let program = assert_checks(&format!(
+            "{DIRECTION}\
+             fun pick(d: Direction): Int64 do \
+                if d is Direction.East then 1 elseif d is Direction.West then 2 end end\n\
+             print(pick(Direction.East()))"
+        ));
+        let result = program.funcs["pick"]
+            .body
+            .result
+            .as_ref()
+            .expect("pick produces a value");
+        let TExpr::If(form) = result else {
+            panic!("expected a value-form if");
+        };
+        assert!(form.exhaustive);
+        assert!(form.else_branch.is_none());
+
+        assert_checks(&format!(
+            "{SHAPE}\
+             fun area(shape: Shape): Int64 do \
+                if shape is Shape.Circle(circle) then circle.radius * circle.radius \
+                elseif shape is Shape.Rectangle(rectangle) then \
+                rectangle.length * rectangle.width end end\n\
+             print(area(Shape.Circle(radius: 2)))"
+        ));
+    }
+
+    /// Conformance 21: missing members, duplicates, mixed places, and an
+    /// unreachable `else`.
+    #[test]
+    fn non_exhaustive_and_unreachable_chains_are_rejected() {
+        let three = "type Light is union | Red | Amber | Green end\n";
+        assert_error_contains(
+            &format!(
+                "{three}fun pick(l: Light): Int64 do \
+                 if l is Light.Red then 1 elseif l is Light.Amber then 2 end end"
+            ),
+            "does not handle Light.Green",
+        );
+        assert_error_contains(
+            &format!(
+                "{DIRECTION}fun pick(d: Direction): Int64 do \
+                 if d is Direction.East then 1 elseif d is Direction.East then 2 \
+                 elseif d is Direction.West then 3 end end"
+            ),
+            "'Direction.East' is already handled by an earlier branch",
+        );
+        // Two different places never form one chain, so `else` stays required.
+        assert_error_contains(
+            &format!(
+                "{DIRECTION}fun pick(a: Direction, b: Direction): Int64 do \
+                 if a is Direction.East then 1 elseif b is Direction.West then 2 end end"
+            ),
+            "requires an 'else' branch",
+        );
+        // An ordinary condition mixed into the chain also requires `else`.
+        assert_error_contains(
+            &format!(
+                "{DIRECTION}fun pick(d: Direction, flag: Bool): Int64 do \
+                 if d is Direction.East then 1 elseif flag then 2 end end"
+            ),
+            "requires an 'else' branch",
+        );
+        // A covered chain rejects `else` in both statement and value form.
+        for source in [
+            format!(
+                "{DIRECTION}fun pick(d: Direction): Int64 do \
+                 if d is Direction.East then 1 elseif d is Direction.West then 2 else 3 end end"
+            ),
+            format!(
+                "{DIRECTION}let d: Direction = Direction.East()\n\
+                 if d is Direction.East then print(1) elseif d is Direction.West then print(2) \
+                 else print(3) end"
+            ),
+        ] {
+            assert_error_contains(&source, "so the 'else' branch is unreachable");
+        }
+    }
+
+    /// Section 12.3: the tested place may be a field path rooted at a local,
+    /// and exhaustiveness compares the complete syntactic place.
+    #[test]
+    fn an_exhaustive_chain_may_test_a_field_path() {
+        let types =
+            format!("{DIRECTION}type Entity is struct heading: Direction, spare: Direction, end\n");
+        assert_checks(&format!(
+            "{types}fun rank(entity: Entity): Int64 do \
+             if entity.heading is Direction.East then 1 \
+             elseif entity.heading is Direction.West then 2 end end"
+        ));
+        // Two different field paths under one root are two different places.
+        assert_error_contains(
+            &format!(
+                "{types}fun rank(entity: Entity): Int64 do \
+                 if entity.heading is Direction.East then 1 \
+                 elseif entity.spare is Direction.West then 2 end end"
+            ),
+            "requires an 'else' branch",
+        );
+    }
+
+    /// Section 11.2 and conformance 14: the receiver evaluates once, before the
+    /// explicit arguments, and arguments keep their written order.
+    #[test]
+    fn a_method_call_keeps_its_receiver_and_arguments_in_order() {
+        let program = assert_checks(&format!(
+            "{POINT}method Point.combine(a: Dec64, b: Dec64): Dec64 do self.x + a + b end\n\
+             let p: Point = Point(x: 1.0, y: 2.0)\nprint(p.combine(3.0, 4.0))"
+        ));
+        let TStmt::Expr(TExpr::Print(value, _)) = &program.body.statements[1] else {
+            panic!("expected a print statement");
+        };
+        let TExpr::MethodCall(call) = value.as_ref() else {
+            panic!("expected a method call");
+        };
+        assert!(
+            matches!(&call.receiver, TReceiver::Place(place) if place.root == PlaceRoot::Local("p".into())),
+            "a place receiver keeps its addressable storage"
+        );
+        assert_eq!(call.args.len(), 2);
+    }
+
+    /// Conformance 22: adding a member breaks a formerly exhaustive chain.
+    #[test]
+    fn adding_a_union_member_breaks_an_exhaustive_chain() {
+        let chain = "fun pick(d: Direction): Int64 do \
+             if d is Direction.East then 1 elseif d is Direction.West then 2 end end";
+        assert_checks(&format!("{DIRECTION}{chain}"));
+        assert_error_contains(
+            &format!("type Direction is union | East | West | North end\n{chain}"),
+            "does not handle Direction.North",
+        );
+    }
+
+    /// Conformance 23: direct and indirect recursive layouts.
+    #[test]
+    fn recursive_value_layouts_are_rejected() {
+        assert_error_contains(
+            "type Node is struct next: Node, end",
+            "Type 'Node' has an infinite value layout: Node -> Node",
+        );
+        assert_error_contains(
+            "type A is struct b: B, end\ntype B is struct a: A, end",
+            "has an infinite value layout: A -> B -> A",
+        );
+        assert_error_contains(
+            "type A is B\ntype B is A",
+            "has an infinite value layout: A -> B -> A",
+        );
+        assert_error_contains(
+            "type Tree is union | Leaf | Branch is struct child: Tree, end end",
+            "has an infinite value layout",
+        );
+    }
+
+    /// Conformance 24: no user-defined type crosses the Rust bridge.
+    #[test]
+    fn user_defined_types_are_rejected_at_every_bridge_site() {
+        for declaration in [
+            "extern rust \"snacc_user_take\" fun take(value: Point)",
+            "extern rust \"snacc_user_make\" fun make(): Point",
+        ] {
+            assert_error_contains(
+                &format!("{POINT}{declaration}"),
+                "only the ABI's permitted types may cross a Rust bridge",
+            );
+        }
+        assert_error_contains(
+            &format!("{SHAPE}extern rust \"snacc_user_take\" fun take(value: Shape.Circle)"),
+            "'Shape.Circle' is a user-defined type",
+        );
+        assert_error_contains(
+            "type UserId is Int64\nextern rust \"snacc_user_take\" fun take(value: UserId)",
+            "'UserId' is a user-defined type",
+        );
+        // Internal Snacc functions accept and return them freely.
+        assert_checks(&format!(
+            "{POINT}fun identity(point: Point): Point do point end\n\
+             print(identity(Point(x: 1.0, y: 2.0)).x)"
+        ));
+    }
+
+    /// Conformance 14 (checking half): a union type flows from an expected
+    /// type through branches and arguments.
+    #[test]
+    fn common_union_types_come_from_the_expected_type() {
+        assert_checks(&format!(
+            "{DIRECTION}\
+             fun pick(flag: Bool): Direction do \
+                if flag then Direction.East() else Direction.West() end end\n\
+             fun take(d: Direction): Int64 do 1 end\n\
+             print(take(Direction.East()))\nprint(take(pick(true)))"
+        ));
+        assert_error_contains(
+            &format!(
+                "{DIRECTION}{SHAPE}\
+                 fun pick(flag: Bool): Direction do \
+                    if flag then Direction.East() else Shape.Circle(radius: 1) end end"
+            ),
+            "expected 'Direction', found 'Shape.Circle'",
+        );
+        assert_error_contains(
+            &format!(
+                "{DIRECTION}fun pick(flag: Bool): Int64 do \
+                 if flag then Direction.East() else 1 end end"
+            ),
+            "expected 'Int64', found 'Direction.East'",
+        );
+    }
+
+    /// Specification 012 section 10: `Nil` is a union member and `nil` names it
+    /// from an expected union type.
+    #[test]
+    fn nil_is_available_as_a_union_member() {
+        assert_checks(
+            "type UserId is Int64\n\
+             type MaybeUser is union | User is struct id: UserId, end | Nil end\n\
+             let missing: MaybeUser = nil\n\
+             let present: MaybeUser = MaybeUser.User(id: UserId(10))\n\
+             if missing is Nil then print(1) elseif missing is MaybeUser.User(user) then \
+             print(Int64(user.id)) end\n\
+             print(missing == nil)",
+        );
+        assert_error_contains(
+            "type MaybeUser is union | User is struct id: Int64, end | Nil end\n\
+             let missing: MaybeUser = nil\n\
+             if missing is Nil(value) then print(1) end",
+            "'Nil' carries no value, so it cannot be bound by a type test",
+        );
+        assert_error_contains(
+            "type Empty is union | Nil end",
+            "contains only 'Nil'; 'Nil' requires another member type",
+        );
+    }
+
+    /// Conformance 4 and 17 diagnostics: duplicate fields and members.
+    #[test]
+    fn duplicate_fields_and_union_members_are_rejected() {
+        assert_error_contains(
+            "type Point is struct x: Dec64, x: Dec64, end",
+            "Field 'Point.x' already exists",
+        );
+        assert_error_contains(
+            "type Shape is union | Circle | Circle end",
+            "Union member 'Shape.Circle' already exists",
+        );
+    }
+
+    /// Conformance 14 and 18: field access needs a struct, and printing a
+    /// user-defined type is rejected rather than silently accepted.
+    #[test]
+    fn field_access_and_printing_reject_unsupported_receivers() {
+        assert_error_contains(
+            "let value: Int64 = 1\nprint(value.field)",
+            "'Int64' is not a struct, so it has no field 'field'",
+        );
+        assert_error_contains(
+            &format!("{SHAPE}let shape: Shape = Shape.Circle(radius: 1)\nprint(shape.radius)"),
+            "'Shape' is not a struct, so it has no field 'radius'",
+        );
+        assert_error_contains(
+            &format!("{POINT}print(Point(x: 1.0, y: 2.0))"),
+            "'print' does not support the user-defined type 'Point'",
+        );
+        assert_error_contains(
+            "type UserId is Int64\nprint(UserId(1))",
+            "'print' does not support the user-defined type 'UserId'",
+        );
+        assert_checks("type UserId is Int64\nprint(Int64(UserId(1)))");
+    }
+
+    /// Conformance 25: user-defined types combine with RFC 008 no-result
+    /// functions and Specification 009 scalar fields.
+    #[test]
+    fn user_types_combine_with_no_result_functions_and_fixed_width_scalars() {
+        assert_checks(
+            "type Pixel is struct red: UInt8, green: UInt8, blue: UInt8, ratio: Float32, end\n\
+             method Pixel.brightest(): UInt8 do self.red end\n\
+             fun announce(value: UInt8) do print(value) end\n\
+             let pixel: Pixel = Pixel(red: 1u8, green: 2u8, blue: 3u8, ratio: 0.5f32)\n\
+             announce(pixel.brightest())\n\
+             print(pixel.ratio)",
+        );
+    }
+
+    /// A method on a union receiver takes the whole union value.
+    #[test]
+    fn methods_attach_to_unions_and_to_their_members() {
+        assert_checks(&format!(
+            "{SHAPE}\
+             method Shape.Circle.area(): Int64 do self.radius * self.radius end\n\
+             method Shape.describe(): Int64 do \
+                if self is Shape.Circle(circle) then circle.area() \
+                elseif self is Shape.Rectangle(rectangle) then \
+                rectangle.length * rectangle.width end end\n\
+             let shape: Shape = Shape.Circle(radius: 2)\nprint(shape.describe())"
+        ));
+        // A member method is not callable on the union.
+        assert_error_contains(
+            &format!(
+                "{SHAPE}method Shape.Circle.area(): Int64 do self.radius end\n\
+                 let shape: Shape = Shape.Circle(radius: 2)\nprint(shape.area())"
+            ),
+            "'Shape' has no method 'area'",
+        );
     }
 }

@@ -1,12 +1,13 @@
 use crate::syntax::ast::{
-    BinaryOp, Block, BlockElement, Expr, ExternFunc, Func, IfForm, Param, Program, Span, Spanned,
-    TypeName, Value,
+    Arg, BinaryOp, Block, BlockElement, Condition, Expr, ExternFunc, FieldDecl, Func, IfForm,
+    MethodDecl, Param, PlacePath, PlaceRootName, Program, Span, Spanned, TypeBody, TypeDecl,
+    TypeName, TypeRef, TypeTest, UnionMemberDecl, Value,
 };
 use crate::syntax::lexer::Token;
 use chumsky::{input::ValueInput, prelude::*};
 use std::collections::HashMap;
 
-fn type_name_parser<'tokens, 'src: 'tokens, I>()
+fn builtin_type_parser<'tokens, 'src: 'tokens, I>()
 -> impl Parser<'tokens, I, TypeName, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
@@ -22,7 +23,63 @@ where
         Token::TyUInt64 => TypeName::UInt64,
         Token::TyFloat32 => TypeName::Float32,
     }
-    .labelled("type name")
+    .labelled("built-in type name")
+}
+
+fn name_parser<'tokens, 'src: 'tokens, I>()
+-> impl Parser<'tokens, I, Spanned<&'src str>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+{
+    select! { Token::Ident(ident) => ident }
+        .map_with(|name, e| (name, e.span()))
+        .labelled("identifier")
+}
+
+/// `type = builtin-type | qualified-name` (Specification 010 section 5). The
+/// parser records the written path; resolution decides what it denotes.
+fn type_ref_parser<'tokens, 'src: 'tokens, I>()
+-> impl Parser<'tokens, I, Spanned<TypeRef<'src>>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+{
+    builtin_type_parser()
+        .map(TypeRef::Builtin)
+        .or(name_parser()
+            .separated_by(just(Token::Ctrl('.')))
+            .at_least(1)
+            .collect::<Vec<_>>()
+            .map(TypeRef::Named))
+        .map_with(|ty, e| (ty, e.span()))
+        .labelled("type")
+        .boxed()
+}
+
+/// `place = ( identifier | "self" ), { ".", identifier }` (Specification 012
+/// section 4).
+fn place_parser<'tokens, 'src: 'tokens, I>()
+-> impl Parser<'tokens, I, PlacePath<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+{
+    select! {
+        Token::Ident(name) => PlaceRootName::Name(name),
+        Token::SelfKw => PlaceRootName::SelfRef,
+    }
+    .map_with(|root, e| (root, e.span()))
+    .then(
+        just(Token::Ctrl('.'))
+            .ignore_then(name_parser())
+            .repeated()
+            .collect::<Vec<_>>(),
+    )
+    .map_with(|((root, root_span), fields), e| PlacePath {
+        root,
+        root_span,
+        fields,
+        span: e.span(),
+    })
+    .labelled("place")
 }
 
 /// Value-producing expressions only. `let`, assignment, `while`, `break`, and
@@ -42,7 +99,7 @@ where
         }
         .labelled("value");
 
-        let ident = select! { Token::Ident(ident) => ident }.labelled("identifier");
+        let name = name_parser();
 
         let items = expr
             .clone()
@@ -55,8 +112,27 @@ where
             .map(Expr::List)
             .delimited_by(just(Token::Ctrl('[')), just(Token::Ctrl(']')));
 
+        // `argument = [ identifier, ":" ], expression`. A named argument is
+        // recorded without deciding whether the call head can accept one.
+        let argument = name
+            .clone()
+            .then_ignore(just(Token::Ctrl(':')))
+            .or_not()
+            .then(expr.clone())
+            .map(|(name, value)| Arg { name, value });
+        let arguments = argument
+            .separated_by(just(Token::Ctrl(',')))
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .delimited_by(just(Token::Ctrl('(')), just(Token::Ctrl(')')))
+            .map_with(|args, e| (args, e.span()));
+
         let atom = val
-            .or(ident.map(Expr::Local))
+            .or(select! { Token::SelfKw => Expr::SelfRef })
+            // A built-in type name is a call head only: `Int64(id)` unwraps one
+            // represented layer. Checking rejects it in any other position.
+            .or(builtin_type_parser().map(Expr::BuiltinType))
+            .or(name.clone().map(|(name, _)| Expr::Local(name)))
             .or(list)
             .or(just(Token::Print)
                 .ignore_then(
@@ -82,20 +158,29 @@ where
             )))
             .boxed();
 
-        let call = atom.foldl_with(
-            items
-                .delimited_by(just(Token::Ctrl('(')), just(Token::Ctrl(')')))
-                .map_with(|args, e| (args, e.span()))
-                .repeated(),
-            |f, args, e| (Expr::Call(Box::new(f), args), e.span()),
-        );
+        // `postfix = atom, { arguments | member-suffix }`. Nothing here decides
+        // whether a name is a type, field, constructor, or method.
+        enum Suffix<'src> {
+            Call(Spanned<Vec<Arg<'src>>>),
+            Member(Spanned<&'src str>),
+        }
+        let suffix = arguments
+            .map(Suffix::Call)
+            .or(just(Token::Ctrl('.')).ignore_then(name).map(Suffix::Member));
+        let postfix = atom.foldl_with(suffix.repeated(), |base, suffix, e| {
+            let expr = match suffix {
+                Suffix::Call(args) => Expr::Call(Box::new(base), args),
+                Suffix::Member(name) => Expr::Member(Box::new(base), name),
+            };
+            (expr, e.span())
+        });
 
         let op = just(Token::Op("*"))
             .to(BinaryOp::Mul)
             .or(just(Token::Op("/")).to(BinaryOp::Div));
-        let product = call
+        let product = postfix
             .clone()
-            .foldl_with(op.then(call).repeated(), |a, (op, b), e| {
+            .foldl_with(op.then(postfix).repeated(), |a, (op, b), e| {
                 (Expr::Binary(Box::new(a), op, Box::new(b)), e.span())
             });
 
@@ -123,6 +208,51 @@ where
 
         compare.labelled("expression").as_context()
     })
+    .boxed()
+}
+
+/// `condition = type-test | expression`. A type test is valid only as a
+/// complete `if`/`elseif` condition (Specification 010 section 12.2), which
+/// this shape enforces structurally.
+fn condition_parser<'tokens, 'src: 'tokens, I>()
+-> impl Parser<'tokens, I, Condition<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+{
+    // `Nil` is a reserved type name rather than an identifier, so a member path
+    // accepts it as its own segment spelling.
+    let segment = select! {
+        Token::Ident(name) => name,
+        Token::TyNil => "Nil",
+    }
+    .map_with(|name, e| (name, e.span()));
+
+    let type_test = place_parser()
+        .then_ignore(just(Token::Is))
+        .then(
+            segment
+                .separated_by(just(Token::Ctrl('.')))
+                .at_least(1)
+                .collect::<Vec<_>>()
+                .map_with(|member, e| (member, e.span())),
+        )
+        .then(
+            name_parser()
+                .delimited_by(just(Token::Ctrl('(')), just(Token::Ctrl(')')))
+                .or_not(),
+        )
+        .map_with(|((place, (member, member_span)), binding), e| {
+            Condition::TypeTest(TypeTest {
+                place,
+                member,
+                member_span,
+                binding,
+                span: e.span(),
+            })
+        })
+        .labelled("type test");
+
+    type_test.or(expr_parser().map(Condition::Expr)).boxed()
 }
 
 /// One block element. Nested blocks (loop bodies, `if` branches) are parsed by
@@ -148,17 +278,14 @@ where
             span: e.span(),
         });
 
-    let ident = select! { Token::Ident(ident) => ident }.labelled("identifier");
-    let name = ident.map_with(|name, e| (name, e.span()));
+    let name = name_parser();
     let expr = expr_parser();
 
-    // `mut` is recognized positionally after `let` rather than as its own
-    // token, so the lexer keeps a single reserved-word table.
     let let_ = just(Token::Let)
-        .ignore_then(just(Token::Ident("mut")).or_not().map(|m| m.is_some()))
+        .ignore_then(just(Token::Mut).or_not().map(|m| m.is_some()))
         .then(name)
         .then_ignore(just(Token::Ctrl(':')))
-        .then(type_name_parser())
+        .then(type_ref_parser())
         .then_ignore(just(Token::Op("=")))
         .then(expr.clone())
         .map(
@@ -172,17 +299,13 @@ where
         )
         .labelled("variable declaration");
 
-    // The single `=` token only begins an assignment when a bare name sits at
+    // The single `=` token only begins an assignment when a place sits at
     // block-element start; `==` is a distinct token, so no lookahead is needed
     // beyond chumsky's ordinary backtracking into the expression alternative.
-    let assign = name
+    let assign = place_parser()
         .then_ignore(just(Token::Op("=")))
         .then(expr.clone())
-        .map(|((name, name_span), value)| BlockElement::Assign {
-            name,
-            name_span,
-            value,
-        })
+        .map(|(place, value)| BlockElement::Assign { place, value })
         .labelled("assignment");
 
     let while_ = just(Token::While)
@@ -199,8 +322,7 @@ where
 
     let break_ = just(Token::Break).map_with(|_, e| BlockElement::Break(e.span()));
 
-    let arm = expr
-        .clone()
+    let arm = condition_parser()
         .then_ignore(just(Token::Then))
         .then(block.clone());
     let if_ = just(Token::If)
@@ -253,6 +375,8 @@ where
 enum Item<'src> {
     Func(Spanned<&'src str>, Func<'src>),
     Extern(Spanned<&'src str>, ExternFunc<'src>),
+    Type(TypeDecl<'src>),
+    Method(MethodDecl<'src>),
     Element(Spanned<BlockElement<'src>>),
 }
 
@@ -262,38 +386,122 @@ where
     I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
 {
     let ident = select! { Token::Ident(ident) => ident };
-    let type_name = type_name_parser();
+    let name = name_parser();
+    let type_ref = type_ref_parser();
 
     let param = ident
         .map_with(|name, e| (name, e.span()))
         .then_ignore(just(Token::Ctrl(':')))
-        .then(type_name.clone())
-        .map(
-            |((name, name_span), ty): ((&'src str, Span), TypeName)| Param {
-                name,
-                ty,
-                span: name_span,
-            },
-        );
+        .then(type_ref.clone())
+        .map(|((name, name_span), ty)| Param {
+            name,
+            ty,
+            span: name_span,
+        });
 
     let args = param
         .separated_by(just(Token::Ctrl(',')))
         .allow_trailing()
-        .collect()
+        .collect::<Vec<_>>()
         .delimited_by(just(Token::Ctrl('(')), just(Token::Ctrl(')')))
-        .labelled("function args");
+        .labelled("function args")
+        .boxed();
 
     // `: type` is optional: omitting it declares no result.
     let result = just(Token::Ctrl(':'))
-        .ignore_then(type_name.clone())
-        .or_not();
+        .ignore_then(type_ref.clone())
+        .or_not()
+        .boxed();
+
+    let field = name
+        .clone()
+        .then_ignore(just(Token::Ctrl(':')))
+        .then(type_ref.clone())
+        .then_ignore(just(Token::Ctrl(',')).or_not())
+        .map(|((name, name_span), ty)| FieldDecl {
+            name,
+            name_span,
+            ty,
+        })
+        .labelled("field declaration");
+
+    let struct_body = just(Token::Struct)
+        .ignore_then(field.repeated().collect::<Vec<_>>())
+        .then_ignore(just(Token::End))
+        .boxed();
+
+    // A bare alternative is exactly an empty inline struct member.
+    let union_member = just(Token::Ctrl('|'))
+        .ignore_then(
+            select! {
+                Token::TyNil => ("Nil", true),
+                Token::Ident(name) => (name, false),
+            }
+            .map_with(|member, e| (member, e.span())),
+        )
+        .then(
+            just(Token::Is)
+                .ignore_then(struct_body.clone())
+                .or_not()
+                .map(Option::unwrap_or_default),
+        )
+        .map(|(((name, nil), name_span), fields)| UnionMemberDecl {
+            name,
+            name_span,
+            nil,
+            fields,
+        })
+        .labelled("union member");
+
+    let union_body = just(Token::Union)
+        .ignore_then(union_member.repeated().at_least(1).collect::<Vec<_>>())
+        .then_ignore(just(Token::End))
+        .boxed();
+
+    let type_decl = just(Token::Type)
+        .ignore_then(name.clone().labelled("type name"))
+        .then_ignore(just(Token::Is))
+        .then(
+            struct_body
+                .map(TypeBody::Struct)
+                .or(union_body.map(TypeBody::Union))
+                .or(type_ref.clone().map(TypeBody::Represented)),
+        )
+        .map_with(|((name, name_span), body), e| {
+            Item::Type(TypeDecl {
+                name,
+                name_span,
+                body,
+                span: e.span(),
+            })
+        })
+        .labelled("type declaration");
+
+    let method_decl = just(Token::Method)
+        .ignore_then(
+            name.clone()
+                .separated_by(just(Token::Ctrl('.')))
+                .at_least(1)
+                .collect::<Vec<_>>()
+                .labelled("method name"),
+        )
+        .then(args.clone())
+        .then(result.clone())
+        .then_ignore(just(Token::Do))
+        .then(block_parser().then_ignore(just(Token::End)))
+        .map_with(|(((path, args), ret), body), e| {
+            Item::Method(MethodDecl {
+                path,
+                args,
+                ret,
+                span: e.span(),
+                body,
+            })
+        })
+        .labelled("method declaration");
 
     let func = just(Token::Fun)
-        .ignore_then(
-            ident
-                .map_with(|name, e| (name, e.span()))
-                .labelled("function name"),
-        )
+        .ignore_then(name.clone().labelled("function name"))
         .then(args.clone())
         .then(result.clone())
         .then_ignore(just(Token::Do))
@@ -315,11 +523,7 @@ where
         .ignore_then(just(Token::Rust))
         .ignore_then(select! { Token::Str(symbol) => symbol }.labelled("link symbol"))
         .then_ignore(just(Token::Fun))
-        .then(
-            ident
-                .map_with(|name, e| (name, e.span()))
-                .labelled("function name"),
-        )
+        .then(name.labelled("function name"))
         .then(args)
         .then(result)
         .map_with(|(((symbol, name), args), ret), e| {
@@ -335,10 +539,12 @@ where
         })
         .labelled("external Rust function");
 
-    // Neither `fun` nor `extern` can begin a block element, so declarations and
-    // executable elements interleave freely at the top level.
+    // None of `fun`, `extern`, `type`, or `method` can begin a block element, so
+    // declarations and executable elements interleave freely at the top level.
     let item = extern_func
         .or(func)
+        .or(type_decl)
+        .or(method_decl)
         .or(block_element_parser().map(Item::Element));
 
     item.repeated()
@@ -348,6 +554,8 @@ where
             let mut funcs = HashMap::new();
             let mut externs = HashMap::new();
             let mut link_names = HashMap::new();
+            let mut types = Vec::new();
+            let mut methods = Vec::new();
             let mut elements = Vec::new();
             for item in items {
                 match item {
@@ -380,12 +588,16 @@ where
                         }
                         externs.insert(name, function);
                     }
+                    Item::Type(declaration) => types.push(declaration),
+                    Item::Method(declaration) => methods.push(declaration),
                     Item::Element(element) => elements.push(element),
                 }
             }
             Program {
                 funcs,
                 externs,
+                types,
+                methods,
                 body: Block { elements, span },
             }
         })
@@ -436,6 +648,13 @@ mod tests {
             !parse_errors.is_empty(),
             "expected a parse error for: {source}"
         );
+    }
+
+    fn builtin(ty: &Spanned<TypeRef<'_>>) -> TypeName {
+        match &ty.0 {
+            TypeRef::Builtin(name) => *name,
+            other => panic!("expected a built-in type, got {other:?}"),
+        }
     }
 
     #[test]
@@ -498,7 +717,10 @@ mod tests {
     #[test]
     fn parses_a_function_with_a_result_type() {
         let program = parse("fun double(value: Int64): Int64 do value * 2 end");
-        assert_eq!(program.funcs["double"].ret, Some(TypeName::Int64));
+        assert_eq!(
+            builtin(program.funcs["double"].ret.as_ref().unwrap()),
+            TypeName::Int64
+        );
     }
 
     #[test]
@@ -512,7 +734,10 @@ mod tests {
         let program = parse(
             "extern rust \"snacc_user_double\" fun rust_double(value: Int64): Int64\nprint(rust_double(2))",
         );
-        assert_eq!(program.externs["rust_double"].ret, Some(TypeName::Int64));
+        assert_eq!(
+            builtin(program.externs["rust_double"].ret.as_ref().unwrap()),
+            TypeName::Int64
+        );
     }
 
     #[test]
@@ -591,31 +816,194 @@ mod tests {
                  fun identity(value: {name}): {name} do value end"
             );
             let program = parse(&source);
-            assert_eq!(program.funcs["identity"].args[0].ty, expected);
-            assert_eq!(program.funcs["identity"].ret, Some(expected));
-            assert_eq!(program.externs["edge"].args[0].ty, expected);
-            assert_eq!(program.externs["edge"].ret, Some(expected));
+            assert_eq!(builtin(&program.funcs["identity"].args[0].ty), expected);
+            assert_eq!(
+                builtin(program.funcs["identity"].ret.as_ref().unwrap()),
+                expected
+            );
+            assert_eq!(builtin(&program.externs["edge"].args[0].ty), expected);
+            assert_eq!(
+                builtin(program.externs["edge"].ret.as_ref().unwrap()),
+                expected
+            );
         }
         let program = parse("let byte: UInt8 = 1u8 let ratio: Float32 = 0.5f32");
-        assert!(matches!(
-            program.body.elements[0].0,
-            BlockElement::Let {
-                ty: TypeName::UInt8,
-                ..
-            }
-        ));
-        assert!(matches!(
-            program.body.elements[1].0,
-            BlockElement::Let {
-                ty: TypeName::Float32,
-                ..
-            }
-        ));
+        let BlockElement::Let { ty, .. } = &program.body.elements[0].0 else {
+            panic!("expected a declaration");
+        };
+        assert_eq!(builtin(ty), TypeName::UInt8);
     }
 
     #[test]
     fn rejects_semicolons() {
         assert_rejects("while false do print(1) end; print(2)");
         assert_rejects("let x: Int64 = 1; print(x)");
+    }
+
+    // Specification 010 section 5: type, struct, union, method, and type-test
+    // syntax.
+
+    #[test]
+    fn parses_a_represented_type_declaration() {
+        let program = parse("type UserId is Int64");
+        assert_eq!(program.types.len(), 1);
+        assert_eq!(program.types[0].name, "UserId");
+        assert!(matches!(program.types[0].body, TypeBody::Represented(_)));
+    }
+
+    #[test]
+    fn parses_a_struct_with_and_without_a_trailing_comma() {
+        for source in [
+            "type Point is struct x: Dec64, y: Dec64, end",
+            "type Point is struct x: Dec64, y: Dec64 end",
+            "type Point is struct\n    x: Dec64\n    y: Dec64\nend",
+        ] {
+            let program = parse(source);
+            let TypeBody::Struct(fields) = &program.types[0].body else {
+                panic!("expected a struct body for {source}");
+            };
+            assert_eq!(fields.len(), 2, "{source}");
+            assert_eq!(fields[0].name, "x");
+            assert_eq!(fields[1].name, "y");
+        }
+    }
+
+    #[test]
+    fn parses_an_empty_struct() {
+        let program = parse("type Marker is struct end");
+        let TypeBody::Struct(fields) = &program.types[0].body else {
+            panic!("expected a struct body");
+        };
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn parses_bare_inline_and_nil_union_members() {
+        let program = parse(
+            "type Shape is union\n\
+             | Circle is struct radius: Int64, end\n\
+             | Point\n\
+             | Nil\n\
+             end",
+        );
+        let TypeBody::Union(members) = &program.types[0].body else {
+            panic!("expected a union body");
+        };
+        assert_eq!(members.len(), 3);
+        assert_eq!(members[0].fields.len(), 1);
+        assert!(members[1].fields.is_empty() && !members[1].nil);
+        assert!(members[2].nil && members[2].name == "Nil");
+    }
+
+    #[test]
+    fn parses_top_level_and_member_method_receivers() {
+        let program = parse(
+            "method Point.length(): Dec64 do 1.0 end\n\
+             method Shape.Circle.area(): Int64 do 1 end",
+        );
+        assert_eq!(program.methods.len(), 2);
+        let (receiver, name) = program.methods[0].split().expect("two components");
+        assert_eq!(receiver.len(), 1);
+        assert_eq!(name.0, "length");
+        let (receiver, name) = program.methods[1].split().expect("three components");
+        assert_eq!(
+            receiver.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec!["Shape", "Circle"]
+        );
+        assert_eq!(name.0, "area");
+    }
+
+    #[test]
+    fn parses_named_constructor_arguments_and_nested_postfix_chains() {
+        let program = parse("print(Point(x: 3.0, y: 4.0).x)\nprint(a.b.c(1).d)");
+        assert_eq!(program.body.elements.len(), 2);
+    }
+
+    #[test]
+    fn parses_field_assignment_through_a_field_path() {
+        let program = parse("entity.position.x = 1.0");
+        let BlockElement::Assign { place, .. } = &program.body.elements[0].0 else {
+            panic!("expected an assignment");
+        };
+        assert_eq!(place.fields.len(), 2);
+        assert!(matches!(place.root, PlaceRootName::Name("entity")));
+    }
+
+    #[test]
+    fn parses_whole_self_assignment_inside_a_method() {
+        let program = parse("method Point.reset() do self = Point(x: 0.0, y: 0.0) end");
+        let BlockElement::Assign { place, .. } = &program.methods[0].body.elements[0].0 else {
+            panic!("expected an assignment");
+        };
+        assert!(matches!(place.root, PlaceRootName::SelfRef));
+        assert!(place.fields.is_empty());
+    }
+
+    #[test]
+    fn parses_type_tests_with_and_without_a_binding() {
+        let program = parse(
+            "if shape is Shape.Circle(circle) then print(1) elseif shape is Nil then print(2) end",
+        );
+        let BlockElement::If(form) = &program.body.elements[0].0 else {
+            panic!("expected an if form");
+        };
+        let Condition::TypeTest(first) = &form.arms[0].0 else {
+            panic!("expected a type test");
+        };
+        assert_eq!(
+            first.member.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec!["Shape", "Circle"]
+        );
+        assert_eq!(first.binding.map(|(name, _)| name), Some("circle"));
+        let Condition::TypeTest(second) = &form.arms[1].0 else {
+            panic!("expected a type test");
+        };
+        assert_eq!(second.member[0].0, "Nil");
+        assert!(second.binding.is_none());
+    }
+
+    #[test]
+    fn a_comparison_still_parses_as_an_ordinary_condition() {
+        let program = parse("if x > 0 then print(1) end");
+        let BlockElement::If(form) = &program.body.elements[0].0 else {
+            panic!("expected an if form");
+        };
+        assert!(matches!(form.arms[0].0, Condition::Expr(_)));
+    }
+
+    #[test]
+    fn parses_a_qualified_type_in_every_type_position() {
+        assert_parses(
+            "type Shape is union | Circle is struct radius: Int64, end end\n\
+             type Holder is struct shape: Shape.Circle, end\n\
+             fun take(value: Shape.Circle): Shape.Circle do value end\n\
+             let held: Shape.Circle = Shape.Circle(radius: 1)",
+        );
+    }
+
+    #[test]
+    fn parses_a_builtin_type_name_as_an_unwrapping_call_head() {
+        let program = parse("type UserId is Int64\nlet id: UserId = UserId(1)\nprint(Int64(id))");
+        assert_eq!(program.body.elements.len(), 2);
+    }
+
+    #[test]
+    fn rejects_malformed_declaration_delimiters() {
+        for source in [
+            "type Point is struct x: Dec64,",
+            "type Shape is union | end",
+            "type Shape is union end",
+            "method Point.length(): Dec64 do 1.0",
+            "type is Int64",
+            "method () do end",
+        ] {
+            assert_rejects(source);
+        }
+    }
+
+    #[test]
+    fn mut_is_reserved_outside_a_declaration() {
+        assert_rejects("fun f(mut value: Int64): Int64 do value end");
+        assert_rejects("let mut: Int64 = 1");
     }
 }

@@ -1,0 +1,7 @@
+type Branch is struct
+    child: Leaf,
+end
+
+type Leaf is struct
+    parent: Branch,
+end

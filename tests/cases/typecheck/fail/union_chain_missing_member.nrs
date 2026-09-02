@@ -1,0 +1,13 @@
+type Light is union
+    | Red
+    | Amber
+    | Green
+end
+
+fun rank(light: Light): Int64 do
+    if light is Light.Red then
+        0
+    elseif light is Light.Amber then
+        1
+    end
+end

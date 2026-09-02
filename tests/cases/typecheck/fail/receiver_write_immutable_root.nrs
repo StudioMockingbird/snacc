@@ -1,0 +1,16 @@
+type Point is struct
+    x: Dec64,
+    y: Dec64,
+end
+
+method Point.bump() do
+    self.x = self.x + 1.0
+end
+
+method Point.bump_twice() do
+    self.bump()
+    self.bump()
+end
+
+let point: Point = Point(x: 3.0, y: 4.0)
+point.bump_twice()

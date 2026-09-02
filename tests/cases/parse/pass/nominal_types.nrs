@@ -1,0 +1,68 @@
+// Specification 010 section 5: represented, struct, union, method, member
+// access, constructor, and type-test syntax.
+type UserId is Int64
+
+type Point is struct
+    x: Dec64,
+    y: Dec64,
+end
+
+type Marker is struct end
+
+type Shape is union
+    | Circle is struct
+        radius: Int64,
+      end
+    | Rectangle is struct
+        length: Int64,
+        width: Int64,
+      end
+    | Point
+end
+
+type MaybeUser is union
+    | User is struct
+        id: UserId,
+      end
+    | Nil
+end
+
+method Point.length(): Dec64 do
+    self.x * self.x + self.y * self.y
+end
+
+method Point.translate(dx: Dec64, dy: Dec64) do
+    self.x = self.x + dx
+    self.y = self.y + dy
+end
+
+method Point.reset() do
+    self = Point(x: 0.0, y: 0.0)
+end
+
+method Shape.Circle.area(): Int64 do
+    self.radius * self.radius
+end
+
+let mut point: Point = Point(y: 4.0, x: 3.0,)
+point.translate(1.0, 2.0)
+point.x = 5.0
+print(point.length())
+
+let marker: Marker = Marker()
+let id: UserId = UserId(42)
+print(Int64(id))
+
+let shape: Shape = Shape.Circle(radius: 10)
+if shape is Shape.Circle(circle) then
+    print(circle.area())
+elseif shape is Shape.Rectangle(rectangle) then
+    print(rectangle.length * rectangle.width)
+elseif shape is Shape.Point then
+    print(0)
+end
+
+let missing: MaybeUser = nil
+if missing is Nil then
+    print(1)
+end

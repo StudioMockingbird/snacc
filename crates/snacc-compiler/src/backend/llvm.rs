@@ -1,5 +1,7 @@
 use crate::Optimization;
-use crate::semantics::checker::{ArithOp, CmpOp, Program, TBlock, TExpr, TStmt, TValueIf, Ty};
+use crate::semantics::checker::{
+    ArithOp, CmpOp, Place, PlaceRoot, Program, TBlock, TCondition, TExpr, TStmt, TValueIf, Ty,
+};
 use crate::syntax::ast::NumLiteral;
 use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::basic_block::BasicBlock;
@@ -16,23 +18,38 @@ use inkwell::values::{
 use inkwell::{FloatPredicate, IntPredicate, OptimizationLevel};
 use std::collections::HashMap;
 
+/// Specification 010's user-defined types have no lowering in this milestone's
+/// front-end task. `build_module` rejects any program that declares one, so a
+/// `Ty::User` never reaches the helpers below; each still rejects explicitly
+/// rather than panicking or silently guessing a representation.
+const USER_TYPE_UNSUPPORTED: &str =
+    "lowering a user-defined type is not implemented yet (Specification 010 backend task)";
+
 /// Specification 009 section 5.2: the value/storage type for each scalar.
-fn llvm_ty(context: &Context, ty: Ty) -> BasicTypeEnum<'_> {
-    match ty {
+fn llvm_ty(context: &Context, ty: Ty) -> Result<BasicTypeEnum<'_>, String> {
+    Ok(match ty {
         Ty::Dec64 => context.f64_type().into(),
         Ty::Float32 => context.f32_type().into(),
         Ty::Int64 | Ty::UInt64 => context.i64_type().into(),
         Ty::UInt32 => context.i32_type().into(),
         Ty::UInt16 => context.i16_type().into(),
         Ty::Bool | Ty::Nil | Ty::UInt8 => context.i8_type().into(),
-    }
+        Ty::User(_) => return Err(USER_TYPE_UNSUPPORTED.into()),
+    })
 }
 
 /// Whether a type is lowered as a floating-point value rather than an integer.
 fn is_float(ty: Ty) -> bool {
     match ty {
         Ty::Dec64 | Ty::Float32 => true,
-        Ty::Int64 | Ty::UInt8 | Ty::UInt16 | Ty::UInt32 | Ty::UInt64 | Ty::Bool | Ty::Nil => false,
+        Ty::Int64
+        | Ty::UInt8
+        | Ty::UInt16
+        | Ty::UInt32
+        | Ty::UInt64
+        | Ty::Bool
+        | Ty::Nil
+        | Ty::User(_) => false,
     }
 }
 
@@ -41,7 +58,7 @@ fn is_float(ty: Ty) -> bool {
 fn is_unsigned(ty: Ty) -> bool {
     match ty {
         Ty::UInt8 | Ty::UInt16 | Ty::UInt32 | Ty::UInt64 => true,
-        Ty::Int64 | Ty::Dec64 | Ty::Float32 | Ty::Bool | Ty::Nil => false,
+        Ty::Int64 | Ty::Dec64 | Ty::Float32 | Ty::Bool | Ty::Nil | Ty::User(_) => false,
     }
 }
 
@@ -50,7 +67,7 @@ fn is_unsigned(ty: Ty) -> bool {
 fn print_import<'ctx>(
     context: &'ctx Context,
     ty: Ty,
-) -> (&'static str, Vec<BasicMetadataTypeEnum<'ctx>>) {
+) -> Result<(&'static str, Vec<BasicMetadataTypeEnum<'ctx>>), String> {
     let symbol = match ty {
         Ty::Dec64 => "snacc_print_f64",
         Ty::Float32 => "snacc_print_f32",
@@ -60,9 +77,10 @@ fn print_import<'ctx>(
         Ty::UInt32 => "snacc_print_u32",
         Ty::UInt64 => "snacc_print_u64",
         Ty::Bool => "snacc_print_bool",
-        Ty::Nil => return ("snacc_print_nil", Vec::new()),
+        Ty::Nil => return Ok(("snacc_print_nil", Vec::new())),
+        Ty::User(_) => return Err(USER_TYPE_UNSUPPORTED.into()),
     };
-    (symbol, vec![llvm_ty(context, ty).into()])
+    Ok((symbol, vec![llvm_ty(context, ty)?.into()]))
 }
 
 fn is_subword_int<'ctx>(ty: impl TryInto<IntType<'ctx>>) -> bool {
@@ -112,16 +130,16 @@ fn function_type<'ctx>(
     context: &'ctx Context,
     params: &[(String, Ty)],
     result: Option<Ty>,
-) -> inkwell::types::FunctionType<'ctx> {
+) -> Result<inkwell::types::FunctionType<'ctx>, String> {
     let mut llvm_params = Vec::new();
     for (_, ty) in params {
-        let param: BasicMetadataTypeEnum = llvm_ty(context, *ty).into();
+        let param: BasicMetadataTypeEnum = llvm_ty(context, *ty)?.into();
         llvm_params.push(param);
     }
-    match result {
-        Some(ty) => llvm_ty(context, ty).fn_type(&llvm_params, false),
+    Ok(match result {
+        Some(ty) => llvm_ty(context, ty)?.fn_type(&llvm_params, false),
         None => context.void_type().fn_type(&llvm_params, false),
-    }
+    })
 }
 
 /// How a local's current value is reached. Immutable roots stay as SSA values;
@@ -206,6 +224,13 @@ fn build_module<'ctx>(
     module_name: &str,
     machine: &TargetMachine,
 ) -> Result<Module<'ctx>, String> {
+    // Specification 010's lowering lands with the backend task; until then a
+    // program that declares a user type is rejected here rather than partially
+    // lowered.
+    if !program.types.is_empty() || !program.methods.is_empty() {
+        return Err(USER_TYPE_UNSUPPORTED.into());
+    }
+
     let triple = TargetMachine::get_default_triple();
     let module = context.create_module(module_name);
     let builder = context.create_builder();
@@ -220,7 +245,7 @@ fn build_module<'ctx>(
             context,
             &module,
             &function.symbol,
-            function_type(context, &function.params, function.result),
+            function_type(context, &function.params, function.result)?,
             None,
         );
         functions.insert(name.clone(), llvm_function);
@@ -230,7 +255,7 @@ fn build_module<'ctx>(
             context,
             &module,
             &format!("snacc_fn_{name}"),
-            function_type(context, &function.params, function.result),
+            function_type(context, &function.params, function.result)?,
             Some(Linkage::Internal),
         );
         functions.insert(name.clone(), llvm_function);
@@ -375,7 +400,7 @@ impl<'ctx> Codegen<'ctx, '_> {
             } => {
                 let value = self.expr(env, loops, value)?;
                 if *mutable {
-                    let ty = llvm_ty(self.context, *ty);
+                    let ty = llvm_ty(self.context, *ty)?;
                     let slot = self.entry_alloca(ty, name)?;
                     self.builder
                         .build_store(slot, value)
@@ -386,8 +411,9 @@ impl<'ctx> Codegen<'ctx, '_> {
                 }
                 Ok(false)
             }
-            TStmt::Assign { name, value } => {
+            TStmt::Assign { place, value } => {
                 let value = self.expr(env, loops, value)?;
+                let name = scalar_local(place)?;
                 match lookup(env, name) {
                     Some(Slot::Mutable(slot, _)) => {
                         self.builder
@@ -398,6 +424,7 @@ impl<'ctx> Codegen<'ctx, '_> {
                     _ => Err("checker allowed an assignment to an immutable local".into()),
                 }
             }
+            TStmt::MethodCall(_) => Err(USER_TYPE_UNSUPPORTED.into()),
             TStmt::While { condition, body } => {
                 let function = self.current_function();
                 let condition_block = self.context.append_basic_block(function, "while_condition");
@@ -442,7 +469,7 @@ impl<'ctx> Codegen<'ctx, '_> {
                 let merge = self.context.append_basic_block(function, "if_merge");
                 let mut reaches_merge = false;
                 for (condition, body) in &form.arms {
-                    let test = self.condition(env, loops, condition)?;
+                    let test = self.arm_condition(env, loops, condition)?;
                     let then_block = self.context.append_basic_block(function, "if_then");
                     let next_block = self.context.append_basic_block(function, "if_next");
                     self.builder
@@ -500,6 +527,20 @@ impl<'ctx> Codegen<'ctx, '_> {
         }
     }
 
+    /// An `if`/`elseif` arm's condition. A proven type test lowers to a tag
+    /// comparison in the backend task; nothing here guesses one.
+    fn arm_condition(
+        &self,
+        env: &mut Env<'ctx>,
+        loops: &mut Loops<'ctx>,
+        condition: &TCondition,
+    ) -> Result<inkwell::values::IntValue<'ctx>, String> {
+        match condition {
+            TCondition::Expr(expression) => self.condition(env, loops, expression),
+            TCondition::Test(_) => Err(USER_TYPE_UNSUPPORTED.into()),
+        }
+    }
+
     fn condition(
         &self,
         env: &mut Env<'ctx>,
@@ -551,9 +592,9 @@ impl<'ctx> Codegen<'ctx, '_> {
     }
 
     /// Declares the runtime print import for `ty` on first use.
-    fn print_import(&self, ty: Ty) -> FunctionValue<'ctx> {
-        let (symbol, params) = print_import(self.context, ty);
-        self.module.get_function(symbol).unwrap_or_else(|| {
+    fn print_import(&self, ty: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let (symbol, params) = print_import(self.context, ty)?;
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
             declare(
                 self.context,
                 self.module,
@@ -561,7 +602,7 @@ impl<'ctx> Codegen<'ctx, '_> {
                 self.context.void_type().fn_type(&params, false),
                 None,
             )
-        })
+        }))
     }
 
     fn value_if(
@@ -574,7 +615,7 @@ impl<'ctx> Codegen<'ctx, '_> {
         let merge = self.context.append_basic_block(function, "if_merge");
         let mut incoming: Vec<(BasicValueEnum<'ctx>, BasicBlock<'ctx>)> = Vec::new();
         for (condition, body) in &form.arms {
-            let test = self.condition(env, loops, condition)?;
+            let test = self.arm_condition(env, loops, condition)?;
             let then_block = self.context.append_basic_block(function, "if_then");
             let next_block = self.context.append_basic_block(function, "if_next");
             self.builder
@@ -584,7 +625,13 @@ impl<'ctx> Codegen<'ctx, '_> {
             self.branch_value(env, loops, body, merge, &mut incoming)?;
             self.builder.position_at_end(next_block);
         }
-        self.branch_value(env, loops, &form.else_branch, merge, &mut incoming)?;
+        // An exhaustive type-test chain has no `else`; that lowering lands with
+        // the backend task.
+        let else_branch = form
+            .else_branch
+            .as_ref()
+            .ok_or_else(|| USER_TYPE_UNSUPPORTED.to_string())?;
+        self.branch_value(env, loops, else_branch, merge, &mut incoming)?;
 
         self.builder.position_at_end(merge);
         if incoming.is_empty() {
@@ -592,7 +639,7 @@ impl<'ctx> Codegen<'ctx, '_> {
         }
         let phi = self
             .builder
-            .build_phi(llvm_ty(self.context, form.ty), "if_value")
+            .build_phi(llvm_ty(self.context, form.ty)?, "if_value")
             .map_err(|error| error.to_string())?;
         let incoming: Vec<(&dyn BasicValue<'ctx>, BasicBlock<'ctx>)> = incoming
             .iter()
@@ -682,14 +729,22 @@ impl<'ctx> Codegen<'ctx, '_> {
                     .into())
             }
             TExpr::Cast(_, _) => Err("checker emitted an unsupported cast".into()),
-            TExpr::Local(name) => match lookup(env, name) {
-                Some(Slot::Value(value)) => Ok(value),
-                Some(Slot::Mutable(slot, ty)) => self
-                    .builder
-                    .build_load(ty, slot, name)
-                    .map_err(|error| error.to_string()),
-                None => Err("type checking guarantees every local resolves".into()),
-            },
+            TExpr::Place(place) => {
+                let name = scalar_local(place)?;
+                match lookup(env, name) {
+                    Some(Slot::Value(value)) => Ok(value),
+                    Some(Slot::Mutable(slot, ty)) => self
+                        .builder
+                        .build_load(ty, slot, name)
+                        .map_err(|error| error.to_string()),
+                    None => Err("type checking guarantees every local resolves".into()),
+                }
+            }
+            TExpr::FieldRead { .. }
+            | TExpr::Construct { .. }
+            | TExpr::Represent { .. }
+            | TExpr::Inject { .. }
+            | TExpr::MethodCall(_) => Err(USER_TYPE_UNSUPPORTED.into()),
             TExpr::Arith(left, op, right, ty) => {
                 let ty = *ty;
                 let left = self.expr(env, loops, left)?;
@@ -792,7 +847,7 @@ impl<'ctx> Codegen<'ctx, '_> {
             TExpr::If(form) => self.value_if(env, loops, form),
             TExpr::Print(value, ty) => {
                 let value = self.expr(env, loops, value)?;
-                let function = self.print_import(*ty);
+                let function = self.print_import(*ty)?;
                 let args = match ty {
                     Ty::Nil => Vec::new(),
                     _ => vec![value.into()],
@@ -801,6 +856,15 @@ impl<'ctx> Codegen<'ctx, '_> {
                 Ok(value)
             }
         }
+    }
+}
+
+/// The local name of a place that selects no field. Field paths and `self`
+/// roots lower with the backend task.
+fn scalar_local(place: &Place) -> Result<&str, String> {
+    match (&place.root, place.path.is_empty()) {
+        (PlaceRoot::Local(name), true) => Ok(name),
+        _ => Err(USER_TYPE_UNSUPPORTED.into()),
     }
 }
 

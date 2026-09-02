@@ -1,0 +1,1 @@
+'Point' is a user-defined type; only the ABI's permitted types may cross a Rust bridge

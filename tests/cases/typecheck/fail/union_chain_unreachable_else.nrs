@@ -1,0 +1,13 @@
+type Direction is union
+    | East
+    | West
+end
+
+let direction: Direction = Direction.East()
+if direction is Direction.East then
+    print(1)
+elseif direction is Direction.West then
+    print(2)
+else
+    print(3)
+end

@@ -14,10 +14,17 @@ pub enum Token<'src> {
     Rust,
     Fun,
     Let,
+    Mut,
     Print,
     If,
     Then,
     Do,
+    Type,
+    Is,
+    Struct,
+    Union,
+    Method,
+    SelfKw,
     TyDec64,
     TyInt64,
     TyBool,
@@ -48,10 +55,17 @@ impl fmt::Display for Token<'_> {
             Token::Rust => write!(f, "rust"),
             Token::Fun => write!(f, "fun"),
             Token::Let => write!(f, "let"),
+            Token::Mut => write!(f, "mut"),
             Token::Print => write!(f, "print"),
             Token::If => write!(f, "if"),
             Token::Then => write!(f, "then"),
             Token::Do => write!(f, "do"),
+            Token::Type => write!(f, "type"),
+            Token::Is => write!(f, "is"),
+            Token::Struct => write!(f, "struct"),
+            Token::Union => write!(f, "union"),
+            Token::Method => write!(f, "method"),
+            Token::SelfKw => write!(f, "self"),
             Token::TyDec64 => write!(f, "Dec64"),
             Token::TyInt64 => write!(f, "Int64"),
             Token::TyBool => write!(f, "Bool"),
@@ -171,13 +185,23 @@ pub fn lexer<'src>()
         .to_slice()
         .map(Token::Op);
 
-    let ctrl = one_of("()[],:").map(Token::Ctrl);
+    // `.` selects a member and continues a qualified path; `|` introduces a
+    // union alternative. Numeric literals are munched before this alternative
+    // runs, so `1.5` is still one token.
+    let ctrl = one_of("()[],:.|").map(Token::Ctrl);
 
     let ident = text::ascii::ident().map(|ident: &str| match ident {
         "fun" => Token::Fun,
         "extern" => Token::Extern,
         "rust" => Token::Rust,
         "let" => Token::Let,
+        "mut" => Token::Mut,
+        "type" => Token::Type,
+        "is" => Token::Is,
+        "struct" => Token::Struct,
+        "union" => Token::Union,
+        "method" => Token::Method,
+        "self" => Token::SelfKw,
         "print" => Token::Print,
         "if" => Token::If,
         "then" => Token::Then,
@@ -392,6 +416,43 @@ mod tests {
                 Token::End,
             ]
         );
+    }
+
+    /// Specification 010 section 4: every new keyword is reserved, and `.`/`|`
+    /// lex as their own control characters.
+    #[test]
+    fn the_nominal_type_keywords_are_reserved_words() {
+        assert_eq!(
+            lex("type is struct union method self mut"),
+            vec![
+                Token::Type,
+                Token::Is,
+                Token::Struct,
+                Token::Union,
+                Token::Method,
+                Token::SelfKw,
+                Token::Mut,
+            ]
+        );
+    }
+
+    #[test]
+    fn member_selection_and_union_bars_lex_as_control_characters() {
+        assert_eq!(
+            lex("a.b | c"),
+            vec![
+                Token::Ident("a"),
+                Token::Ctrl('.'),
+                Token::Ident("b"),
+                Token::Ctrl('|'),
+                Token::Ident("c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_decimal_literal_still_munches_its_own_point() {
+        assert_eq!(lex("1.5"), vec![Token::Num(NumLiteral::Dec(1.5))]);
     }
 
     #[test]

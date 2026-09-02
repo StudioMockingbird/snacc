@@ -1,0 +1,13 @@
+type Shape is union
+    | Circle is struct
+        radius: Int64,
+      end
+end
+
+fun make(): Shape do
+    Shape.Circle(radius: 1)
+end
+
+if make() is Shape.Circle then
+    print(1)
+end
