@@ -1,3 +1,4 @@
+use sha2::Digest;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -613,4 +614,58 @@ fn concurrent_bridge_assertion_generation_does_not_corrupt_the_file() {
     // comment (see `render_bridge_assertions`), so a non-corrupted, non-truncated
     // publish ends with the comment's closing paren, not the statement's `;`.
     assert!(content.trim_end().ends_with(')'));
+}
+
+#[test]
+fn concurrent_object_cache_publication_does_not_corrupt_the_cache() {
+    let target = tempfile::tempdir().expect("failed to create fixture target directory");
+    let target_path = target.path().to_path_buf();
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let target_path = target_path.clone();
+            std::thread::spawn(move || cargo_snacc(&target_path, &["build", "--offline"]))
+        })
+        .collect();
+    for handle in handles {
+        let output = handle.join().expect("cargo-snacc thread panicked");
+        assert!(
+            output.status.success(),
+            "concurrent build failed:\n{}",
+            combined(&output)
+        );
+    }
+
+    let manifest_path = find_manifest(&target_path.join("snacc"))
+        .expect("content-addressed cache manifest was not written");
+    let cache_dir = manifest_path.parent().unwrap();
+    let object_path = cache_dir.join(if cfg!(windows) { "app.obj" } else { "app.o" });
+    let object_bytes = fs::read(&object_path).expect("cached object was not published");
+    assert!(
+        !object_bytes.is_empty(),
+        "cached object should not be empty"
+    );
+
+    let manifest_bytes = fs::read(&manifest_path).expect("cache manifest was not published");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).expect("cache manifest should be valid JSON");
+    let mut hash = sha2::Sha256::new();
+    hash.update(&object_bytes);
+    let expected_sha256 = format!("{:x}", hash.finalize());
+    assert_eq!(
+        manifest["object_sha256"].as_str(),
+        Some(expected_sha256.as_str()),
+        "manifest's recorded object hash should match the object bytes actually on disk \
+         (a mismatch means one process's manifest published over another's object, or vice versa)"
+    );
+
+    let leftover_temp_files: Vec<_> = fs::read_dir(cache_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "tmp"))
+        .collect();
+    assert!(
+        leftover_temp_files.is_empty(),
+        "no unique temp files should remain in the cache directory after publish: {:?}",
+        leftover_temp_files
+    );
 }

@@ -767,9 +767,19 @@ fn emit_cached(selected: &Selected, source: &str, options: &Options) -> Result<P
         )));
     }
     fs::create_dir_all(&directory).map_err(io_error)?;
-    let temp = directory.join("app.tmp");
-    fs::write(&temp, &emitted.bytes).map_err(io_error)?;
-    fs::rename(&temp, &object).map_err(io_error)?;
+    let mut temp = tempfile::Builder::new()
+        .prefix("app-")
+        .suffix(".tmp")
+        .tempfile_in(&directory)
+        .map_err(io_error)?;
+    temp.write_all(&emitted.bytes).map_err(io_error)?;
+    if let Err(error) = temp.persist(&object) {
+        if !object.is_file() {
+            return Err(CliError(format!(
+                "failed to publish cached object: {error}"
+            )));
+        }
+    }
     let cache = CacheManifest {
         schema: 1,
         identity: identity.clone(),
@@ -782,11 +792,21 @@ fn emit_cached(selected: &Selected, source: &str, options: &Options) -> Result<P
         profile: profile.into(),
         object_sha256: sha256(&emitted.bytes),
     };
-    let manifest_temp = directory.join("manifest.tmp");
     let encoded = serde_json::to_vec_pretty(&cache)
         .map_err(|error| CliError(format!("encode cache manifest: {error}")))?;
-    fs::write(&manifest_temp, encoded).map_err(io_error)?;
-    fs::rename(&manifest_temp, &manifest).map_err(io_error)?;
+    let mut manifest_temp = tempfile::Builder::new()
+        .prefix("manifest-")
+        .suffix(".json.tmp")
+        .tempfile_in(&directory)
+        .map_err(io_error)?;
+    manifest_temp.write_all(&encoded).map_err(io_error)?;
+    if let Err(error) = manifest_temp.persist(&manifest) {
+        if !manifest.is_file() {
+            return Err(CliError(format!(
+                "failed to publish cache manifest: {error}"
+            )));
+        }
+    }
     if options.verbose {
         println!("Snacc object rebuilt: {}", selected.entry.display());
     }
