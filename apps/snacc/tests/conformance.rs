@@ -43,3 +43,32 @@ fn run_pass_corpus_with_llvm() {
     let case_names = case_names.join(", ");
     run_llvm(&case_names, &source, &expected);
 }
+
+/// The workbench embeds `examples/*.nrs` files individually (see
+/// `apps/snacc-workbench/build.rs` and `snippets.json`), each paired with a
+/// `.stdout` sidecar that `build.rs` only checks for existence. Run each
+/// example on its own, the same way the workbench runs a snippet, so a stale
+/// or wrong `.stdout` file fails a test instead of shipping unverified.
+#[test]
+fn run_examples_individually_with_llvm() {
+    let examples_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let mut cases = fs::read_dir(&examples_dir)
+        .expect("examples directory is missing")
+        .map(|entry| entry.expect("invalid examples directory entry").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "nrs"))
+        .filter(|path| path.with_extension("stdout").is_file())
+        .collect::<Vec<_>>();
+    cases.sort();
+    assert!(
+        !cases.is_empty(),
+        "no examples/*.nrs files have a matching .stdout sidecar"
+    );
+
+    for case_path in cases {
+        let case_name = case_path.display().to_string();
+        let source = fs::read_to_string(&case_path).expect("failed to read example");
+        let expected = fs::read_to_string(case_path.with_extension("stdout"))
+            .expect("example has no .stdout file");
+        run_llvm(&case_name, &source, &expected);
+    }
+}
