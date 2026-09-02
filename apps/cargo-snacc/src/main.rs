@@ -1506,6 +1506,40 @@ mod tests {
         assert!(zeta_line.contains("// snacc: zeta (src/main.nrs:1:1)"));
     }
 
+    /// Specification 009 section 5.2's exact bridge/ABI mapping, checked
+    /// against the pure rendering function so this regresses without needing
+    /// a full LLVM/cargo build (see the slower, real-link coverage in
+    /// `apps/cargo-snacc/tests/cargo_hosted.rs`).
+    #[test]
+    fn render_bridge_assertions_maps_every_new_scalar_type() {
+        let source = concat!(
+            "extern rust \"snacc_user_u8\" fun echo_u8(value: UInt8): UInt8\n",
+            "extern rust \"snacc_user_u16\" fun echo_u16(value: UInt16): UInt16\n",
+            "extern rust \"snacc_user_u32\" fun echo_u32(value: UInt32): UInt32\n",
+            "extern rust \"snacc_user_u64\" fun echo_u64(value: UInt64): UInt64\n",
+            "extern rust \"snacc_user_f32\" fun echo_f32(value: Float32): Float32\n",
+            "print(0)\n"
+        );
+        let checked = check(source).expect("bridge declarations should type check");
+        let rendered = render_bridge_assertions(&checked, Path::new("src/main.nrs"), source);
+        for (symbol, mapping) in [
+            ("snacc_user_u8", "fn(u8) -> u8"),
+            ("snacc_user_u16", "fn(u16) -> u16"),
+            ("snacc_user_u32", "fn(u32) -> u32"),
+            ("snacc_user_u64", "fn(u64) -> u64"),
+            ("snacc_user_f32", "fn(f32) -> f32"),
+        ] {
+            let line = rendered
+                .lines()
+                .find(|line| line.contains(symbol))
+                .unwrap_or_else(|| panic!("assertion line for {symbol} was not rendered"));
+            assert!(
+                line.contains(mapping),
+                "{symbol} should render '{mapping}', got: {line}"
+            );
+        }
+    }
+
     #[test]
     fn render_bridge_assertions_with_no_externs_still_checks_the_abi_version() {
         let source = "print(0)\n";
