@@ -17,6 +17,11 @@ use std::{
 };
 use tempfile::TempDir;
 
+#[test]
+fn runtime_implements_abi_version_two() {
+    assert_eq!(snacc_runtime::ABI_VERSION, 2);
+}
+
 fn run(command: &mut Command, what: &str) -> Output {
     let output = command
         .output()

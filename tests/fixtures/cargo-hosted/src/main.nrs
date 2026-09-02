@@ -1,5 +1,5 @@
 extern rust "snacc_user_itoa_len" fun itoa_len(value: Int64): Int64
 extern rust "snacc_user_arg_count" fun arg_count(): Int64
 
-print(itoa_len(12345));
+print(itoa_len(12345))
 print(arg_count())

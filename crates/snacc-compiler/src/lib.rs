@@ -9,7 +9,8 @@ pub use diagnostics::{Diagnostic, DiagnosticPhase, Diagnostics};
 pub use semantics::checker::{Program, Ty};
 pub use syntax::ast::Program as AstProgram;
 
-pub const ABI_VERSION: u32 = 1;
+/// Contract version for generated objects, runtime imports, and Rust bridges.
+pub const ABI_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Optimization {

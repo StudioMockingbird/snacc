@@ -1,5 +1,8 @@
 //! Stable Rust-side ABI used by generated Snacc objects.
 
+/// Contract version for generated objects, runtime imports, and Rust bridges.
+pub const ABI_VERSION: u32 = 2;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn snacc_print_f64(value: f64) {
     println!("{value}");
