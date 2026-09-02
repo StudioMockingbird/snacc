@@ -39,18 +39,13 @@ no test exercises. Each one can regress silently today.
    buffers do not deadlock (this is why draining is threaded); timeout kills and
    waits for the child; a build path containing spaces still compiles and runs.
 
-6. [ ] Add focused `snacc-driver` tests in `crates/snacc-driver/tests/`:
-   structured diagnostics for invalid source, an isolated build directory per
-   call, a changed source not reusing a stale executable, runtime output landing
-   on stdout rather than stderr, and filesystem or missing-`rustc` failures.
-
-7. [ ] Add `snacc-runtime` ABI coverage in `crates/snacc-runtime/tests/` for
+6. [ ] Add `snacc-runtime` ABI coverage in `crates/snacc-runtime/tests/` for
    each exported `snacc_print_*` symbol and the `force_link` retention
    contract.
 
 ## Housekeeping
 
-8. [ ] After all acceptance criteria are verified, change RFCs 004, 005, and
+7. [ ] After all acceptance criteria are verified, change RFCs 004, 005, and
    006 to `Status: Closed` and move them to `docs/specs/archive/` in the same
    change. `Status: Completed` is not a permitted terminal status.
 
