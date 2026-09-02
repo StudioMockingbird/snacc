@@ -1,0 +1,15 @@
+// Specification 009 conformance 11: printing every new type through a real
+// compiled executable. unsigned_and_float32.nrs deliberately routes every
+// observation through Bool (see its header comment) and never links against
+// the five ABI version 3 print symbols this case exercises directly
+// (snacc_print_u8/_u16/_u32/_u64/_f32).
+print(0u8)
+print(255u8)
+print(0u16)
+print(65535u16)
+print(0u32)
+print(4294967295u32)
+print(0u64)
+print(18446744073709551615u64)
+print(0f32)
+print(1.5f32)

@@ -7,13 +7,16 @@ top-level-declaration
                      = function-declaration
                      | rust-declaration ;
 
-function-declaration = "fun", identifier, parameters, [ ":", type ], "do",
+function-declaration = "fun", identifier, parameters, [ ":", builtin-value-type ], "do",
                        block, "end" ;
 rust-declaration     = "extern", "rust", string-literal, "fun", identifier,
-                       parameters, [ ":", type ] ;
+                       parameters, [ ":", builtin-value-type ] ;
 parameters           = "(", [ parameter, { ",", parameter }, [ "," ] ], ")" ;
-parameter            = identifier, ":", type ;
-type                 = "Int64" | "Dec64" | "Bool" | "Nil" ;
+parameter            = identifier, ":", builtin-value-type ;
+unsigned-type        = "UInt8" | "UInt16" | "UInt32" | "UInt64" ;
+builtin-value-type   = "Int64" | "Dec64" | "Bool" | "Nil"
+                     | unsigned-type
+                     | "Float32" ;
 
 block                = { block-element } ;
 block-element        = variable-declaration
@@ -23,7 +26,7 @@ block-element        = variable-declaration
                      | if-form
                      | expression ;
 
-variable-declaration = "let", [ "mut" ], identifier, ":", type,
+variable-declaration = "let", [ "mut" ], identifier, ":", builtin-value-type,
                        "=", expression ;
 assignment           = identifier, "=", expression ;
 
@@ -48,11 +51,15 @@ atom                 = literal
                      | "(", expression, ")" ;
 print-expression     = "print", "(", expression, ")" ;
 list-literal         = "[", [ expression, { ",", expression }, [ "," ] ], "]" ;
-literal              = decimal-literal | integer-literal | boolean-literal
-                     | nil-literal | string-literal ;
+literal              = float32-literal | unsigned-literal | decimal-literal
+                     | integer-literal | boolean-literal | nil-literal
+                     | string-literal ;
 boolean-literal      = "true" | "false" ;
 nil-literal          = "nil" | "null" ;
 
+float32-literal      = digit, { digit }, [ ".", digit, { digit } ], "f32" ;
+unsigned-literal     = digit, { digit }, unsigned-suffix ;
+unsigned-suffix      = "u8" | "u16" | "u32" | "u64" ;
 decimal-literal      = digit, { digit }, ".", digit, { digit } ;
 integer-literal      = digit, { digit } ;
 string-literal       = '"', { string-character }, '"' ;
@@ -67,4 +74,8 @@ digit                = "0" | "1" | "2" | "3" | "4"
    grammatical meaning. A comment begins with // and ends immediately before
    the next line feed or at end of input. Keywords are reserved and cannot be
    identifiers. The semicolons above terminate EBNF productions; Snacc has no
-   semicolon token. *)
+   semicolon token. Numeric tokens use maximal munch: a digit-led token
+   immediately followed by an ASCII letter, digit, or underscore that does not
+   complete one of the literal forms above is one invalid token, not a valid
+   number followed by an identifier; thus `1u8` and `1.0f32` are valid, while
+   `1u9`, `1u8x`, `1f64`, and `1.0u8` are lexical errors. *)

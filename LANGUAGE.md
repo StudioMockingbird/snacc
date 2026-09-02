@@ -9,13 +9,16 @@ top-level-declaration
                      = function-declaration
                      | rust-declaration ;
 
-function-declaration = "fun", identifier, parameters, [ ":", type ], "do",
+function-declaration = "fun", identifier, parameters, [ ":", builtin-value-type ], "do",
                        block, "end" ;
 rust-declaration     = "extern", "rust", string-literal, "fun", identifier,
-                       parameters, [ ":", type ] ;
+                       parameters, [ ":", builtin-value-type ] ;
 parameters           = "(", [ parameter, { ",", parameter }, [ "," ] ], ")" ;
-parameter            = identifier, ":", type ;
-type                 = "Int64" | "Dec64" | "Bool" | "Nil" ;
+parameter            = identifier, ":", builtin-value-type ;
+unsigned-type        = "UInt8" | "UInt16" | "UInt32" | "UInt64" ;
+builtin-value-type   = "Int64" | "Dec64" | "Bool" | "Nil"
+                     | unsigned-type
+                     | "Float32" ;
 
 block                = { block-element } ;
 block-element        = variable-declaration
@@ -25,7 +28,7 @@ block-element        = variable-declaration
                      | if-form
                      | expression ;
 
-variable-declaration = "let", [ "mut" ], identifier, ":", type,
+variable-declaration = "let", [ "mut" ], identifier, ":", builtin-value-type,
                        "=", expression ;
 assignment           = identifier, "=", expression ;
 
@@ -50,11 +53,15 @@ atom                 = literal
                      | "(", expression, ")" ;
 print-expression     = "print", "(", expression, ")" ;
 list-literal         = "[", [ expression, { ",", expression }, [ "," ] ], "]" ;
-literal              = decimal-literal | integer-literal | boolean-literal
-                     | nil-literal | string-literal ;
+literal              = float32-literal | unsigned-literal | decimal-literal
+                     | integer-literal | boolean-literal | nil-literal
+                     | string-literal ;
 boolean-literal      = "true" | "false" ;
 nil-literal          = "nil" | "null" ;
 
+float32-literal      = digit, { digit }, [ ".", digit, { digit } ], "f32" ;
+unsigned-literal     = digit, { digit }, unsigned-suffix ;
+unsigned-suffix      = "u8" | "u16" | "u32" | "u64" ;
 decimal-literal      = digit, { digit }, ".", digit, { digit } ;
 integer-literal      = digit, { digit } ;
 string-literal       = '"', { string-character }, '"' ;
@@ -69,15 +76,20 @@ digit                = "0" | "1" | "2" | "3" | "4"
    grammatical meaning. A comment begins with // and ends immediately before
    the next line feed or at end of input. Keywords are reserved and cannot be
    identifiers. The semicolons above terminate EBNF productions; Snacc has no
-   semicolon token. *)
+   semicolon token. Numeric tokens use maximal munch: a digit-led token
+   immediately followed by an ASCII letter, digit, or underscore that does not
+   complete one of the literal forms above is one invalid token, not a valid
+   number followed by an identifier; thus `1u8` and `1.0f32` are valid, while
+   `1u9`, `1u8x`, `1f64`, and `1.0u8` are lexical errors. *)
 ```
 
 String escapes do not exist.
 
 The keywords `fun`, `extern`, `rust`, `let`, `print`, `if`, `then`, `elseif`,
 `else`, `while`, `do`, `break`, `end`, `true`, `false`, `nil`, `null`,
-`Int64`, `Dec64`, `Bool`, and `Nil` are reserved. `mut` is not a reserved
-keyword; it is recognized only in the fixed position immediately after `let`.
+`Int64`, `Dec64`, `Bool`, `Nil`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, and
+`Float32` are reserved. `mut` is not a reserved keyword; it is recognized only
+in the fixed position immediately after `let`.
 Operators of the same precedence associate left to right. Calls bind more
 tightly than arithmetic, arithmetic binds more tightly than comparison, and
 multiplication and division bind more tightly than addition and subtraction.
@@ -112,13 +124,33 @@ point has type `Dec64`.
 `Bool` contains `true` and `false`. `Nil` contains the single value `nil`; `null`
 is an alternate spelling of that value.
 
+`UInt8`, `UInt16`, `UInt32`, and `UInt64` are unsigned integers of the named
+bit width, holding integers from 0 through 2^N - 1. An unsigned literal has
+the type selected by its suffix (`u8`, `u16`, `u32`, or `u64`); its
+mathematical value must fit that type, or the literal is rejected without
+truncation or wrapping (`256u8` and `18446744073709551616u64` are invalid).
+
+`Float32` is an IEEE 754 binary32 value. A literal ending in `f32` has type
+`Float32`; both `1f32` and `1.0f32` are valid. The decimal source value is
+rounded once to the nearest binary32 value using round-to-nearest,
+ties-to-even. A literal that would round to infinity is rejected as out of
+range; infinity and NaN have no literal spelling.
+
+All five of these types are scalar copy types: copying, binding, passing, and
+returning a value duplicates its bits and transfers no resource ownership.
+
 String and list forms are reserved syntax. A conforming compiler must diagnose
 either form as unsupported before native-code generation.
 
 Every parameter, function result, and local binding has an explicit type. The
 only implicit conversion is `Int64` to `Dec64`. It applies to bindings, function
 arguments and results, numeric operands, and branches. No conversion to or from
-`Bool` or `Nil` exists.
+`Bool` or `Nil` exists. `UInt8`, `UInt16`, `UInt32`, `UInt64`, and `Float32`
+participate in no implicit conversion at all: not to or from `Int64`, not to
+or from `Dec64`, not to or from each other, and not to or from `Bool` or
+`Nil`. Every declaration, assignment, argument, result, and branch involving
+one of these five types requires an exact type match; `let byte: UInt8 = 1`
+is a type error, not a contextual reinterpretation of the literal.
 
 No result is not a type. A function or Rust bridge that omits its result type
 produces no result: it cannot be written, stored, passed, returned, or
@@ -253,15 +285,35 @@ Operands, arguments, and block elements evaluate from left to right. A
 discarded expression result still evaluates completely, including its side
 effects.
 
-- `+`, `-`, `*`, and `/` require numeric operands. Two `Int64` operands produce
-  `Int64`; otherwise both operands are widened as needed and the result is
-  `Dec64`. `Int64` division truncates toward zero. `Int64` overflow and division
-  by zero have unspecified behavior. `Dec64` arithmetic follows IEEE 754.
+- `+`, `-`, `*`, and `/` on `Int64` and `Dec64` operands require numeric
+  operands. Two `Int64` operands produce `Int64`; otherwise both operands are
+  widened as needed and the result is `Dec64`. `Int64` division truncates
+  toward zero. `Int64` overflow and division by zero have unspecified
+  behavior. `Dec64` arithmetic follows IEEE 754.
+- For `UInt8`, `UInt16`, `UInt32`, and `UInt64`, `+`, `-`, and `*` require two
+  operands of the same `UIntN` type and produce that same type, using
+  arithmetic modulo 2^N. `/` is unsigned integer division, discarding the
+  fractional part. Executing unsigned division by zero is undefined behavior,
+  exactly like `Int64` division by zero.
+- `Float32` arithmetic requires two `Float32` operands, produces `Float32`,
+  and follows IEEE 754 binary32 semantics; each operation rounds its result to
+  binary32 and is never evaluated at `Dec64` precision.
+- `UInt8`, `UInt16`, `UInt32`, `UInt64`, and `Float32` operands are accepted
+  only in exact-type pairs for arithmetic and comparison: mixing any two of
+  these five types, or mixing one of them with `Int64` or `Dec64`, is a type
+  error.
 - `<`, `<=`, `>`, and `>=` require numeric operands and produce `Bool`. `==` and
   `!=` accept numeric operands, two `Bool` operands, or two `Nil` operands and
-  produce `Bool`. Mixed numeric operands are compared as `Dec64`.
+  produce `Bool`. Mixed `Int64`/`Dec64` operands are compared as `Dec64`.
+  `UInt8`, `UInt16`, `UInt32`, `UInt64`, and `Float32` operands must match
+  exactly for ordered comparison and equality alike; unsigned comparisons use
+  unsigned ordering, and `Float32` follows the same NaN rule as `Dec64` (a
+  comparison other than `!=` is false when either operand is NaN, and NaN is
+  unequal to every value including itself).
 - `print(value)` writes the value followed by a line feed and returns the same
-  value with the same type.
+  value with the same type. An unsigned value is written in base ten without a
+  suffix; a `Float32` value uses the same observable formatting rule as
+  `Dec64`, applied to its binary32 value.
 - A call must supply exactly one argument per parameter. Each argument must be
   assignable to its parameter type. A call to a declaration with a result is
   itself an expression, whose type is the declared result type. A call to a
@@ -289,9 +341,14 @@ extern rust "snacc_user_log" fun log(value: Int64)
 Its Rust assertion result is `()`, and its C ABI result is `void`. Its call
 has the same no-result restriction as an internal no-result function.
 
-The ABI representation is `i64` for `Int64`, IEEE binary64 for `Dec64`, and
-`u8` for `Bool` and `Nil`. A host must encode `false` as zero, `true` as
-one, and `nil` as zero. Rust bridges must not unwind across the ABI boundary.
+The ABI representation is `i64` for `Int64`, IEEE binary64 for `Dec64`, `u8`
+for `Bool` and `Nil`, `u8`/`u16`/`u32`/`u64` for
+`UInt8`/`UInt16`/`UInt32`/`UInt64`, and IEEE binary32 (`f32`) for `Float32`. A
+host must encode `false` as zero, `true` as one, and `nil` as zero. `UInt8`
+and `UInt16` sub-word parameters and results carry the zero-extension
+attribute the target C ABI requires, matching Rust's and Clang's `zeroext`
+behavior; `Bool` carries the same attribute for consistency. Rust bridges
+must not unwind across the ABI boundary.
 
 A bridge function is a `pub` item of the host crate's `interop` module, reachable
 at `crate::interop::<symbol>`. Its Rust item name is exactly the declared link
@@ -303,13 +360,14 @@ linker's responsibility.
 
 ## ABI version and ownership
 
-The current Snacc ABI version is 2. The version covers the `snacc_main` entry,
+The current Snacc ABI version is 3. The version covers the `snacc_main` entry,
 the required `snacc_print_*` runtime imports, the permitted Rust bridge types
-(including the no-result bridge signature added in ABI version 2), their
+(including the no-result bridge signature added in ABI version 2 and the
+fixed-width unsigned and `Float32` types added in ABI version 3), their
 representations and valid values, the C calling convention, and the ownership
 rules for values crossing those boundaries.
 
-ABI version 2 exports `snacc_main` as `extern "C" fn() -> i32` and imports:
+ABI version 3 exports `snacc_main` as `extern "C" fn() -> i32` and imports:
 
 | Symbol | Rust signature |
 | --- | --- |
@@ -317,14 +375,25 @@ ABI version 2 exports `snacc_main` as `extern "C" fn() -> i32` and imports:
 | `snacc_print_i64` | `extern "C" fn(i64)` |
 | `snacc_print_bool` | `extern "C" fn(u8)` |
 | `snacc_print_nil` | `extern "C" fn()` |
+| `snacc_print_u8` | `extern "C" fn(u8)` |
+| `snacc_print_u16` | `extern "C" fn(u16)` |
+| `snacc_print_u32` | `extern "C" fn(u32)` |
+| `snacc_print_u64` | `extern "C" fn(u64)` |
+| `snacc_print_f32` | `extern "C" fn(f32)` |
 
-Every value permitted across an ABI version 2 Rust bridge is a scalar passed
+Every value permitted across an ABI version 3 Rust bridge is a scalar passed
 or returned by value, or no value at all (a no-result bridge's C ABI result is
 `void`). Crossing the boundary copies the value. No allocation, pointer,
 reference, borrow, destructor obligation, or resource ownership crosses with
 it. A Rust bridge may retain its scalar copy; Rust-owned state otherwise
 remains behind the bridge. Pointers, buffers, aggregates, and handles are not
-ABI version 2 values.
+ABI version 3 values.
+
+At ABI version 3, `UInt8`, `Bool`, and standalone `Nil` share the Rust
+representation `u8`; the generated Rust type assertion verifies width and ABI
+representation but cannot distinguish these three Snacc types from one
+another. Their distinct Snacc meanings remain the declaration author's
+contract.
 
 An ABI version must change when a permitted type, representation, valid-value
 rule, ownership rule, calling convention, required symbol, or required symbol
