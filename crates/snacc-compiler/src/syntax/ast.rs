@@ -9,14 +9,26 @@ pub enum TypeName {
     Int64,
     Bool,
     Nil,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+    Float32,
 }
 
-/// A numeric literal's exact value, carried without ever passing through
-/// `f64` for an integer literal (see TODO item on Int64 precision).
+/// A numeric literal's exact value. Every literal form has its own variant so
+/// no magnitude is ever narrowed or re-rounded on its way to the backend: an
+/// integer never passes through `f64`, and a `Float32` is rounded once, from
+/// the source decimal, by the lexer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NumLiteral {
     Int(i64),
     Dec(f64),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    F32(f32),
 }
 
 impl std::fmt::Display for NumLiteral {
@@ -24,6 +36,11 @@ impl std::fmt::Display for NumLiteral {
         match self {
             Self::Int(x) => write!(f, "{x}"),
             Self::Dec(x) => write!(f, "{x}"),
+            Self::U8(x) => write!(f, "{x}u8"),
+            Self::U16(x) => write!(f, "{x}u16"),
+            Self::U32(x) => write!(f, "{x}u32"),
+            Self::U64(x) => write!(f, "{x}u64"),
+            Self::F32(x) => write!(f, "{x}f32"),
         }
     }
 }

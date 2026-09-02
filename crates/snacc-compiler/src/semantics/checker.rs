@@ -4,12 +4,17 @@ use crate::syntax::ast::{
 };
 use std::collections::HashMap;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Ty {
     Dec64,
     Int64,
     Bool,
     Nil,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+    Float32,
 }
 
 impl From<TypeName> for Ty {
@@ -19,6 +24,11 @@ impl From<TypeName> for Ty {
             TypeName::Int64 => Self::Int64,
             TypeName::Bool => Self::Bool,
             TypeName::Nil => Self::Nil,
+            TypeName::UInt8 => Self::UInt8,
+            TypeName::UInt16 => Self::UInt16,
+            TypeName::UInt32 => Self::UInt32,
+            TypeName::UInt64 => Self::UInt64,
+            TypeName::Float32 => Self::Float32,
         }
     }
 }
@@ -30,6 +40,11 @@ impl std::fmt::Display for Ty {
             Self::Int64 => write!(f, "Int64"),
             Self::Bool => write!(f, "Bool"),
             Self::Nil => write!(f, "Nil"),
+            Self::UInt8 => write!(f, "UInt8"),
+            Self::UInt16 => write!(f, "UInt16"),
+            Self::UInt32 => write!(f, "UInt32"),
+            Self::UInt64 => write!(f, "UInt64"),
+            Self::Float32 => write!(f, "Float32"),
         }
     }
 }
@@ -51,6 +66,18 @@ impl Error {
         Self {
             span,
             msg: format!("expected '{expected}', found '{found}'"),
+        }
+    }
+
+    /// Specification 009 section 6: a rejected operand pair names both types
+    /// and the exact-match requirement.
+    fn operands(span: Span, what: &str, left: Ty, right: Ty) -> Self {
+        Self {
+            span,
+            msg: format!(
+                "{what} operands must be two numbers of the same type, \
+                 found '{left}' and '{right}'"
+            ),
         }
     }
 }
@@ -341,8 +368,24 @@ fn is_rust_identifier(symbol: &str) -> bool {
     chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
+/// The two types the one surviving implicit conversion joins. Specification
+/// 009 section 4.4 adds no further promotion, so nothing else belongs here.
 fn numeric(ty: Ty) -> bool {
-    matches!(ty, Ty::Dec64 | Ty::Int64)
+    match ty {
+        Ty::Dec64 | Ty::Int64 => true,
+        Ty::Bool | Ty::Nil | Ty::UInt8 | Ty::UInt16 | Ty::UInt32 | Ty::UInt64 | Ty::Float32 => {
+            false
+        }
+    }
+}
+
+/// Numeric types that operate only on an exact type match (Specification 009
+/// sections 4.5-4.6): they never promote, not even to each other.
+fn exact_match_numeric(ty: Ty) -> bool {
+    match ty {
+        Ty::UInt8 | Ty::UInt16 | Ty::UInt32 | Ty::UInt64 | Ty::Float32 => true,
+        Ty::Dec64 | Ty::Int64 | Ty::Bool | Ty::Nil => false,
+    }
 }
 
 fn common_numeric(left: Ty, right: Ty) -> Option<Ty> {
@@ -356,10 +399,15 @@ fn common_numeric(left: Ty, right: Ty) -> Option<Ty> {
     })
 }
 
-fn assignable(from: Ty, to: Ty) -> bool {
-    from == to || (from == Ty::Int64 && to == Ty::Dec64)
+/// The type an arithmetic or ordered-comparison pair shares, or `None` when the
+/// operands cannot be combined at all.
+fn operand_numeric(left: Ty, right: Ty) -> Option<Ty> {
+    common_numeric(left, right)
+        .or_else(|| (left == right && exact_match_numeric(left)).then_some(left))
 }
 
+/// The one implicit conversion Snacc has. Every other assignment, argument,
+/// result, and branch requires an exact type match (Specification 009 4.4).
 fn coerce(ctx: &mut Ctx<'_>, value: TExpr, from: Ty, to: Ty, span: Span) -> TExpr {
     if from == to {
         value
@@ -666,6 +714,11 @@ fn check_expr<'src>(
             let ty = match literal {
                 NumLiteral::Int(_) => Ty::Int64,
                 NumLiteral::Dec(_) => Ty::Dec64,
+                NumLiteral::U8(_) => Ty::UInt8,
+                NumLiteral::U16(_) => Ty::UInt16,
+                NumLiteral::U32(_) => Ty::UInt32,
+                NumLiteral::U64(_) => Ty::UInt64,
+                NumLiteral::F32(_) => Ty::Float32,
             };
             (TExpr::Num(*literal), ty)
         }
@@ -712,15 +765,6 @@ fn check_expr<'src>(
             let (right, right_ty) = check_expr(ctx, env, right);
             match op {
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
-                    let ty = common_numeric(left_ty, right_ty).unwrap_or_else(|| {
-                        ctx.errors.push(Error {
-                            span,
-                            msg: "arithmetic operands must be numeric".into(),
-                        });
-                        Ty::Int64
-                    });
-                    let left = coerce(ctx, left, left_ty, ty, span);
-                    let right = coerce(ctx, right, right_ty, ty, span);
                     let operation = match op {
                         BinaryOp::Add => ArithOp::Add,
                         BinaryOp::Sub => ArithOp::Sub,
@@ -728,41 +772,51 @@ fn check_expr<'src>(
                         BinaryOp::Div => ArithOp::Div,
                         _ => unreachable!(),
                     };
+                    // A rejected pair keeps its own operand types rather than
+                    // being coerced to a guessed one, so one mixed-type
+                    // expression reports one diagnostic.
+                    let Some(ty) = operand_numeric(left_ty, right_ty) else {
+                        ctx.errors
+                            .push(Error::operands(span, "arithmetic", left_ty, right_ty));
+                        return (
+                            TExpr::Arith(Box::new(left), operation, Box::new(right), left_ty),
+                            left_ty,
+                        );
+                    };
+                    let left = coerce(ctx, left, left_ty, ty, span);
+                    let right = coerce(ctx, right, right_ty, ty, span);
                     (
                         TExpr::Arith(Box::new(left), operation, Box::new(right), ty),
                         ty,
                     )
                 }
                 BinaryOp::Eq | BinaryOp::NotEq => {
-                    let operand_ty = common_numeric(left_ty, right_ty).unwrap_or(left_ty);
-                    if !assignable(left_ty, operand_ty)
-                        || !assignable(right_ty, operand_ty)
-                        || (!numeric(left_ty) && left_ty != right_ty)
-                    {
-                        ctx.errors.push(Error::mismatch(span, left_ty, right_ty));
-                    }
-                    let left = coerce(ctx, left, left_ty, operand_ty, span);
-                    let right = coerce(ctx, right, right_ty, operand_ty, span);
                     let operation = if matches!(op, BinaryOp::Eq) {
                         CmpOp::Eq
                     } else {
                         CmpOp::NotEq
                     };
+                    // Equality joins the `Int64`/`Dec64` promotion pair; every
+                    // other type compares only against itself.
+                    let operand_ty = match common_numeric(left_ty, right_ty) {
+                        Some(ty) => ty,
+                        None if left_ty == right_ty => left_ty,
+                        None => {
+                            ctx.errors.push(Error::mismatch(span, left_ty, right_ty));
+                            return (
+                                TExpr::Cmp(Box::new(left), operation, Box::new(right), left_ty),
+                                Ty::Bool,
+                            );
+                        }
+                    };
+                    let left = coerce(ctx, left, left_ty, operand_ty, span);
+                    let right = coerce(ctx, right, right_ty, operand_ty, span);
                     (
                         TExpr::Cmp(Box::new(left), operation, Box::new(right), operand_ty),
                         Ty::Bool,
                     )
                 }
                 _ => {
-                    let operand_ty = common_numeric(left_ty, right_ty).unwrap_or_else(|| {
-                        ctx.errors.push(Error {
-                            span,
-                            msg: "ordered comparison operands must be numeric".into(),
-                        });
-                        Ty::Int64
-                    });
-                    let left = coerce(ctx, left, left_ty, operand_ty, span);
-                    let right = coerce(ctx, right, right_ty, operand_ty, span);
                     let operation = match op {
                         BinaryOp::Less => CmpOp::Less,
                         BinaryOp::LessEq => CmpOp::LessEq,
@@ -770,6 +824,20 @@ fn check_expr<'src>(
                         BinaryOp::GreaterEq => CmpOp::GreaterEq,
                         _ => unreachable!(),
                     };
+                    let Some(operand_ty) = operand_numeric(left_ty, right_ty) else {
+                        ctx.errors.push(Error::operands(
+                            span,
+                            "ordered comparison",
+                            left_ty,
+                            right_ty,
+                        ));
+                        return (
+                            TExpr::Cmp(Box::new(left), operation, Box::new(right), left_ty),
+                            Ty::Bool,
+                        );
+                    };
+                    let left = coerce(ctx, left, left_ty, operand_ty, span);
+                    let right = coerce(ctx, right, right_ty, operand_ty, span);
                     (
                         TExpr::Cmp(Box::new(left), operation, Box::new(right), operand_ty),
                         Ty::Bool,
@@ -1149,5 +1217,149 @@ mod tests {
     #[test]
     fn a_no_result_function_body_may_be_empty() {
         assert_checks("fun nothing() do end");
+    }
+
+    // Specification 009 sections 4.4-4.7: exact-match types.
+
+    /// Each new type paired with a literal of that exact type.
+    const NEW_TYPES: [(&str, &str); 5] = [
+        ("UInt8", "1u8"),
+        ("UInt16", "1u16"),
+        ("UInt32", "1u32"),
+        ("UInt64", "1u64"),
+        ("Float32", "1.5f32"),
+    ];
+
+    #[test]
+    fn accepts_every_new_type_in_every_declaration_position() {
+        for (name, literal) in NEW_TYPES {
+            let program = assert_checks(&format!(
+                "extern rust \"snacc_user_edge\" fun edge(value: {name}): {name}\n\
+                 fun identity(value: {name}): {name} do value end\n\
+                 let bound: {name} = {literal}\n\
+                 print(identity(bound))"
+            ));
+            let expected = program.funcs["identity"].result;
+            assert!(expected.is_some());
+            assert_eq!(program.funcs["identity"].params[0].1, expected.unwrap());
+            assert_eq!(program.externs["edge"].result, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_every_implicit_conversion_the_new_types_prohibit() {
+        // Specification 009 section 4.4: no width converts to another width, to
+        // or from Int64, to a float, and Float32 does not meet Dec64.
+        for (source, needle) in [
+            ("let byte: UInt8 = 1", "expected 'UInt8', found 'Int64'"),
+            ("let byte: UInt8 = 1u16", "expected 'UInt8', found 'UInt16'"),
+            (
+                "let wide: UInt64 = 1u32",
+                "expected 'UInt64', found 'UInt32'",
+            ),
+            (
+                "let count: Int64 = 1u64",
+                "expected 'Int64', found 'UInt64'",
+            ),
+            (
+                "let ratio: Float32 = 1u8",
+                "expected 'Float32', found 'UInt8'",
+            ),
+            (
+                "let ratio: Float32 = 1.5",
+                "expected 'Float32', found 'Dec64'",
+            ),
+            (
+                "let wide: Dec64 = 1.5f32",
+                "expected 'Dec64', found 'Float32'",
+            ),
+            ("let wide: Dec64 = 1u8", "expected 'Dec64', found 'UInt8'"),
+        ] {
+            assert_error_contains(source, needle);
+        }
+    }
+
+    #[test]
+    fn the_int64_to_dec64_conversion_still_works() {
+        assert_checks("let wide: Dec64 = 1\nprint(wide + 1)");
+    }
+
+    #[test]
+    fn accepts_same_type_arithmetic_and_comparison_for_every_new_type() {
+        for (name, literal) in NEW_TYPES {
+            for operator in ["+", "-", "*", "/"] {
+                let source = format!("let result: {name} = {literal} {operator} {literal}");
+                assert_checks(&source);
+            }
+            for operator in ["<", "<=", ">", ">=", "==", "!="] {
+                let source = format!("let flag: Bool = {literal} {operator} {literal}");
+                assert_checks(&source);
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_mixed_operands_in_every_category() {
+        // Every pairing of a new type with a different type, in arithmetic,
+        // ordered comparison, and equality.
+        let others = ["1", "1.5", "1u8", "1u16", "1u32", "1u64", "1.5f32", "true"];
+        for (_, literal) in NEW_TYPES {
+            for other in others {
+                if other == literal {
+                    continue;
+                }
+                assert_error_contains(
+                    &format!("print({literal} + {other})"),
+                    "operands must be two numbers of the same type",
+                );
+                assert_error_contains(
+                    &format!("print({literal} < {other})"),
+                    "operands must be two numbers of the same type",
+                );
+                assert_error_contains(&format!("print({literal} == {other})"), "expected");
+            }
+        }
+    }
+
+    #[test]
+    fn a_mixed_operand_pair_reports_one_diagnostic() {
+        assert_eq!(errors("print(1u8 + 1)").len(), 1);
+        assert_eq!(errors("print(1u8 < 1u16)").len(), 1);
+        assert_eq!(errors("print(1u8 == 1)").len(), 1);
+    }
+
+    #[test]
+    fn arithmetic_and_comparison_keep_the_exact_operand_type() {
+        // The backend reads signedness and float width from this type, so it
+        // must survive checking rather than being inferred from a bit width.
+        for (name, literal) in NEW_TYPES {
+            let program = assert_checks(&format!(
+                "fun combine(): Bool do {literal} + {literal} < {literal} end\n\
+                 let bound: {name} = {literal}"
+            ));
+            let TStmt::Let { ty, .. } = &program.body.statements[0] else {
+                panic!("expected a let statement");
+            };
+            let result = program.funcs["combine"]
+                .body
+                .result
+                .as_ref()
+                .expect("combine produces a value");
+            let TExpr::Cmp(left, _, _, operand_ty) = result else {
+                panic!("expected a comparison");
+            };
+            assert_eq!(operand_ty, ty, "{name} comparison lost its operand type");
+            let TExpr::Arith(_, _, _, arith_ty) = left.as_ref() else {
+                panic!("expected arithmetic");
+            };
+            assert_eq!(arith_ty, ty, "{name} arithmetic lost its operand type");
+        }
+    }
+
+    #[test]
+    fn print_accepts_every_new_type_and_returns_it() {
+        for (name, literal) in NEW_TYPES {
+            assert_checks(&format!("let echoed: {name} = print({literal})"));
+        }
     }
 }

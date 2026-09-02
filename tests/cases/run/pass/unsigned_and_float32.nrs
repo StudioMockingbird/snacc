@@ -1,0 +1,80 @@
+// Specification 009 conformance 7-10: unsigned ordering, unsigned division,
+// modular arithmetic at every width, and binary32 evaluation, executed through
+// a real compiled program. Every result is observed as a Bool, so this case
+// needs no runtime print symbol beyond the ones ABI version 2 already has.
+
+fun u8_quotient(numerator: UInt8, denominator: UInt8): UInt8 do
+    numerator / denominator
+end
+
+fun u32_quotient(numerator: UInt32, denominator: UInt32): UInt32 do
+    numerator / denominator
+end
+
+fun f32_quotient(numerator: Float32, denominator: Float32): Float32 do
+    numerator / denominator
+end
+
+fun u16_pick(flag: Bool): UInt16 do
+    if flag then
+        65535u16
+    else
+        0u16
+    end
+end
+
+fun u8_wrapped_sum(limit: UInt8): UInt8 do
+    let mut total: UInt8 = 250u8
+    let mut step: UInt8 = 0u8
+    while step < limit do
+        total = total + 1u8
+        step = step + 1u8
+    end
+    total
+end
+
+// Unsigned ordering. Each of these four answers flips if the operands are
+// compared with the signed predicates Int64 uses.
+print(200u8 < 100u8)
+print(40000u16 < 30000u16)
+print(3000000000u32 < 2000000000u32)
+print(18446744073709551615u64 > 1u64)
+
+// Addition, subtraction, and multiplication modulo 2^N at every width.
+print(255u8 + 1u8 == 0u8)
+print(0u8 - 1u8 == 255u8)
+print(16u8 * 16u8 == 0u8)
+print(65535u16 + 1u16 == 0u16)
+print(0u16 - 1u16 == 65535u16)
+print(256u16 * 256u16 == 0u16)
+print(4294967295u32 + 1u32 == 0u32)
+print(0u32 - 1u32 == 4294967295u32)
+print(65536u32 * 65536u32 == 0u32)
+print(18446744073709551615u64 + 1u64 == 0u64)
+print(0u64 - 1u64 == 18446744073709551615u64)
+print(4294967296u64 * 4294967296u64 == 0u64)
+
+// Unsigned division. Signed division of the same bit patterns gives 21u8 and
+// 0u32 instead.
+print(u8_quotient(200u8, 3u8) == 66u8)
+print(u32_quotient(4294967295u32, 2u32) == 2147483647u32)
+
+// Binary32 arithmetic. Evaluated as binary64 and rounded only at the end, the
+// first line would be false: 2^24 + 1 is exact in binary64 but not in binary32.
+print(16777216f32 + 1f32 - 16777216f32 == 0f32)
+print(1.5f32 + 2.25f32 == 3.75f32)
+print(1.5f32 < 2.5f32)
+print(2.5f32 <= 2.5f32)
+
+// Float32 equality and ordering follow IEEE 754: NaN equals nothing, including
+// itself, and every ordered comparison against it is false.
+print(f32_quotient(0f32, 0f32) == f32_quotient(0f32, 0f32))
+print(f32_quotient(0f32, 0f32) != f32_quotient(0f32, 0f32))
+print(f32_quotient(0f32, 0f32) < 1f32)
+print(f32_quotient(1f32, 0f32) > 1000000f32)
+
+// New types flow through mutable storage, loop conditions, and a value-form
+// `if` at their own widths.
+print(u16_pick(true) == 65535u16)
+print(u16_pick(false) == 0u16)
+print(u8_wrapped_sum(10u8) == 4u8)

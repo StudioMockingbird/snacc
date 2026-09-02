@@ -1,26 +1,109 @@
 use crate::Optimization;
 use crate::semantics::checker::{ArithOp, CmpOp, Program, TBlock, TExpr, TStmt, TValueIf, Ty};
 use crate::syntax::ast::NumLiteral;
+use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
-use inkwell::module::Linkage;
+use inkwell::module::{Linkage, Module};
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
-use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum};
+use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType, IntType};
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, PointerValue,
 };
 use inkwell::{FloatPredicate, IntPredicate, OptimizationLevel};
 use std::collections::HashMap;
 
+/// Specification 009 section 5.2: the value/storage type for each scalar.
 fn llvm_ty(context: &Context, ty: Ty) -> BasicTypeEnum<'_> {
     match ty {
         Ty::Dec64 => context.f64_type().into(),
-        Ty::Int64 => context.i64_type().into(),
-        Ty::Bool | Ty::Nil => context.i8_type().into(),
+        Ty::Float32 => context.f32_type().into(),
+        Ty::Int64 | Ty::UInt64 => context.i64_type().into(),
+        Ty::UInt32 => context.i32_type().into(),
+        Ty::UInt16 => context.i16_type().into(),
+        Ty::Bool | Ty::Nil | Ty::UInt8 => context.i8_type().into(),
     }
+}
+
+/// Whether a type is lowered as a floating-point value rather than an integer.
+fn is_float(ty: Ty) -> bool {
+    match ty {
+        Ty::Dec64 | Ty::Float32 => true,
+        Ty::Int64 | Ty::UInt8 | Ty::UInt16 | Ty::UInt32 | Ty::UInt64 | Ty::Bool | Ty::Nil => false,
+    }
+}
+
+/// Whether an integer type's division and ordering are unsigned. Signedness is
+/// read from the checked type, never inferred from an LLVM bit width.
+fn is_unsigned(ty: Ty) -> bool {
+    match ty {
+        Ty::UInt8 | Ty::UInt16 | Ty::UInt32 | Ty::UInt64 => true,
+        Ty::Int64 | Ty::Dec64 | Ty::Float32 | Ty::Bool | Ty::Nil => false,
+    }
+}
+
+/// The runtime import that prints one scalar. `Nil` carries no value, so it
+/// prints through a niladic import.
+fn print_import<'ctx>(
+    context: &'ctx Context,
+    ty: Ty,
+) -> (&'static str, Vec<BasicMetadataTypeEnum<'ctx>>) {
+    let symbol = match ty {
+        Ty::Dec64 => "snacc_print_f64",
+        Ty::Float32 => "snacc_print_f32",
+        Ty::Int64 => "snacc_print_i64",
+        Ty::UInt8 => "snacc_print_u8",
+        Ty::UInt16 => "snacc_print_u16",
+        Ty::UInt32 => "snacc_print_u32",
+        Ty::UInt64 => "snacc_print_u64",
+        Ty::Bool => "snacc_print_bool",
+        Ty::Nil => return ("snacc_print_nil", Vec::new()),
+    };
+    (symbol, vec![llvm_ty(context, ty).into()])
+}
+
+fn is_subword_int<'ctx>(ty: impl TryInto<IntType<'ctx>>) -> bool {
+    ty.try_into()
+        .is_ok_and(|int: IntType<'ctx>| int.get_bit_width() < 32)
+}
+
+/// Rust's `extern "C"` functions carry `zeroext` on sub-word integer parameters
+/// and results on every target Snacc emits for (confirmed against rustc's own
+/// IR). Specification 009 section 5.2 requires the backend to match that rather
+/// than assume an LLVM width alone defines the call ABI, so declarations and
+/// their call sites both get the attribute -- this covers `UInt8`, `UInt16`,
+/// and the pre-existing `Bool`/`Nil` `u8` mapping alike.
+fn zero_extend_subwords<'ctx>(
+    context: &'ctx Context,
+    signature: FunctionType<'ctx>,
+    mut add: impl FnMut(AttributeLoc, Attribute),
+) {
+    let zeroext = context.create_enum_attribute(Attribute::get_named_enum_kind_id("zeroext"), 0);
+    for (index, param) in signature.get_param_types().into_iter().enumerate() {
+        if is_subword_int(param) {
+            add(AttributeLoc::Param(index as u32), zeroext);
+        }
+    }
+    if signature.get_return_type().is_some_and(is_subword_int) {
+        add(AttributeLoc::Return, zeroext);
+    }
+}
+
+fn declare<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    symbol: &str,
+    signature: FunctionType<'ctx>,
+    linkage: Option<Linkage>,
+) -> FunctionValue<'ctx> {
+    let function = module.add_function(symbol, signature, linkage);
+    zero_extend_subwords(context, signature, |location, attribute| {
+        function.add_attribute(location, attribute)
+    });
+    function
 }
 
 /// A declaration without a result lowers to an LLVM `void` function; no value
@@ -71,12 +154,7 @@ pub fn llvm_version() -> (u32, u32, u32) {
     (major, minor, patch)
 }
 
-/// Compiles the checked program directly to a native object for the host.
-pub fn compile(
-    program: &Program,
-    module_name: &str,
-    optimization: Optimization,
-) -> Result<(Vec<u8>, String), String> {
+fn host_machine(optimization: Optimization) -> Result<TargetMachine, String> {
     Target::initialize_x86(&InitializationConfig::default());
 
     let triple = TargetMachine::get_default_triple();
@@ -85,7 +163,7 @@ pub fn compile(
         Optimization::None => OptimizationLevel::None,
         Optimization::Aggressive => OptimizationLevel::Aggressive,
     };
-    let machine = target
+    target
         .create_target_machine(
             &triple,
             "generic",
@@ -94,60 +172,75 @@ pub fn compile(
             RelocMode::Default,
             CodeModel::Default,
         )
-        .ok_or_else(|| "LLVM could not create a target machine for this host".to_string())?;
+        .ok_or_else(|| "LLVM could not create a target machine for this host".to_string())
+}
 
+/// Compiles the checked program directly to a native object for the host.
+pub fn compile(
+    program: &Program,
+    module_name: &str,
+    optimization: Optimization,
+) -> Result<(Vec<u8>, String), String> {
+    let machine = host_machine(optimization)?;
     let context = Context::create();
+    let module = build_module(&context, program, module_name, &machine)?;
+    let object = machine
+        .write_to_memory_buffer(&module, FileType::Object)
+        .map_err(|error| error.to_string())?;
+    Ok((object.as_slice().to_vec(), target_triple()))
+}
+
+/// Renders a checked program as LLVM IR. Calling-convention attributes exist
+/// only in the IR -- no object file preserves them -- so this is how they are
+/// verified.
+pub fn compile_to_ir(program: &Program, module_name: &str) -> Result<String, String> {
+    let machine = host_machine(Optimization::None)?;
+    let context = Context::create();
+    let module = build_module(&context, program, module_name, &machine)?;
+    Ok(module.print_to_string().to_string())
+}
+
+fn build_module<'ctx>(
+    context: &'ctx Context,
+    program: &Program,
+    module_name: &str,
+    machine: &TargetMachine,
+) -> Result<Module<'ctx>, String> {
+    let triple = TargetMachine::get_default_triple();
     let module = context.create_module(module_name);
     let builder = context.create_builder();
     module.set_triple(&triple);
     module.set_data_layout(&machine.get_target_data().get_data_layout());
 
-    let print_f64_type = context
-        .void_type()
-        .fn_type(&[context.f64_type().into()], false);
-    let print_f64 = module.add_function("snacc_print_f64", print_f64_type, None);
-    let print_i64_type = context
-        .void_type()
-        .fn_type(&[context.i64_type().into()], false);
-    let print_i64 = module.add_function("snacc_print_i64", print_i64_type, None);
-    let print_bool_type = context
-        .void_type()
-        .fn_type(&[context.i8_type().into()], false);
-    let print_bool = module.add_function("snacc_print_bool", print_bool_type, None);
-    let print_nil = module.add_function(
-        "snacc_print_nil",
-        context.void_type().fn_type(&[], false),
-        None,
-    );
-
     // Every function is declared before any body is lowered, so recursion and
     // forward calls do not depend on source or hash-map iteration order.
     let mut functions = HashMap::new();
     for (name, function) in &program.externs {
-        let llvm_function = module.add_function(
+        let llvm_function = declare(
+            context,
+            &module,
             &function.symbol,
-            function_type(&context, &function.params, function.result),
+            function_type(context, &function.params, function.result),
             None,
         );
         functions.insert(name.clone(), llvm_function);
     }
     for (name, function) in &program.funcs {
-        let llvm_function = module.add_function(
+        let llvm_function = declare(
+            context,
+            &module,
             &format!("snacc_fn_{name}"),
-            function_type(&context, &function.params, function.result),
+            function_type(context, &function.params, function.result),
             Some(Linkage::Internal),
         );
         functions.insert(name.clone(), llvm_function);
     }
 
     let cg = Codegen {
-        context: &context,
+        context,
         builder: &builder,
+        module: &module,
         functions: &functions,
-        print_f64,
-        print_i64,
-        print_bool,
-        print_nil,
     };
 
     for (name, function) in &program.funcs {
@@ -191,20 +284,14 @@ pub fn compile(
     }
 
     module.verify().map_err(|error| error.to_string())?;
-    let object = machine
-        .write_to_memory_buffer(&module, FileType::Object)
-        .map_err(|error| error.to_string())?;
-    Ok((object.as_slice().to_vec(), target_triple()))
+    Ok(module)
 }
 
 struct Codegen<'ctx, 'a> {
     context: &'ctx Context,
     builder: &'a Builder<'ctx>,
+    module: &'a Module<'ctx>,
     functions: &'a HashMap<String, FunctionValue<'ctx>>,
-    print_f64: FunctionValue<'ctx>,
-    print_i64: FunctionValue<'ctx>,
-    print_bool: FunctionValue<'ctx>,
-    print_nil: FunctionValue<'ctx>,
 }
 
 /// Basic blocks a `break` may branch to, innermost last.
@@ -442,9 +529,39 @@ impl<'ctx> Codegen<'ctx, '_> {
             let value: BasicMetadataValueEnum = self.expr(env, loops, arg)?.into();
             llvm_args.push(value);
         }
-        self.builder
-            .build_call(self.functions[name], &llvm_args, "call")
-            .map_err(|error| error.to_string())
+        self.invoke(self.functions[name], &llvm_args)
+    }
+
+    /// Builds a call and repeats the callee's ABI extension attributes on the
+    /// call site, the way a C compiler does, so a bridge's sub-word arguments
+    /// and result agree on both sides of the boundary.
+    fn invoke(
+        &self,
+        callee: FunctionValue<'ctx>,
+        args: &[BasicMetadataValueEnum<'ctx>],
+    ) -> Result<inkwell::values::CallSiteValue<'ctx>, String> {
+        let call = self
+            .builder
+            .build_call(callee, args, "call")
+            .map_err(|error| error.to_string())?;
+        zero_extend_subwords(self.context, callee.get_type(), |location, attribute| {
+            call.add_attribute(location, attribute)
+        });
+        Ok(call)
+    }
+
+    /// Declares the runtime print import for `ty` on first use.
+    fn print_import(&self, ty: Ty) -> FunctionValue<'ctx> {
+        let (symbol, params) = print_import(self.context, ty);
+        self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.void_type().fn_type(&params, false),
+                None,
+            )
+        })
     }
 
     fn value_if(
@@ -518,14 +635,38 @@ impl<'ctx> Codegen<'ctx, '_> {
         expr: &TExpr,
     ) -> Result<BasicValueEnum<'ctx>, String> {
         match expr {
-            TExpr::Num(literal) => match literal {
-                NumLiteral::Dec(value) => Ok(self.context.f64_type().const_float(*value).into()),
-                NumLiteral::Int(value) => Ok(self
+            // Each literal arrived at its exact value in the lexer, so nothing
+            // here re-parses or re-rounds it. `f32 as f64` is exact, so the
+            // already-rounded binary32 value reaches `const_float` unchanged.
+            TExpr::Num(literal) => Ok(match literal {
+                NumLiteral::Dec(value) => self.context.f64_type().const_float(*value).into(),
+                NumLiteral::F32(value) => self
+                    .context
+                    .f32_type()
+                    .const_float(f64::from(*value))
+                    .into(),
+                NumLiteral::Int(value) => self
                     .context
                     .i64_type()
                     .const_int(*value as u64, true)
-                    .into()),
-            },
+                    .into(),
+                NumLiteral::U8(value) => self
+                    .context
+                    .i8_type()
+                    .const_int(u64::from(*value), false)
+                    .into(),
+                NumLiteral::U16(value) => self
+                    .context
+                    .i16_type()
+                    .const_int(u64::from(*value), false)
+                    .into(),
+                NumLiteral::U32(value) => self
+                    .context
+                    .i32_type()
+                    .const_int(u64::from(*value), false)
+                    .into(),
+                NumLiteral::U64(value) => self.context.i64_type().const_int(*value, false).into(),
+            }),
             TExpr::Bool(value) => Ok(self
                 .context
                 .i8_type()
@@ -550,143 +691,91 @@ impl<'ctx> Codegen<'ctx, '_> {
                 None => Err("type checking guarantees every local resolves".into()),
             },
             TExpr::Arith(left, op, right, ty) => {
-                let left = self.expr(env, loops, left)?;
-                let right = self.expr(env, loops, right)?;
-                match ty {
-                    Ty::Dec64 => {
-                        let left = left.into_float_value();
-                        let right = right.into_float_value();
-                        let value = match op {
-                            ArithOp::Add => self.builder.build_float_add(left, right, "add"),
-                            ArithOp::Sub => self.builder.build_float_sub(left, right, "sub"),
-                            ArithOp::Mul => self.builder.build_float_mul(left, right, "mul"),
-                            ArithOp::Div => self.builder.build_float_div(left, right, "div"),
-                        }
-                        .map_err(|e| e.to_string())?;
-                        Ok(value.into())
-                    }
-                    Ty::Int64 => {
-                        let left = left.into_int_value();
-                        let right = right.into_int_value();
-                        let value = match op {
-                            ArithOp::Add => self.builder.build_int_add(left, right, "add"),
-                            ArithOp::Sub => self.builder.build_int_sub(left, right, "sub"),
-                            ArithOp::Mul => self.builder.build_int_mul(left, right, "mul"),
-                            ArithOp::Div => self.builder.build_int_signed_div(left, right, "div"),
-                        }
-                        .map_err(|e| e.to_string())?;
-                        Ok(value.into())
-                    }
-                    _ => Err("checker produced non-numeric arithmetic".into()),
-                }
-            }
-            TExpr::Cmp(left, op, right, operand_ty) => {
+                let ty = *ty;
                 let left = self.expr(env, loops, left)?;
                 let right = self.expr(env, loops, right)?;
                 let builder = self.builder;
-                let comparison = match (*operand_ty, op) {
-                    (Ty::Dec64, CmpOp::Eq) => builder.build_float_compare(
-                        FloatPredicate::OEQ,
-                        left.into_float_value(),
-                        right.into_float_value(),
-                        "equal",
-                    ),
-                    (Ty::Dec64, CmpOp::NotEq) => builder.build_float_compare(
-                        FloatPredicate::UNE,
-                        left.into_float_value(),
-                        right.into_float_value(),
-                        "not_equal",
-                    ),
-                    (Ty::Dec64, CmpOp::Less) => builder.build_float_compare(
-                        FloatPredicate::OLT,
-                        left.into_float_value(),
-                        right.into_float_value(),
-                        "less",
-                    ),
-                    (Ty::Dec64, CmpOp::LessEq) => builder.build_float_compare(
-                        FloatPredicate::OLE,
-                        left.into_float_value(),
-                        right.into_float_value(),
-                        "less_equal",
-                    ),
-                    (Ty::Dec64, CmpOp::Greater) => builder.build_float_compare(
-                        FloatPredicate::OGT,
-                        left.into_float_value(),
-                        right.into_float_value(),
-                        "greater",
-                    ),
-                    (Ty::Dec64, CmpOp::GreaterEq) => builder.build_float_compare(
-                        FloatPredicate::OGE,
-                        left.into_float_value(),
-                        right.into_float_value(),
-                        "greater_equal",
-                    ),
-                    (Ty::Bool, CmpOp::Eq) => builder.build_int_compare(
-                        IntPredicate::EQ,
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "equal",
-                    ),
-                    (Ty::Bool, CmpOp::NotEq) => builder.build_int_compare(
-                        IntPredicate::NE,
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "not_equal",
-                    ),
-                    (Ty::Bool, _) => {
-                        return Err("checker allowed an ordered boolean comparison".into());
+                if is_float(ty) {
+                    // `Float32` operands are already `float`, so every rounding
+                    // happens at binary32 and never through `double`.
+                    let (left, right) = (left.into_float_value(), right.into_float_value());
+                    let value = match op {
+                        ArithOp::Add => builder.build_float_add(left, right, "add"),
+                        ArithOp::Sub => builder.build_float_sub(left, right, "sub"),
+                        ArithOp::Mul => builder.build_float_mul(left, right, "mul"),
+                        ArithOp::Div => builder.build_float_div(left, right, "div"),
                     }
-                    (Ty::Int64, CmpOp::Eq) => builder.build_int_compare(
-                        IntPredicate::EQ,
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "equal",
-                    ),
-                    (Ty::Int64, CmpOp::NotEq) => builder.build_int_compare(
-                        IntPredicate::NE,
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "not_equal",
-                    ),
-                    (Ty::Int64, CmpOp::Less) => builder.build_int_compare(
-                        IntPredicate::SLT,
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "less",
-                    ),
-                    (Ty::Int64, CmpOp::LessEq) => builder.build_int_compare(
-                        IntPredicate::SLE,
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "less_equal",
-                    ),
-                    (Ty::Int64, CmpOp::Greater) => builder.build_int_compare(
-                        IntPredicate::SGT,
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "greater",
-                    ),
-                    (Ty::Int64, CmpOp::GreaterEq) => builder.build_int_compare(
-                        IntPredicate::SGE,
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "greater_equal",
-                    ),
-                    (Ty::Nil, CmpOp::Eq) => builder.build_int_compare(
-                        IntPredicate::EQ,
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "equal",
-                    ),
-                    (Ty::Nil, CmpOp::NotEq) => builder.build_int_compare(
-                        IntPredicate::NE,
-                        left.into_int_value(),
-                        right.into_int_value(),
-                        "not_equal",
-                    ),
-                    (Ty::Nil, _) => {
-                        return Err("checker allowed an ordered non-numeric comparison".into());
+                    .map_err(|e| e.to_string())?;
+                    return Ok(value.into());
+                }
+                if matches!(ty, Ty::Bool | Ty::Nil) {
+                    return Err("checker produced non-numeric arithmetic".into());
+                }
+                // Plain `add`/`sub`/`mul` on an N-bit integer already wrap
+                // modulo 2^N; no no-wrap flag may be added or the modular
+                // result Specification 009 section 4.5 requires becomes poison.
+                // Unsigned division is `udiv`, whose division by zero is
+                // undefined behavior by that same section -- deliberately
+                // unguarded.
+                let (left, right) = (left.into_int_value(), right.into_int_value());
+                let value = match op {
+                    ArithOp::Add => builder.build_int_add(left, right, "add"),
+                    ArithOp::Sub => builder.build_int_sub(left, right, "sub"),
+                    ArithOp::Mul => builder.build_int_mul(left, right, "mul"),
+                    ArithOp::Div if is_unsigned(ty) => {
+                        builder.build_int_unsigned_div(left, right, "div")
                     }
+                    ArithOp::Div => builder.build_int_signed_div(left, right, "div"),
+                }
+                .map_err(|e| e.to_string())?;
+                Ok(value.into())
+            }
+            TExpr::Cmp(left, op, right, operand_ty) => {
+                let operand_ty = *operand_ty;
+                let left = self.expr(env, loops, left)?;
+                let right = self.expr(env, loops, right)?;
+                let builder = self.builder;
+                let ordered = !matches!(op, CmpOp::Eq | CmpOp::NotEq);
+                if ordered && matches!(operand_ty, Ty::Bool | Ty::Nil) {
+                    return Err("checker allowed an ordered non-numeric comparison".into());
+                }
+                let comparison = if is_float(operand_ty) {
+                    // `Float32` reuses the `Dec64` rule: every predicate but
+                    // `!=` is ordered, so a NaN operand makes it false.
+                    let predicate = match op {
+                        CmpOp::Eq => FloatPredicate::OEQ,
+                        CmpOp::NotEq => FloatPredicate::UNE,
+                        CmpOp::Less => FloatPredicate::OLT,
+                        CmpOp::LessEq => FloatPredicate::OLE,
+                        CmpOp::Greater => FloatPredicate::OGT,
+                        CmpOp::GreaterEq => FloatPredicate::OGE,
+                    };
+                    builder.build_float_compare(
+                        predicate,
+                        left.into_float_value(),
+                        right.into_float_value(),
+                        "compare",
+                    )
+                } else {
+                    let unsigned = is_unsigned(operand_ty);
+                    let predicate = match op {
+                        CmpOp::Eq => IntPredicate::EQ,
+                        CmpOp::NotEq => IntPredicate::NE,
+                        CmpOp::Less if unsigned => IntPredicate::ULT,
+                        CmpOp::Less => IntPredicate::SLT,
+                        CmpOp::LessEq if unsigned => IntPredicate::ULE,
+                        CmpOp::LessEq => IntPredicate::SLE,
+                        CmpOp::Greater if unsigned => IntPredicate::UGT,
+                        CmpOp::Greater => IntPredicate::SGT,
+                        CmpOp::GreaterEq if unsigned => IntPredicate::UGE,
+                        CmpOp::GreaterEq => IntPredicate::SGE,
+                    };
+                    builder.build_int_compare(
+                        predicate,
+                        left.into_int_value(),
+                        right.into_int_value(),
+                        "compare",
+                    )
                 }
                 .map_err(|error| error.to_string())?;
                 let value = builder
@@ -703,20 +792,12 @@ impl<'ctx> Codegen<'ctx, '_> {
             TExpr::If(form) => self.value_if(env, loops, form),
             TExpr::Print(value, ty) => {
                 let value = self.expr(env, loops, value)?;
-                let function = match ty {
-                    Ty::Dec64 => self.print_f64,
-                    Ty::Int64 => self.print_i64,
-                    Ty::Bool => self.print_bool,
-                    Ty::Nil => {
-                        self.builder
-                            .build_call(self.print_nil, &[], "")
-                            .map_err(|error| error.to_string())?;
-                        return Ok(value);
-                    }
+                let function = self.print_import(*ty);
+                let args = match ty {
+                    Ty::Nil => Vec::new(),
+                    _ => vec![value.into()],
                 };
-                self.builder
-                    .build_call(function, &[value.into()], "")
-                    .map_err(|error| error.to_string())?;
+                self.invoke(function, &args)?;
                 Ok(value)
             }
         }

@@ -93,6 +93,14 @@ pub fn emit_object(source: &str) -> Result<Vec<u8>, Diagnostics> {
     emit_object_with_options(source, CompileOptions::default()).map(|object| object.bytes)
 }
 
+/// Renders a program as LLVM IR without emitting an object. Nothing in the
+/// build pipeline uses this; it exists so calling-convention attributes, which
+/// no object file preserves, can be inspected.
+pub fn emit_llvm_ir(source: &str) -> Result<String, Diagnostics> {
+    let program = check(source)?;
+    backend::llvm::compile_to_ir(&program, "snacc").map_err(Diagnostics::backend)
+}
+
 pub fn target_triple() -> String {
     backend::llvm::target_triple()
 }

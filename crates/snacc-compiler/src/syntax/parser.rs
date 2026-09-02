@@ -16,6 +16,11 @@ where
         Token::TyInt64 => TypeName::Int64,
         Token::TyBool => TypeName::Bool,
         Token::TyNil => TypeName::Nil,
+        Token::TyUInt8 => TypeName::UInt8,
+        Token::TyUInt16 => TypeName::UInt16,
+        Token::TyUInt32 => TypeName::UInt32,
+        Token::TyUInt64 => TypeName::UInt64,
+        Token::TyFloat32 => TypeName::Float32,
     }
     .labelled("type name")
 }
@@ -568,6 +573,44 @@ mod tests {
             format!("{:?}", one_line.body.elements[0].0),
             format!("{:?}", multi_line.body.elements[0].0)
         );
+    }
+
+    /// Specification 009 conformance 1: every new type name is accepted in a
+    /// binding, a parameter, a function result, and a bridge declaration.
+    #[test]
+    fn parses_every_new_type_name_in_every_type_position() {
+        for (name, expected) in [
+            ("UInt8", TypeName::UInt8),
+            ("UInt16", TypeName::UInt16),
+            ("UInt32", TypeName::UInt32),
+            ("UInt64", TypeName::UInt64),
+            ("Float32", TypeName::Float32),
+        ] {
+            let source = format!(
+                "extern rust \"snacc_user_edge\" fun edge(value: {name}): {name}\n\
+                 fun identity(value: {name}): {name} do value end"
+            );
+            let program = parse(&source);
+            assert_eq!(program.funcs["identity"].args[0].ty, expected);
+            assert_eq!(program.funcs["identity"].ret, Some(expected));
+            assert_eq!(program.externs["edge"].args[0].ty, expected);
+            assert_eq!(program.externs["edge"].ret, Some(expected));
+        }
+        let program = parse("let byte: UInt8 = 1u8 let ratio: Float32 = 0.5f32");
+        assert!(matches!(
+            program.body.elements[0].0,
+            BlockElement::Let {
+                ty: TypeName::UInt8,
+                ..
+            }
+        ));
+        assert!(matches!(
+            program.body.elements[1].0,
+            BlockElement::Let {
+                ty: TypeName::Float32,
+                ..
+            }
+        ));
     }
 
     #[test]

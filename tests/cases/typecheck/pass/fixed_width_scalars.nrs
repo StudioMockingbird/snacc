@@ -1,0 +1,15 @@
+extern rust "snacc_user_scale" fun scale(value: UInt32): UInt32
+
+fun ratio(numerator: Float32, denominator: Float32): Float32 do
+    numerator / denominator
+end
+
+let byte: UInt8 = 255u8
+let word: UInt16 = 65535u16
+let wide: UInt64 = 18446744073709551615u64
+
+print(byte == 255u8)
+print(word == 65535u16)
+print(wide == 18446744073709551615u64)
+print(scale(2u32) == 2u32)
+print(ratio(1f32, 2f32) == 0.5f32)
