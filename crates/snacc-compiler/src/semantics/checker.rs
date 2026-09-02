@@ -1,5 +1,6 @@
 use crate::syntax::ast::{
-    BinaryOp, Expr, NumLiteral, Param, Program as AstProgram, Span, Spanned, TypeName, Value,
+    BinaryOp, Block, BlockElement, Expr, IfForm, NumLiteral, Param, Program as AstProgram, Span,
+    Spanned, TypeName, Value,
 };
 use std::collections::HashMap;
 
@@ -72,68 +73,135 @@ pub enum CmpOp {
     GreaterEq,
 }
 
+/// Value-producing checked nodes. Nothing here may stand for a construct
+/// without a result: no sentinel type, dummy value, or fallback expression.
 pub enum TExpr {
     Num(NumLiteral),
     Bool(bool),
     Nil,
     Local(String),
-    Let(String, Box<TExpr>, Box<TExpr>),
-    Then(Box<TExpr>, Box<TExpr>),
     Arith(Box<TExpr>, ArithOp, Box<TExpr>, Ty),
     Cmp(Box<TExpr>, CmpOp, Box<TExpr>, Ty),
+    /// A call to a declaration that has a result.
     Call(String, Vec<TExpr>),
-    If(Box<TExpr>, Box<TExpr>, Box<TExpr>, Ty),
-    While(Box<TExpr>, Box<TExpr>, Ty),
+    /// An `if` classified as value-form: every branch is a value block and an
+    /// `else` is present, so the form produces a value on every path.
+    If(Box<TValueIf>),
     Print(Box<TExpr>, Ty),
     Cast(Box<TExpr>, Ty),
 }
 
+pub struct TValueIf {
+    /// First arm is the `if`; remaining arms are `elseif`s, in source order.
+    pub arms: Vec<(TExpr, TBlock)>,
+    pub else_branch: TBlock,
+    pub ty: Ty,
+}
+
+/// Checked statements. These perform control flow or effects and produce no
+/// value, so none of them can satisfy a value-required block.
+pub enum TStmt {
+    Let {
+        mutable: bool,
+        name: String,
+        ty: Ty,
+        value: TExpr,
+    },
+    Assign {
+        name: String,
+        value: TExpr,
+    },
+    While {
+        condition: TExpr,
+        body: TBlock,
+    },
+    Break,
+    /// An `if` classified as statement-form: `else` is optional and every
+    /// branch is a no-result block.
+    If(TStmtIf),
+    /// A call to a declaration without a result.
+    Call(String, Vec<TExpr>),
+    /// A value-producing expression whose result is discarded.
+    Expr(TExpr),
+}
+
+pub struct TStmtIf {
+    pub arms: Vec<(TExpr, TBlock)>,
+    pub else_branch: Option<TBlock>,
+}
+
+/// A block's ordered checked elements plus its optional resulting value.
+/// `result` is `Some` only for a value-required block whose final element
+/// supplied a value.
+pub struct TBlock {
+    pub statements: Vec<TStmt>,
+    pub result: Option<TExpr>,
+}
+
 pub struct TFunc {
     pub params: Vec<(String, Ty)>,
-    pub ret: Ty,
-    pub body: TExpr,
+    /// `None` is a function without a result; it lowers to LLVM `void`.
+    pub result: Option<Ty>,
+    pub body: TBlock,
 }
 
 pub struct TExtern {
     pub symbol: String,
     pub params: Vec<(String, Ty)>,
-    pub ret: Ty,
+    /// `None` is a bridge without a result; its C ABI result is `void`.
+    pub result: Option<Ty>,
     pub span: std::ops::Range<usize>,
 }
 
 pub struct Program {
     pub funcs: HashMap<String, TFunc>,
     pub externs: HashMap<String, TExtern>,
-    pub body: Option<TExpr>,
+    pub body: TBlock,
 }
 
 #[derive(Clone)]
 struct FuncSig {
     params: Vec<Ty>,
-    ret: Ty,
+    result: Option<Ty>,
+}
+
+#[derive(Clone, Copy)]
+struct Binding<'src> {
+    name: &'src str,
+    ty: Ty,
+    mutable: bool,
 }
 
 struct Ctx<'src> {
     sigs: HashMap<&'src str, FuncSig>,
+    /// Every name bound anywhere in the function or method being checked.
+    /// Specification 012 section 5.2 makes this uniqueness rule function-wide,
+    /// so nested blocks and sibling branches share one set.
+    declared: Vec<&'src str>,
+    /// One entry per enclosing `while` body. `break` needs a non-empty stack.
+    loops: Vec<()>,
     errors: Vec<Error>,
     unknown: Option<&'static str>,
 }
 
+type Env<'src> = Vec<Binding<'src>>;
+
 pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
     let mut ctx = Ctx {
         sigs: HashMap::new(),
+        declared: Vec::new(),
+        loops: Vec::new(),
         errors: Vec::new(),
         unknown: None,
     };
 
     for (name, function) in &program.funcs {
-        check_duplicate_params(&mut ctx, &function.args);
         let params = function.args.iter().map(|param| param.ty.into()).collect();
         ctx.sigs.insert(
             *name,
             FuncSig {
                 params,
-                ret: function.ret.into(),
+                result: function.ret.map(Into::into),
             },
         );
     }
@@ -144,7 +212,7 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
             *name,
             FuncSig {
                 params,
-                ret: function.ret.into(),
+                result: function.ret.map(Into::into),
             },
         );
         if !function.symbol.starts_with("snacc_user_") {
@@ -165,17 +233,34 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
     let mut typed_funcs = HashMap::new();
     for name in names {
         let function = &program.funcs[name];
-        let mut env = Vec::new();
+        // Parameters and locals share one function-wide binding namespace.
+        ctx.declared.clear();
+        ctx.loops.clear();
+        let mut env = Env::new();
         let mut params = Vec::new();
         for param in &function.args {
             let ty = param.ty.into();
-            env.push((param.name, ty));
+            declare(&mut ctx, param.name, param.span, "Parameter");
+            env.push(Binding {
+                name: param.name,
+                ty,
+                mutable: false,
+            });
             params.push((param.name.to_string(), ty));
         }
-        let (body, body_ty) = check_expr(&mut ctx, &mut env, &function.body);
-        let ret = function.ret.into();
-        let body = coerce(&mut ctx, body, body_ty, ret, function.body.1);
-        typed_funcs.insert(name.to_string(), TFunc { params, ret, body });
+        let result = function.ret.map(Ty::from);
+        let body = match result {
+            Some(expected) => check_value_block(&mut ctx, &mut env, &function.body, expected),
+            None => check_statement_block(&mut ctx, &mut env, &function.body),
+        };
+        typed_funcs.insert(
+            name.to_string(),
+            TFunc {
+                params,
+                result,
+                body,
+            },
+        );
     }
 
     let mut typed_externs = HashMap::new();
@@ -193,16 +278,18 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
             TExtern {
                 symbol: function.symbol.to_string(),
                 params,
-                ret: function.ret.into(),
+                result: function.ret.map(Into::into),
                 span: function.span.into_range(),
             },
         );
     }
 
-    let body = program.body.as_ref().map(|expression| {
-        let mut env = Vec::new();
-        check_expr(&mut ctx, &mut env, expression).0
-    });
+    // The top-level executable body is a no-result block with its own binding
+    // namespace; Snacc creates no implicit global state.
+    ctx.declared.clear();
+    ctx.loops.clear();
+    let mut env = Env::new();
+    let body = check_statement_block(&mut ctx, &mut env, &program.body);
 
     if let Some(detail) = ctx.unknown {
         return Err(Failure::Unknown(detail));
@@ -229,6 +316,19 @@ fn check_duplicate_params(ctx: &mut Ctx<'_>, params: &[Param<'_>]) {
         } else {
             seen.push(param.name);
         }
+    }
+}
+
+/// Records a function-wide binding, reporting a duplicate rather than creating
+/// a second layer for the same name.
+fn declare<'src>(ctx: &mut Ctx<'src>, name: &'src str, span: Span, kind: &str) {
+    if ctx.declared.contains(&name) {
+        ctx.errors.push(Error {
+            span,
+            msg: format!("{kind} '{name}' already exists"),
+        });
+    } else {
+        ctx.declared.push(name);
     }
 }
 
@@ -271,9 +371,289 @@ fn coerce(ctx: &mut Ctx<'_>, value: TExpr, from: Ty, to: Ty, span: Span) -> TExp
     }
 }
 
+fn check_condition<'src>(
+    ctx: &mut Ctx<'src>,
+    env: &mut Env<'src>,
+    condition: &Spanned<Expr<'src>>,
+) -> TExpr {
+    let (value, ty) = check_expr(ctx, env, condition);
+    if ty != Ty::Bool {
+        ctx.errors.push(Error::mismatch(condition.1, Ty::Bool, ty));
+    }
+    value
+}
+
+/// Checks a block that must supply a value of `expected`. Every element but
+/// the last is a statement; the last shall be a value-producing expression or
+/// a value-form `if`.
+fn check_value_block<'src>(
+    ctx: &mut Ctx<'src>,
+    env: &mut Env<'src>,
+    block: &Block<'src>,
+    expected: Ty,
+) -> TBlock {
+    let scope = env.len();
+    let mut statements = Vec::new();
+    let mut result = None;
+    let last = block.elements.len().wrapping_sub(1);
+    for (index, element) in block.elements.iter().enumerate() {
+        if index != last {
+            statements.push(check_stmt(ctx, env, element));
+            continue;
+        }
+        match &element.0 {
+            BlockElement::Expr(expression) => {
+                let (value, ty) = check_expr(ctx, env, expression);
+                result = Some(coerce(ctx, value, ty, expected, expression.1));
+            }
+            BlockElement::If(form) => {
+                result = Some(check_value_if(ctx, env, form, expected));
+            }
+            _ => {
+                ctx.errors.push(Error {
+                    span: element.1,
+                    msg: format!(
+                        "this block must end in an expression of type '{expected}', \
+                         but it ends in a statement"
+                    ),
+                });
+                statements.push(check_stmt(ctx, env, element));
+            }
+        }
+    }
+    if result.is_none() && block.elements.is_empty() {
+        ctx.errors.push(Error {
+            span: block.span,
+            msg: format!(
+                "this block must end in an expression of type '{expected}', but it is empty"
+            ),
+        });
+    }
+    env.truncate(scope);
+    TBlock { statements, result }
+}
+
+/// Checks a block with no required final value. Every element is a statement;
+/// a value-producing expression used as an element is simply discarded.
+fn check_statement_block<'src>(
+    ctx: &mut Ctx<'src>,
+    env: &mut Env<'src>,
+    block: &Block<'src>,
+) -> TBlock {
+    let scope = env.len();
+    let statements = block
+        .elements
+        .iter()
+        .map(|element| check_stmt(ctx, env, element))
+        .collect();
+    env.truncate(scope);
+    TBlock {
+        statements,
+        result: None,
+    }
+}
+
+fn check_value_if<'src>(
+    ctx: &mut Ctx<'src>,
+    env: &mut Env<'src>,
+    form: &IfForm<'src>,
+    expected: Ty,
+) -> TExpr {
+    let mut arms = Vec::new();
+    for (condition, body) in &form.arms {
+        let condition = check_condition(ctx, env, condition);
+        let body = check_value_block(ctx, env, body, expected);
+        arms.push((condition, body));
+    }
+    // Specification 010 will add an exhaustive union type-test chain as the
+    // second way to cover every path; until unions exist, `else` is the only
+    // one.
+    let else_branch = match &form.else_branch {
+        Some(body) => check_value_block(ctx, env, body, expected),
+        None => {
+            ctx.errors.push(Error {
+                span: form.span,
+                msg: format!(
+                    "an 'if' that produces a value of type '{expected}' requires an 'else' branch"
+                ),
+            });
+            TBlock {
+                statements: Vec::new(),
+                result: None,
+            }
+        }
+    };
+    TExpr::If(Box::new(TValueIf {
+        arms,
+        else_branch,
+        ty: expected,
+    }))
+}
+
+fn check_stmt<'src>(
+    ctx: &mut Ctx<'src>,
+    env: &mut Env<'src>,
+    element: &Spanned<BlockElement<'src>>,
+) -> TStmt {
+    match &element.0 {
+        BlockElement::Let {
+            mutable,
+            name,
+            name_span,
+            ty,
+            value,
+        } => {
+            let declared = Ty::from(*ty);
+            // The initializer is checked before the name is in scope, so it can
+            // never refer to the variable being created.
+            let (checked, value_ty) = check_expr(ctx, env, value);
+            let checked = coerce(ctx, checked, value_ty, declared, value.1);
+            declare(ctx, name, *name_span, "Variable");
+            env.push(Binding {
+                name,
+                ty: declared,
+                mutable: *mutable,
+            });
+            TStmt::Let {
+                mutable: *mutable,
+                name: (*name).to_string(),
+                ty: declared,
+                value: checked,
+            }
+        }
+        BlockElement::Assign {
+            name,
+            name_span,
+            value,
+        } => {
+            let target = env
+                .iter()
+                .rev()
+                .find(|binding| binding.name == *name)
+                .copied();
+            let (checked, value_ty) = check_expr(ctx, env, value);
+            let checked = match target {
+                Some(binding) => {
+                    if !binding.mutable {
+                        ctx.errors.push(Error {
+                            span: *name_span,
+                            msg: format!("'{name}' is not declared 'mut' and cannot be assigned"),
+                        });
+                    }
+                    coerce(ctx, checked, value_ty, binding.ty, value.1)
+                }
+                None => {
+                    ctx.errors.push(Error {
+                        span: *name_span,
+                        msg: format!("No such variable '{name}' in scope"),
+                    });
+                    checked
+                }
+            };
+            TStmt::Assign {
+                name: (*name).to_string(),
+                value: checked,
+            }
+        }
+        BlockElement::While {
+            condition, body, ..
+        } => {
+            let condition = check_condition(ctx, env, condition);
+            ctx.loops.push(());
+            let body = check_statement_block(ctx, env, body);
+            ctx.loops.pop();
+            TStmt::While { condition, body }
+        }
+        BlockElement::Break(span) => {
+            if ctx.loops.is_empty() {
+                ctx.errors.push(Error {
+                    span: *span,
+                    msg: "'break' is only valid inside a 'while' body, which is the only \
+                          construct that establishes a loop target"
+                        .into(),
+                });
+            }
+            TStmt::Break
+        }
+        BlockElement::If(form) => {
+            let mut arms = Vec::new();
+            for (condition, body) in &form.arms {
+                let condition = check_condition(ctx, env, condition);
+                let body = check_statement_block(ctx, env, body);
+                arms.push((condition, body));
+            }
+            let else_branch = form
+                .else_branch
+                .as_ref()
+                .map(|body| check_statement_block(ctx, env, body));
+            TStmt::If(TStmtIf { arms, else_branch })
+        }
+        BlockElement::Expr(expression) => {
+            // A call to a declaration without a result is a call statement, not
+            // an expression whose value is discarded.
+            if let Expr::Call(function, arguments) = &expression.0
+                && let Some((name, args, None)) =
+                    check_call(ctx, env, expression.1, function, arguments)
+            {
+                return TStmt::Call(name, args);
+            }
+            TStmt::Expr(check_expr(ctx, env, expression).0)
+        }
+    }
+}
+
+/// Checks a call's callee and arguments. Returns `None` when the callee is not
+/// a resolvable declaration (the diagnostic has already been recorded).
+fn check_call<'src>(
+    ctx: &mut Ctx<'src>,
+    env: &mut Env<'src>,
+    span: Span,
+    function: &Spanned<Expr<'src>>,
+    arguments: &Spanned<Vec<Spanned<Expr<'src>>>>,
+) -> Option<(String, Vec<TExpr>, Option<Ty>)> {
+    let Expr::Local(name) = &function.0 else {
+        ctx.errors.push(Error {
+            span: function.1,
+            msg: "only calling a function by name is supported".into(),
+        });
+        return None;
+    };
+    let Some(signature) = ctx.sigs.get(name).cloned() else {
+        ctx.errors.push(Error {
+            span: function.1,
+            msg: format!("'{name}' is not callable"),
+        });
+        return None;
+    };
+    let mut checked = Vec::new();
+    for argument in &arguments.0 {
+        let (value, value_ty) = check_expr(ctx, env, argument);
+        checked.push((value, value_ty, argument.1));
+    }
+    if signature.params.len() != checked.len() {
+        ctx.errors.push(Error {
+            span,
+            msg: format!(
+                "'{name}' called with wrong number of arguments (expected {}, found {})",
+                signature.params.len(),
+                checked.len()
+            ),
+        });
+    }
+    let mut args = Vec::new();
+    for (index, (value, value_ty, arg_span)) in checked.into_iter().enumerate() {
+        if let Some(expected) = signature.params.get(index) {
+            args.push(coerce(ctx, value, value_ty, *expected, arg_span));
+        } else {
+            args.push(value);
+        }
+    }
+    Some(((*name).to_string(), args, signature.result))
+}
+
 fn check_expr<'src>(
     ctx: &mut Ctx<'src>,
-    env: &mut Vec<(&'src str, Ty)>,
+    env: &mut Env<'src>,
     expression: &Spanned<Expr<'src>>,
 ) -> (TExpr, Ty) {
     let span = expression.1;
@@ -309,9 +689,9 @@ fn check_expr<'src>(
             (TExpr::Nil, Ty::Nil)
         }
         Expr::Local(name) => {
-            for (bound_name, ty) in env.iter().rev() {
-                if bound_name == name {
-                    return (TExpr::Local((*name).to_string()), *ty);
+            for binding in env.iter().rev() {
+                if binding.name == *name {
+                    return (TExpr::Local((*name).to_string()), binding.ty);
                 }
             }
             if ctx.sigs.contains_key(name) {
@@ -326,24 +706,6 @@ fn check_expr<'src>(
                 });
             }
             (TExpr::Nil, Ty::Nil)
-        }
-        Expr::Let(name, declared, value, body) => {
-            let declared = (*declared).into();
-            let value_span = value.1;
-            let (value, value_ty) = check_expr(ctx, env, value);
-            let value = coerce(ctx, value, value_ty, declared, value_span);
-            env.push((name, declared));
-            let (body, body_ty) = check_expr(ctx, env, body);
-            env.pop();
-            (
-                TExpr::Let((*name).to_string(), Box::new(value), Box::new(body)),
-                body_ty,
-            )
-        }
-        Expr::Then(first, second) => {
-            let (first, _) = check_expr(ctx, env, first);
-            let (second, ty) = check_expr(ctx, env, second);
-            (TExpr::Then(Box::new(first), Box::new(second)), ty)
         }
         Expr::Binary(left, op, right) => {
             let (left, left_ty) = check_expr(ctx, env, left);
@@ -416,82 +778,21 @@ fn check_expr<'src>(
             }
         }
         Expr::Call(function, arguments) => {
-            let Expr::Local(name) = &function.0 else {
-                ctx.errors.push(Error {
-                    span: function.1,
-                    msg: "only calling a function by name is supported".into(),
-                });
+            let Some((name, args, result)) = check_call(ctx, env, span, function, arguments) else {
                 return (TExpr::Nil, Ty::Nil);
             };
-            let Some(signature) = ctx.sigs.get(name).cloned() else {
-                ctx.errors.push(Error {
-                    span: function.1,
-                    msg: format!("'{name}' is not callable"),
-                });
-                return (TExpr::Nil, Ty::Nil);
-            };
-            let mut checked = Vec::new();
-            for argument in &arguments.0 {
-                let (value, value_ty) = check_expr(ctx, env, argument);
-                checked.push((value, value_ty, argument.1));
-            }
-            if signature.params.len() != checked.len() {
-                ctx.errors.push(Error {
-                    span,
-                    msg: format!(
-                        "'{name}' called with wrong number of arguments (expected {}, found {})",
-                        signature.params.len(),
-                        checked.len()
-                    ),
-                });
-            }
-            let mut args = Vec::new();
-            for (index, (value, value_ty, arg_span)) in checked.into_iter().enumerate() {
-                if let Some(expected) = signature.params.get(index) {
-                    args.push(coerce(ctx, value, value_ty, *expected, arg_span));
-                } else {
-                    args.push(value);
+            match result {
+                Some(ty) => (TExpr::Call(name, args), ty),
+                None => {
+                    ctx.errors.push(Error {
+                        span,
+                        msg: format!(
+                            "'{name}' declares no result, so its call cannot be used as a value"
+                        ),
+                    });
+                    (TExpr::Nil, Ty::Nil)
                 }
             }
-            (TExpr::Call((*name).to_string(), args), signature.ret)
-        }
-        Expr::If(condition, then_branch, else_branch) => {
-            let condition_span = condition.1;
-            let (condition, condition_ty) = check_expr(ctx, env, condition);
-            if condition_ty != Ty::Bool {
-                ctx.errors
-                    .push(Error::mismatch(condition_span, Ty::Bool, condition_ty));
-            }
-            let (then_branch, then_ty) = check_expr(ctx, env, then_branch);
-            let (else_branch, else_ty) = check_expr(ctx, env, else_branch);
-            let ty = common_numeric(then_ty, else_ty).unwrap_or(then_ty);
-            if !assignable(then_ty, ty) || !assignable(else_ty, ty) {
-                ctx.errors.push(Error::mismatch(span, then_ty, else_ty));
-            }
-            let then_branch = coerce(ctx, then_branch, then_ty, ty, span);
-            let else_branch = coerce(ctx, else_branch, else_ty, ty, span);
-            (
-                TExpr::If(
-                    Box::new(condition),
-                    Box::new(then_branch),
-                    Box::new(else_branch),
-                    ty,
-                ),
-                ty,
-            )
-        }
-        Expr::While(condition, body) => {
-            let condition_span = condition.1;
-            let (condition, condition_ty) = check_expr(ctx, env, condition);
-            if condition_ty != Ty::Bool {
-                ctx.errors
-                    .push(Error::mismatch(condition_span, Ty::Bool, condition_ty));
-            }
-            let (body, body_ty) = check_expr(ctx, env, body);
-            (
-                TExpr::While(Box::new(condition), Box::new(body), body_ty),
-                body_ty,
-            )
         }
         Expr::Print(value) => {
             let (value, ty) = check_expr(ctx, env, value);
@@ -503,6 +804,31 @@ fn check_expr<'src>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::syntax::ast::Block;
+
+    fn errors(source: &str) -> Vec<Error> {
+        let syntax =
+            crate::parse(source).unwrap_or_else(|d| panic!("{source} should parse: {d:?}"));
+        match check(&syntax) {
+            Err(Failure::Source(errors)) => errors,
+            Err(Failure::Unknown(detail)) => panic!("unexpected compiler bug: {detail}"),
+            Ok(_) => panic!("expected a type error for: {source}"),
+        }
+    }
+
+    fn assert_checks(source: &str) -> Program {
+        let syntax =
+            crate::parse(source).unwrap_or_else(|d| panic!("{source} should parse: {d:?}"));
+        check(&syntax).unwrap_or_else(|failure| panic!("{source} should check: {failure:?}"))
+    }
+
+    fn assert_error_contains(source: &str, needle: &str) {
+        let errors = errors(source);
+        assert!(
+            errors.iter().any(|error| error.msg.contains(needle)),
+            "expected an error containing {needle:?} for {source}, got: {errors:?}"
+        );
+    }
 
     #[test]
     fn parser_recovery_nodes_are_compiler_bugs_after_parsing() {
@@ -512,15 +838,21 @@ mod tests {
             "recovered",
             crate::syntax::ast::Func {
                 args: Vec::new(),
-                ret: TypeName::Nil,
+                ret: Some(TypeName::Nil),
                 span,
-                body: (Expr::Error, span),
+                body: Block {
+                    elements: vec![(BlockElement::Expr((Expr::Error, span)), span)],
+                    span,
+                },
             },
         );
         let program = AstProgram {
             funcs,
             externs: HashMap::new(),
-            body: None,
+            body: Block {
+                elements: Vec::new(),
+                span,
+            },
         };
 
         match check(&program) {
@@ -533,20 +865,17 @@ mod tests {
 
     #[test]
     fn checks_typed_rust_bridge_calls() {
-        let source = "extern rust \"snacc_user_double\" fun rust_double(value: Int64): Int64\nprint(rust_double(2))";
-        let syntax = crate::parse(source).expect("bridge declaration should parse");
-        let program = match check(&syntax) {
-            Ok(program) => program,
-            Err(_) => panic!("bridge call should type check"),
-        };
+        let program = assert_checks(
+            "extern rust \"snacc_user_double\" fun rust_double(value: Int64): Int64\nprint(rust_double(2))",
+        );
         assert_eq!(program.externs["rust_double"].symbol, "snacc_user_double");
+        assert_eq!(program.externs["rust_double"].result, Some(Ty::Int64));
     }
 
     #[test]
     fn checked_externs_carry_their_declaration_span() {
         let source = "extern rust \"snacc_user_double\" fun rust_double(value: Int64): Int64\nprint(rust_double(2))";
-        let syntax = crate::parse(source).expect("bridge declaration should parse");
-        let program = check(&syntax).expect("bridge call should type check");
+        let program = assert_checks(source);
         let span = &program.externs["rust_double"].span;
         assert_eq!(span.start, 0);
         assert!(span.end > span.start && span.end <= source.find('\n').unwrap());
@@ -554,58 +883,271 @@ mod tests {
 
     #[test]
     fn rejects_bridge_symbols_that_are_not_rust_identifiers() {
-        let source = "extern rust \"snacc_user_bad-name\" fun bad(): Nil\nprint(0)";
-        let syntax = crate::parse(source).expect("declaration should parse");
-        match check(&syntax) {
-            Err(Failure::Source(errors)) => {
-                assert!(
-                    errors
-                        .iter()
-                        .any(|error| error.msg.contains("valid Rust identifiers")),
-                    "expected a Rust-identifier diagnostic"
-                );
-            }
-            _ => panic!("a non-identifier bridge symbol should fail type checking"),
-        }
+        assert_error_contains(
+            "extern rust \"snacc_user_bad-name\" fun bad(): Nil\nprint(0)",
+            "valid Rust identifiers",
+        );
     }
 
     #[test]
     fn accepts_bridge_symbols_with_digits_and_underscores() {
-        let source = "extern rust \"snacc_user_v2_ok\" fun ok(): Nil\nprint(0)";
-        let syntax = crate::parse(source).expect("declaration should parse");
-        assert!(check(&syntax).is_ok());
+        assert_checks("extern rust \"snacc_user_v2_ok\" fun ok(): Nil\nprint(0)");
     }
 
     #[test]
     fn rejects_duplicate_function_parameter_names() {
         let source = "fun f(a: Int64, a: Int64): Int64 do a end";
-        let syntax = crate::parse(source).expect("declaration should parse");
         let second_a = source.find(", a: Int64)").map(|i| i + 2).unwrap();
-        match check(&syntax) {
-            Err(Failure::Source(errors)) => {
-                let error = errors
-                    .iter()
-                    .find(|error| error.msg.contains("Parameter 'a' already exists"))
-                    .unwrap_or_else(|| {
-                        panic!("expected a duplicate-parameter diagnostic, got: {errors:?}")
-                    });
-                assert_eq!(
-                    error.span.start, second_a,
-                    "diagnostic should span the second 'a'"
-                );
-                assert_eq!(error.span.end, second_a + 1);
-            }
-            Ok(_) => panic!("duplicate parameter names should fail type checking"),
-            Err(Failure::Unknown(detail)) => {
-                panic!("duplicate parameter names should fail type checking, got: {detail}")
-            }
-        }
+        let errors = errors(source);
+        let error = errors
+            .iter()
+            .find(|error| error.msg.contains("Parameter 'a' already exists"))
+            .unwrap_or_else(|| {
+                panic!("expected a duplicate-parameter diagnostic, got: {errors:?}")
+            });
+        assert_eq!(
+            error.span.start, second_a,
+            "diagnostic should span the second 'a'"
+        );
+        assert_eq!(error.span.end, second_a + 1);
     }
 
     #[test]
     fn accepts_functions_with_distinct_parameter_names() {
-        let source = "fun f(a: Int64, b: Int64): Int64 do a + b end";
-        let syntax = crate::parse(source).expect("declaration should parse");
-        assert!(check(&syntax).is_ok());
+        assert_checks("fun f(a: Int64, b: Int64): Int64 do a + b end");
+    }
+
+    // RFC 008 conformance 1: declarations with and without results.
+
+    #[test]
+    fn checks_functions_and_bridges_with_and_without_results() {
+        let program = assert_checks(
+            "extern rust \"snacc_user_log\" fun log(value: Int64)\n\
+             extern rust \"snacc_user_double\" fun rust_double(value: Int64): Int64\n\
+             fun announce(value: Int64) do print(value) end\n\
+             fun double(value: Int64): Int64 do value * 2 end\n\
+             announce(1)\n\
+             log(2)\n\
+             print(double(3))\n\
+             print(rust_double(4))",
+        );
+        assert_eq!(program.funcs["announce"].result, None);
+        assert_eq!(program.funcs["double"].result, Some(Ty::Int64));
+        assert_eq!(program.externs["log"].result, None);
+        assert_eq!(program.externs["rust_double"].result, Some(Ty::Int64));
+    }
+
+    // RFC 008 conformance 2: no-result calls as block elements, never as values.
+
+    #[test]
+    fn accepts_a_no_result_call_as_a_block_element() {
+        let program = assert_checks("fun announce(value: Int64) do print(value) end\nannounce(1)");
+        assert!(matches!(program.body.statements[0], TStmt::Call(_, _)));
+        assert!(program.body.result.is_none());
+    }
+
+    #[test]
+    fn rejects_a_no_result_call_in_every_expression_position() {
+        let declaration = "fun announce(value: Int64) do print(value) end\n";
+        for use_site in [
+            "print(announce(1))",
+            "let value: Int64 = announce(1)",
+            "print(1 + announce(1))",
+            "fun wrap(): Int64 do announce(1) end",
+            "if announce(1) then print(0) end",
+        ] {
+            assert_error_contains(
+                &format!("{declaration}{use_site}"),
+                "declares no result, so its call cannot be used as a value",
+            );
+        }
+    }
+
+    // RFC 008 conformance 3: value-required bodies reject statements.
+
+    #[test]
+    fn rejects_a_value_required_body_ending_in_a_statement() {
+        for body in ["let value: Int64 = 1", "while false do print(1) end"] {
+            assert_error_contains(
+                &format!("fun f(): Int64 do {body} end"),
+                "must end in an expression of type 'Int64'",
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_value_required_body_ending_in_an_assignment() {
+        assert_error_contains(
+            "fun f(): Int64 do let mut x: Int64 = 1 x = 2 end",
+            "must end in an expression of type 'Int64'",
+        );
+    }
+
+    #[test]
+    fn accepts_a_value_required_body_with_a_leading_statement() {
+        assert_checks("fun f(value: Int64): Int64 do let result: Int64 = value * value result end");
+    }
+
+    #[test]
+    fn accepts_a_statement_loop_followed_by_an_explicit_value() {
+        // RFC 008's migration pattern for the old loop zero-value fallback.
+        assert_checks(
+            "fun zero_after_loop(value: Int64): Int64 do while false do print(value) end 0 end",
+        );
+    }
+
+    // RFC 008 conformance 6: break targets and placement.
+
+    #[test]
+    fn rejects_break_outside_a_loop() {
+        assert_error_contains("break", "only valid inside a 'while' body");
+        assert_error_contains(
+            "fun f() do if true then break end end",
+            "only valid inside a 'while' body",
+        );
+    }
+
+    #[test]
+    fn accepts_break_inside_a_nested_loop_body() {
+        assert_checks("while true do while true do break end break end");
+    }
+
+    #[test]
+    fn a_loop_target_does_not_outlive_its_body() {
+        // The stack must pop when the body ends, so a `break` after the loop
+        // is still rejected.
+        assert_error_contains(
+            "while true do print(1) end break",
+            "only valid inside a 'while' body",
+        );
+    }
+
+    // RFC 008 conformance 7: statement-form vs value-form `if`.
+
+    #[test]
+    fn statement_form_if_accepts_an_omitted_else() {
+        let program = assert_checks("if true then print(1) end");
+        assert!(matches!(program.body.statements[0], TStmt::If(_)));
+    }
+
+    #[test]
+    fn value_form_if_requires_an_else() {
+        assert_error_contains(
+            "fun f(): Int64 do if true then 1 end end",
+            "requires an 'else' branch",
+        );
+    }
+
+    #[test]
+    fn value_form_if_checks_every_branch_against_the_required_type() {
+        assert_checks("fun f(c: Bool): Int64 do if c then 1 elseif c then 2 else 3 end end");
+        assert_error_contains(
+            "fun f(c: Bool): Int64 do if c then 1 else true end end",
+            "expected 'Int64', found 'Bool'",
+        );
+    }
+
+    #[test]
+    fn value_form_if_rejects_a_branch_that_ends_in_a_statement() {
+        assert_error_contains(
+            "fun f(c: Bool): Int64 do if c then print(1) else while false do print(2) end end end",
+            "must end in an expression of type 'Int64'",
+        );
+    }
+
+    #[test]
+    fn rejects_a_non_bool_condition() {
+        assert_error_contains("while 1 do print(1) end", "expected 'Bool', found 'Int64'");
+        assert_error_contains("if 1 then print(1) end", "expected 'Bool', found 'Int64'");
+    }
+
+    // Specification 012 sections 5-6: declarations and root mutability.
+
+    #[test]
+    fn rejects_a_duplicate_local_declaration() {
+        assert_error_contains(
+            "let x: Int64 = 10\nlet x: Int64 = 20",
+            "Variable 'x' already exists",
+        );
+    }
+
+    #[test]
+    fn rejects_a_duplicate_local_declared_in_a_nested_branch() {
+        // Specification 012 section 5.2: uniqueness is function-wide, so a
+        // nested block cannot reuse an outer name.
+        assert_error_contains(
+            "fun f(ready: Bool) do let value: Int64 = 1 if ready then let value: Int64 = 2 print(value) end end",
+            "Variable 'value' already exists",
+        );
+    }
+
+    #[test]
+    fn rejects_a_local_that_shadows_a_parameter() {
+        assert_error_contains(
+            "fun f(value: Int64): Int64 do let value: Int64 = 1 value end",
+            "Variable 'value' already exists",
+        );
+    }
+
+    #[test]
+    fn accepts_the_same_local_name_in_different_functions() {
+        assert_checks(
+            "fun f(): Int64 do let value: Int64 = 1 value end\n\
+             fun g(): Int64 do let value: Int64 = 2 value end",
+        );
+    }
+
+    #[test]
+    fn an_initializer_cannot_refer_to_the_variable_being_declared() {
+        assert_error_contains("let count: Int64 = count + 1", "No such variable 'count'");
+    }
+
+    #[test]
+    fn rejects_assignment_to_an_immutable_root() {
+        assert_error_contains(
+            "let count: Int64 = 1\ncount = 2",
+            "'count' is not declared 'mut' and cannot be assigned",
+        );
+    }
+
+    #[test]
+    fn accepts_assignment_to_a_mutable_root() {
+        let program = assert_checks("let mut count: Int64 = 1\ncount = count + 1\nprint(count)");
+        assert!(matches!(
+            program.body.statements[0],
+            TStmt::Let { mutable: true, .. }
+        ));
+        assert!(matches!(program.body.statements[1], TStmt::Assign { .. }));
+    }
+
+    #[test]
+    fn rejects_an_assignment_type_mismatch() {
+        assert_error_contains(
+            "let mut count: Int64 = 1\ncount = true",
+            "expected 'Int64', found 'Bool'",
+        );
+    }
+
+    #[test]
+    fn rejects_assignment_to_an_undeclared_name() {
+        assert_error_contains("missing = 1", "No such variable 'missing' in scope");
+    }
+
+    #[test]
+    fn a_declaration_does_not_escape_its_block() {
+        assert_error_contains(
+            "if true then let inner: Int64 = 1 print(inner) end\nprint(inner)",
+            "No such variable 'inner' in scope",
+        );
+    }
+
+    #[test]
+    fn an_empty_value_required_body_is_rejected() {
+        assert_error_contains("fun f(): Int64 do end", "but it is empty");
+    }
+
+    #[test]
+    fn a_no_result_function_body_may_be_empty() {
+        assert_checks("fun nothing() do end");
     }
 }

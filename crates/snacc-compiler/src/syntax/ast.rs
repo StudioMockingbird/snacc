@@ -63,6 +63,10 @@ pub enum BinaryOp {
     GreaterEq,
 }
 
+/// Only value-producing forms live here. Statements and `if` are block
+/// elements (see [`BlockElement`]) so no construct without a value can ever
+/// reach an expression position.
+///
 /// Child spans preserve source locations across parsing and type checking.
 #[derive(Debug)]
 pub enum Expr<'src> {
@@ -70,28 +74,69 @@ pub enum Expr<'src> {
     Value(Value<'src>),
     List(Vec<Spanned<Self>>),
     Local(&'src str),
-    Let(&'src str, TypeName, Box<Spanned<Self>>, Box<Spanned<Self>>),
-    Then(Box<Spanned<Self>>, Box<Spanned<Self>>),
     Binary(Box<Spanned<Self>>, BinaryOp, Box<Spanned<Self>>),
     Call(Box<Spanned<Self>>, Spanned<Vec<Spanned<Self>>>),
-    If(Box<Spanned<Self>>, Box<Spanned<Self>>, Box<Spanned<Self>>),
-    While(Box<Spanned<Self>>, Box<Spanned<Self>>),
     Print(Box<Spanned<Self>>),
+}
+
+/// An ordered list of block elements. Whether the block must produce a value
+/// is decided by its position, not its syntax, so the parser records no such
+/// distinction.
+#[derive(Debug)]
+pub struct Block<'src> {
+    pub elements: Vec<Spanned<BlockElement<'src>>>,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub enum BlockElement<'src> {
+    Let {
+        mutable: bool,
+        name: &'src str,
+        name_span: Span,
+        ty: TypeName,
+        value: Spanned<Expr<'src>>,
+    },
+    Assign {
+        name: &'src str,
+        name_span: Span,
+        value: Spanned<Expr<'src>>,
+    },
+    While {
+        condition: Spanned<Expr<'src>>,
+        body: Block<'src>,
+        span: Span,
+    },
+    Break(Span),
+    If(IfForm<'src>),
+    Expr(Spanned<Expr<'src>>),
+}
+
+/// One `if` syntax form. The checker classifies each occurrence as
+/// statement-form or value-form purely from where it sits.
+#[derive(Debug)]
+pub struct IfForm<'src> {
+    /// First arm is the `if`; remaining arms are `elseif`s, in source order.
+    pub arms: Vec<(Spanned<Expr<'src>>, Block<'src>)>,
+    pub else_branch: Option<Block<'src>>,
+    pub span: Span,
 }
 
 #[derive(Debug)]
 pub struct Func<'src> {
     pub args: Vec<Param<'src>>,
-    pub ret: TypeName,
+    /// `None` declares a function without a result.
+    pub ret: Option<TypeName>,
     pub span: Span,
-    pub body: Spanned<Expr<'src>>,
+    pub body: Block<'src>,
 }
 
 #[derive(Debug)]
 pub struct ExternFunc<'src> {
     pub symbol: &'src str,
     pub args: Vec<Param<'src>>,
-    pub ret: TypeName,
+    /// `None` declares a bridge without a result.
+    pub ret: Option<TypeName>,
     pub span: Span,
 }
 
@@ -105,5 +150,7 @@ pub struct Param<'src> {
 pub struct Program<'src> {
     pub funcs: HashMap<&'src str, Func<'src>>,
     pub externs: HashMap<&'src str, ExternFunc<'src>>,
-    pub body: Option<Spanned<Expr<'src>>>,
+    /// The top-level executable block. An empty program is a block with zero
+    /// elements, so this is never optional.
+    pub body: Block<'src>,
 }

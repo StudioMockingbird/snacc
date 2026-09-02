@@ -2,8 +2,19 @@ fun double(value: Int64): Int64 do
     value * 2
 end
 
-fun zero_from_loop(value: Int64): Int64 do
-    while false do value end
+fun zero_after_loop(value: Int64): Int64 do
+    while false do
+        print(value)
+    end
+    0
+end
+
+fun pick(flag: Bool): Int64 do
+    if flag then
+        10
+    else
+        20
+    end
 end
 
 print(1 + 2)
@@ -12,8 +23,12 @@ print(nil)
 print(3 * 4)
 print(5 > 2)
 print(double(6))
-print(if 1 == 1 then 10 else 20 end)
-print(while false do 7 end)
-while false do print(99) end
+print(pick(true))
+if 1 == 1 then
+    print(30)
+end
+while false do
+    print(99)
+end
 print(11)
-print(zero_from_loop(3))
+print(zero_after_loop(3))

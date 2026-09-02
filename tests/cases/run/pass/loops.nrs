@@ -1,0 +1,44 @@
+// RFC 008: `while` executes for zero, one, and many iterations without ever
+// producing a value, `break` leaves the innermost loop, and a function without
+// a result type is called as a statement.
+fun count_to(limit: Int64) do
+    let mut index: Int64 = 0
+    while index < limit do
+        print(index)
+        index = index + 1
+    end
+end
+
+fun first_over_five(step: Int64): Int64 do
+    let mut factor: Int64 = 1
+    while true do
+        if factor * step > 5 then
+            break
+        end
+        factor = factor + 1
+    end
+    factor
+end
+
+fun inner_break_hits(): Int64 do
+    let mut outer: Int64 = 0
+    let mut hits: Int64 = 0
+    while outer < 3 do
+        let mut inner: Int64 = 0
+        while true do
+            inner = inner + 1
+            if inner > 2 then
+                break
+            end
+            hits = hits + 1
+        end
+        outer = outer + 1
+    end
+    hits
+end
+
+count_to(0)
+count_to(1)
+count_to(3)
+print(first_over_five(2))
+print(inner_break_hits())
