@@ -73,9 +73,15 @@ pub fn build(source: &str) -> Result<BuiltExecutable, DriverError> {
     fs::write(&object_path, emitted).map_err(|error| {
         DriverError::Filesystem(format!("failed to write native object: {error}"))
     })?;
-    fs::write(&host_path, format!("{RUNTIME_SOURCE}{HOST_SUFFIX}")).map_err(|error| {
-        DriverError::Filesystem(format!("failed to write generated host: {error}"))
-    })?;
+    let abi_assertion = format!(
+        "\nconst _: () = assert!(ABI_VERSION == {}, \"snacc compiler/runtime ABI version mismatch\");\n",
+        snacc_compiler::ABI_VERSION
+    );
+    fs::write(
+        &host_path,
+        format!("{RUNTIME_SOURCE}{abi_assertion}{HOST_SUFFIX}"),
+    )
+    .map_err(|error| DriverError::Filesystem(format!("failed to write generated host: {error}")))?;
 
     let status = Command::new("rustc")
         .arg("--edition=2024")
