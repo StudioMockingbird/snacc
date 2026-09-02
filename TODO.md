@@ -39,13 +39,9 @@ no test exercises. Each one can regress silently today.
    buffers do not deadlock (this is why draining is threaded); timeout kills and
    waits for the child; a build path containing spaces still compiles and runs.
 
-6. [ ] Add `snacc-runtime` ABI coverage in `crates/snacc-runtime/tests/` for
-   each exported `snacc_print_*` symbol and the `force_link` retention
-   contract.
-
 ## Housekeeping
 
-7. [ ] After all acceptance criteria are verified, change RFCs 004, 005, and
+6. [ ] After all acceptance criteria are verified, change RFCs 004, 005, and
    006 to `Status: Closed` and move them to `docs/specs/archive/` in the same
    change. `Status: Completed` is not a permitted terminal status.
 

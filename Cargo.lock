@@ -441,6 +441,9 @@ dependencies = [
 [[package]]
 name = "snacc-runtime"
 version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "snacc-workbench"
