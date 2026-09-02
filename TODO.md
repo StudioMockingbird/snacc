@@ -35,41 +35,34 @@
 Behavior that RFCs 004-006 specified and the implementation provides, but that
 no test exercises. Each one can regress silently today.
 
-5. [ ] Make the conformance runner execute every `examples/*.nrs` with a
-   `.stdout` sidecar. `apps/snacc/tests/conformance.rs:24` reads only
-   `tests/cases/run/pass/`, and `apps/snacc-workbench/build.rs:39` checks the
-   sidecar exists without running it, so the four shipped workbench snippets are
-   unverified. Their expected output is correct as of this writing; nothing
-   keeps it correct.
-
-6. [ ] Add workbench request-rejection tests. Every control is implemented and
+5. [ ] Add workbench request-rejection tests. Every control is implemented and
    none is tested: missing or wrong session token, foreign `Origin`, mismatched
    `Host`, unsupported method (405 plus `Allow`), non-JSON `Content-Type`,
    malformed JSON, unknown JSON fields, each size limit, 429 while a run is
    active, and compile failure yielding a null `execution` object.
 
-7. [ ] Add workbench process tests: supplied stdin reaches a helper child and
+6. [ ] Add workbench process tests: supplied stdin reaches a helper child and
    then observes EOF; simultaneous stdout and stderr larger than the pipe
    buffers do not deadlock (this is why draining is threaded); timeout kills and
    waits for the child; a build path containing spaces still compiles and runs.
 
-8. [ ] Add focused `snacc-driver` tests in `crates/snacc-driver/tests/`:
+7. [ ] Add focused `snacc-driver` tests in `crates/snacc-driver/tests/`:
    structured diagnostics for invalid source, an isolated build directory per
    call, a changed source not reusing a stale executable, runtime output landing
    on stdout rather than stderr, and filesystem or missing-`rustc` failures.
 
-9. [ ] Add `snacc-runtime` ABI coverage in `crates/snacc-runtime/tests/` for
+8. [ ] Add `snacc-runtime` ABI coverage in `crates/snacc-runtime/tests/` for
    each exported `snacc_print_*` symbol and the `force_link` retention
    contract.
 
-10. [ ] Extend `tools/package-windows.ps1` so `-IncludeDirectCompiler` compiles
-    and runs a Snacc program from the staged package before publication, with no
-    repository runtime source, Cargo, registry, or network access available.
-    Verified by hand once; not automated.
+9. [ ] Extend `tools/package-windows.ps1` so `-IncludeDirectCompiler` compiles
+   and runs a Snacc program from the staged package before publication, with no
+   repository runtime source, Cargo, registry, or network access available.
+   Verified by hand once; not automated.
 
 ## Housekeeping
 
-11. [ ] After all acceptance criteria are verified, change RFCs 004, 005, and
+10. [ ] After all acceptance criteria are verified, change RFCs 004, 005, and
     006 to `Status: Closed` and move them to `docs/specs/archive/` in the same
     change. `Status: Completed` is not a permitted terminal status.
 
