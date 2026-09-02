@@ -19,14 +19,7 @@
    rejected; parameters are not. Emit the same structured diagnostic shape,
    spanned on the second occurrence.
 
-3. [ ] Make object-cache publication safe for concurrent builds.
-   `apps/cargo-snacc/src/main.rs:742` and `:757` write the fixed names
-   `app.tmp` and `manifest.tmp` in the shared cache directory before renaming.
-   Two concurrent `cargo snacc build` runs clobber each other's temporary file
-   and can publish a partially written object. Use unique temporary siblings
-   (`app.<random>.tmp`) so each writer owns its file, keeping the atomic rename.
-
-4. [ ] Use a constant-time comparison for the workbench session token.
+3. [ ] Use a constant-time comparison for the workbench session token.
    `apps/snacc-workbench/src/lib.rs:601` compares with `==` on `String`, which
    short-circuits. RFC 004's security model requires constant-time comparison.
 
@@ -35,29 +28,29 @@
 Behavior that RFCs 004-006 specified and the implementation provides, but that
 no test exercises. Each one can regress silently today.
 
-5. [ ] Add workbench request-rejection tests. Every control is implemented and
+4. [ ] Add workbench request-rejection tests. Every control is implemented and
    none is tested: missing or wrong session token, foreign `Origin`, mismatched
    `Host`, unsupported method (405 plus `Allow`), non-JSON `Content-Type`,
    malformed JSON, unknown JSON fields, each size limit, 429 while a run is
    active, and compile failure yielding a null `execution` object.
 
-6. [ ] Add workbench process tests: supplied stdin reaches a helper child and
+5. [ ] Add workbench process tests: supplied stdin reaches a helper child and
    then observes EOF; simultaneous stdout and stderr larger than the pipe
    buffers do not deadlock (this is why draining is threaded); timeout kills and
    waits for the child; a build path containing spaces still compiles and runs.
 
-7. [ ] Add focused `snacc-driver` tests in `crates/snacc-driver/tests/`:
+6. [ ] Add focused `snacc-driver` tests in `crates/snacc-driver/tests/`:
    structured diagnostics for invalid source, an isolated build directory per
    call, a changed source not reusing a stale executable, runtime output landing
    on stdout rather than stderr, and filesystem or missing-`rustc` failures.
 
-8. [ ] Add `snacc-runtime` ABI coverage in `crates/snacc-runtime/tests/` for
+7. [ ] Add `snacc-runtime` ABI coverage in `crates/snacc-runtime/tests/` for
    each exported `snacc_print_*` symbol and the `force_link` retention
    contract.
 
 ## Housekeeping
 
-9. [ ] After all acceptance criteria are verified, change RFCs 004, 005, and
+8. [ ] After all acceptance criteria are verified, change RFCs 004, 005, and
    006 to `Status: Closed` and move them to `docs/specs/archive/` in the same
    change. `Status: Completed` is not a permitted terminal status.
 
