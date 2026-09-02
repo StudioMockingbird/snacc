@@ -1,5 +1,6 @@
 use crate::Optimization;
 use crate::semantics::checker::{ArithOp, CmpOp, Program, TExpr, Ty};
+use crate::syntax::ast::NumLiteral;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::{Linkage, Module};
@@ -196,10 +197,9 @@ fn lower<'ctx>(
     expr: &TExpr,
 ) -> Result<BasicValueEnum<'ctx>, String> {
     match expr {
-        TExpr::Num(value, ty) => match ty {
-            Ty::Dec64 => Ok(context.f64_type().const_float(*value).into()),
-            Ty::Int64 => Ok(context.i64_type().const_int(*value as u64, true).into()),
-            _ => Err("numeric literal has a non-numeric type".into()),
+        TExpr::Num(literal) => match literal {
+            NumLiteral::Dec(value) => Ok(context.f64_type().const_float(*value).into()),
+            NumLiteral::Int(value) => Ok(context.i64_type().const_int(*value as u64, true).into()),
         },
         TExpr::Bool(value) => Ok(context.i8_type().const_int(*value as u64, false).into()),
         TExpr::Nil => Ok(context.i8_type().const_zero().into()),

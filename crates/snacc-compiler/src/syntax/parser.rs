@@ -15,7 +15,7 @@ where
             let val = select! {
                 Token::Nil => Expr::Value(Value::Nil),
                 Token::Bool(x) => Expr::Value(Value::Bool(x)),
-                Token::Num(n, is_float) => Expr::Value(Value::Num(n, is_float)),
+                Token::Num(n) => Expr::Value(Value::Num(n)),
                 Token::Str(s) => Expr::Value(Value::Str(s)),
             }
             .labelled("value");

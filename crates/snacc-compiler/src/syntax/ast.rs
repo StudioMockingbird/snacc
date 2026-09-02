@@ -11,13 +11,30 @@ pub enum TypeName {
     Nil,
 }
 
+/// A numeric literal's exact value, carried without ever passing through
+/// `f64` for an integer literal (see TODO item on Int64 precision).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NumLiteral {
+    Int(i64),
+    Dec(f64),
+}
+
+impl std::fmt::Display for NumLiteral {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::Int(x) => write!(f, "{x}"),
+            Self::Dec(x) => write!(f, "{x}"),
+        }
+    }
+}
+
 /// Syntax retains unsupported literal forms so type checking can own their
 /// diagnostics instead of leaking them into the backend.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value<'src> {
     Nil,
     Bool(bool),
-    Num(f64, bool),
+    Num(NumLiteral),
     Str(&'src str),
 }
 
@@ -26,7 +43,7 @@ impl std::fmt::Display for Value<'_> {
         match self {
             Self::Nil => write!(f, "nil"),
             Self::Bool(x) => write!(f, "{x}"),
-            Self::Num(x, _) => write!(f, "{x}"),
+            Self::Num(x) => write!(f, "{x}"),
             Self::Str(x) => write!(f, "{x}"),
         }
     }

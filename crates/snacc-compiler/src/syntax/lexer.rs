@@ -1,11 +1,11 @@
-use crate::syntax::ast::{Span, Spanned};
+use crate::syntax::ast::{NumLiteral, Span, Spanned};
 use chumsky::prelude::*;
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Token<'src> {
     Bool(bool),
-    Num(f64, bool),
+    Num(NumLiteral),
     Str(&'src str),
     Op(&'src str),
     Ctrl(char),
@@ -33,7 +33,7 @@ impl fmt::Display for Token<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Token::Bool(x) => write!(f, "{x}"),
-            Token::Num(n, _) => write!(f, "{n}"),
+            Token::Num(n) => write!(f, "{n}"),
             Token::Str(s) => write!(f, "{s}"),
             Token::Op(s) => write!(f, "{s}"),
             Token::Ctrl(c) => write!(f, "{c}"),
@@ -64,9 +64,23 @@ pub fn lexer<'src>()
     let num = text::int(10)
         .then(just('.').then(text::digits(10)).or_not())
         .to_slice()
-        .map(|slice: &str| {
-            let value = slice.parse::<f64>().expect("lexer produced a valid number");
-            Token::Num(value, slice.contains('.'))
+        .try_map(|slice: &str, span| {
+            if slice.contains('.') {
+                let value = slice
+                    .parse::<f64>()
+                    .expect("lexer produced a valid decimal");
+                Ok(Token::Num(NumLiteral::Dec(value)))
+            } else {
+                match slice.parse::<u64>() {
+                    Ok(value) if value <= i64::MAX as u64 => {
+                        Ok(Token::Num(NumLiteral::Int(value as i64)))
+                    }
+                    _ => Err(Rich::custom(
+                        span,
+                        format!("integer literal '{slice}' is out of range for Int64"),
+                    )),
+                }
+            }
         });
 
     let str_ = just('"')

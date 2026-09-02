@@ -1,4 +1,6 @@
-use crate::syntax::ast::{BinaryOp, Expr, Program as AstProgram, Span, Spanned, TypeName, Value};
+use crate::syntax::ast::{
+    BinaryOp, Expr, NumLiteral, Param, Program as AstProgram, Span, Spanned, TypeName, Value,
+};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,7 +73,7 @@ pub enum CmpOp {
 }
 
 pub enum TExpr {
-    Num(f64, Ty),
+    Num(NumLiteral),
     Bool(bool),
     Nil,
     Local(String),
@@ -125,6 +127,7 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
     };
 
     for (name, function) in &program.funcs {
+        check_duplicate_params(&mut ctx, &function.args);
         let params = function.args.iter().map(|param| param.ty.into()).collect();
         ctx.sigs.insert(
             *name,
@@ -135,6 +138,7 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
         );
     }
     for (name, function) in &program.externs {
+        check_duplicate_params(&mut ctx, &function.args);
         let params = function.args.iter().map(|param| param.ty.into()).collect();
         ctx.sigs.insert(
             *name,
@@ -214,6 +218,20 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
     }
 }
 
+fn check_duplicate_params(ctx: &mut Ctx<'_>, params: &[Param<'_>]) {
+    let mut seen: Vec<&str> = Vec::new();
+    for param in params {
+        if seen.contains(&param.name) {
+            ctx.errors.push(Error {
+                span: param.span,
+                msg: format!("Parameter '{}' already exists", param.name),
+            });
+        } else {
+            seen.push(param.name);
+        }
+    }
+}
+
 fn is_rust_identifier(symbol: &str) -> bool {
     let mut chars = symbol.chars();
     match chars.next() {
@@ -262,11 +280,14 @@ fn check_expr<'src>(
     match &expression.0 {
         Expr::Error => {
             ctx.unknown = Some("a parser recovery node escaped into type checking");
-            (TExpr::Num(0.0, Ty::Int64), Ty::Int64)
+            (TExpr::Num(NumLiteral::Int(0)), Ty::Int64)
         }
-        Expr::Value(Value::Num(value, is_float)) => {
-            let ty = if *is_float { Ty::Dec64 } else { Ty::Int64 };
-            (TExpr::Num(*value, ty), ty)
+        Expr::Value(Value::Num(literal)) => {
+            let ty = match literal {
+                NumLiteral::Int(_) => Ty::Int64,
+                NumLiteral::Dec(_) => Ty::Dec64,
+            };
+            (TExpr::Num(*literal), ty)
         }
         Expr::Value(Value::Bool(value)) => (TExpr::Bool(*value), Ty::Bool),
         Expr::Value(Value::Nil) => (TExpr::Nil, Ty::Nil),
@@ -551,6 +572,39 @@ mod tests {
     #[test]
     fn accepts_bridge_symbols_with_digits_and_underscores() {
         let source = "extern rust \"snacc_user_v2_ok\" fun ok(): Nil\nprint(0)";
+        let syntax = crate::parse(source).expect("declaration should parse");
+        assert!(check(&syntax).is_ok());
+    }
+
+    #[test]
+    fn rejects_duplicate_function_parameter_names() {
+        let source = "fun f(a: Int64, a: Int64): Int64 do a end";
+        let syntax = crate::parse(source).expect("declaration should parse");
+        let second_a = source.find(", a: Int64)").map(|i| i + 2).unwrap();
+        match check(&syntax) {
+            Err(Failure::Source(errors)) => {
+                let error = errors
+                    .iter()
+                    .find(|error| error.msg.contains("Parameter 'a' already exists"))
+                    .unwrap_or_else(|| {
+                        panic!("expected a duplicate-parameter diagnostic, got: {errors:?}")
+                    });
+                assert_eq!(
+                    error.span.start, second_a,
+                    "diagnostic should span the second 'a'"
+                );
+                assert_eq!(error.span.end, second_a + 1);
+            }
+            Ok(_) => panic!("duplicate parameter names should fail type checking"),
+            Err(Failure::Unknown(detail)) => {
+                panic!("duplicate parameter names should fail type checking, got: {detail}")
+            }
+        }
+    }
+
+    #[test]
+    fn accepts_functions_with_distinct_parameter_names() {
+        let source = "fun f(a: Int64, b: Int64): Int64 do a + b end";
         let syntax = crate::parse(source).expect("declaration should parse");
         assert!(check(&syntax).is_ok());
     }
