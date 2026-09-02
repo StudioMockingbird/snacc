@@ -865,6 +865,11 @@ fn rust_abi_type(ty: Ty) -> &'static str {
         Ty::Int64 => "i64",
         Ty::Dec64 => "f64",
         Ty::Bool | Ty::Nil => "u8",
+        Ty::UInt8 => "u8",
+        Ty::UInt16 => "u16",
+        Ty::UInt32 => "u32",
+        Ty::UInt64 => "u64",
+        Ty::Float32 => "f32",
     }
 }
 

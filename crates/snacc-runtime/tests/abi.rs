@@ -18,8 +18,8 @@ use std::{
 use tempfile::TempDir;
 
 #[test]
-fn runtime_implements_abi_version_two() {
-    assert_eq!(snacc_runtime::ABI_VERSION, 2);
+fn runtime_implements_abi_version_three() {
+    assert_eq!(snacc_runtime::ABI_VERSION, 3);
 }
 
 fn run(command: &mut Command, what: &str) -> Output {
@@ -43,7 +43,7 @@ fn run(command: &mut Command, what: &str) -> Output {
 const RUNTIME_SOURCE: &str = include_str!("../src/lib.rs");
 
 /// Appended to `RUNTIME_SOURCE` so one compiled probe binary can exercise
-/// any of the four print symbols by argv, e.g. `probe f64 1.5` or `probe nil`.
+/// any of the nine print symbols by argv, e.g. `probe f64 1.5` or `probe nil`.
 /// Calling a `pub extern "C" fn` directly by name (not through an FFI
 /// declaration) is ordinary, safe Rust -- no `unsafe` required.
 const PROBE_MAIN: &str = r#"
@@ -56,6 +56,11 @@ fn main() {
         "i64" => snacc_print_i64(args.next().expect("missing value").parse().expect("invalid i64")),
         "bool" => snacc_print_bool(args.next().expect("missing value").parse().expect("invalid u8")),
         "nil" => snacc_print_nil(),
+        "u8" => snacc_print_u8(args.next().expect("missing value").parse().expect("invalid u8")),
+        "u16" => snacc_print_u16(args.next().expect("missing value").parse().expect("invalid u16")),
+        "u32" => snacc_print_u32(args.next().expect("missing value").parse().expect("invalid u32")),
+        "u64" => snacc_print_u64(args.next().expect("missing value").parse().expect("invalid u64")),
+        "f32" => snacc_print_f32(args.next().expect("missing value").parse().expect("invalid f32")),
         other => panic!("unknown selector: {other}"),
     }
 }
@@ -127,12 +132,46 @@ fn snacc_print_nil_always_prints_nil() {
     assert_eq!(probe_stdout(&["nil"]), "nil\n");
 }
 
+#[test]
+fn snacc_print_u8_uses_default_u8_display() {
+    assert_eq!(probe_stdout(&["u8", "0"]), "0\n");
+    assert_eq!(probe_stdout(&["u8", "255"]), "255\n");
+}
+
+#[test]
+fn snacc_print_u16_uses_default_u16_display() {
+    assert_eq!(probe_stdout(&["u16", "0"]), "0\n");
+    assert_eq!(probe_stdout(&["u16", "65535"]), "65535\n");
+}
+
+#[test]
+fn snacc_print_u32_uses_default_u32_display() {
+    assert_eq!(probe_stdout(&["u32", "0"]), "0\n");
+    assert_eq!(probe_stdout(&["u32", "4294967295"]), "4294967295\n");
+}
+
+#[test]
+fn snacc_print_u64_uses_default_u64_display() {
+    assert_eq!(probe_stdout(&["u64", "0"]), "0\n");
+    assert_eq!(
+        probe_stdout(&["u64", &u64::MAX.to_string()]),
+        "18446744073709551615\n"
+    );
+}
+
+#[test]
+fn snacc_print_f32_uses_default_f32_display() {
+    assert_eq!(probe_stdout(&["f32", "1.5"]), "1.5\n");
+    assert_eq!(probe_stdout(&["f32", "0.0"]), "0\n");
+    assert_eq!(probe_stdout(&["f32", "-3.25"]), "-3.25\n");
+}
+
 // ---------------------------------------------------------------------
 // force_link retention contract
 // ---------------------------------------------------------------------
 
 /// Stands in for the object file the LLVM backend emits: undefined
-/// references to all four print symbols, called from one exported entry
+/// references to all nine print symbols, called from one exported entry
 /// point that a host can invoke without knowing anything else about it.
 const FAKE_OBJECT_SOURCE: &str = r#"
 unsafe extern "C" {
@@ -140,6 +179,11 @@ unsafe extern "C" {
     fn snacc_print_i64(value: i64);
     fn snacc_print_bool(value: u8);
     fn snacc_print_nil();
+    fn snacc_print_u8(value: u8);
+    fn snacc_print_u16(value: u16);
+    fn snacc_print_u32(value: u32);
+    fn snacc_print_u64(value: u64);
+    fn snacc_print_f32(value: f32);
 }
 
 #[unsafe(no_mangle)]
@@ -149,6 +193,11 @@ pub extern "C" fn probe_entry() {
         snacc_print_i64(-42);
         snacc_print_bool(1);
         snacc_print_nil();
+        snacc_print_u8(255);
+        snacc_print_u16(65535);
+        snacc_print_u32(4294967295);
+        snacc_print_u64(18446744073709551615);
+        snacc_print_f32(2.5);
     }
 }
 "#;
@@ -171,7 +220,7 @@ fn main() {
 /// Proves the actual property `force_link` exists to guarantee: a host that
 /// touches `snacc-runtime` only by calling `force_link()` still lets an
 /// externally linked native object resolve, call, and correctly observe all
-/// four `snacc_print_*` symbols across a real link -- not just that
+/// nine `snacc_print_*` symbols across a real link -- not just that
 /// `force_link()` runs without panicking.
 ///
 /// This builds `snacc-runtime` as a standalone `.rlib` (the same separately
@@ -197,7 +246,7 @@ fn main() {
 /// undefined references are known -- is a property of some linkers (e.g.
 /// classic GNU `ld`), not of MSVC's.
 #[test]
-fn force_link_retains_all_four_print_symbols_through_a_real_link() {
+fn force_link_retains_all_nine_print_symbols_through_a_real_link() {
     let dir = tempfile::Builder::new()
         .prefix("snacc-runtime-force-link-")
         .tempdir()
@@ -253,5 +302,8 @@ fn force_link_retains_all_four_print_symbols_through_a_real_link() {
         "running the force_link-only host",
     );
     let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
-    assert_eq!(stdout, "1.5\n-42\ntrue\nnil\n");
+    assert_eq!(
+        stdout,
+        "1.5\n-42\ntrue\nnil\n255\n65535\n4294967295\n18446744073709551615\n2.5\n"
+    );
 }

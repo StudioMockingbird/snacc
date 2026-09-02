@@ -639,6 +639,46 @@ fn abi_1_cache_manifests_are_never_reused_after_the_abi_2_bump() {
     );
 }
 
+/// Specification 009 conformance 16: an ABI version 2 cache object (the
+/// version predating this milestone's ABI 3 bump) is not reused once the
+/// compiler declares ABI version 3.
+#[test]
+fn abi_2_cache_manifests_are_never_reused_after_the_abi_3_bump() {
+    let target = tempfile::tempdir().expect("failed to create fixture target directory");
+    let build = cargo_snacc(target.path(), &["build", "--offline", "--verbose"]);
+    assert!(
+        build.status.success(),
+        "build failed:\n{}",
+        combined(&build)
+    );
+
+    let manifest_path = find_manifest(&target.path().join("snacc"))
+        .expect("content-addressed cache manifest was not written");
+    let encoded = fs::read_to_string(&manifest_path).unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    // Simulate a cache object published by an ABI-2 build (RFC008's ABI, the
+    // version this milestone bumps from).
+    manifest["abi_version"] = serde_json::json!(2);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let rebuilt = cargo_snacc(target.path(), &["build", "--offline", "--verbose"]);
+    assert!(
+        rebuilt.status.success(),
+        "rebuild failed:\n{}",
+        combined(&rebuilt)
+    );
+    assert!(
+        String::from_utf8_lossy(&rebuilt.stdout).contains("Snacc object rebuilt"),
+        "an ABI-2 cache manifest must not be reused for an ABI-{}-build:\n{}",
+        snacc_compiler::ABI_VERSION,
+        combined(&rebuilt)
+    );
+}
+
 #[test]
 fn each_bridge_type_round_trips_through_a_parameter_and_a_result() {
     let workspace = tempfile::tempdir().expect("failed to create workspace");
@@ -685,6 +725,94 @@ fn each_bridge_type_round_trips_through_a_parameter_and_a_result() {
     assert!(stdout.lines().any(|line| line == "1.5"));
     assert!(stdout.lines().any(|line| line == "true"));
     assert!(stdout.lines().any(|line| line == "nil"));
+}
+
+/// Specification 009 conformance 12-13: every ABI version 3 addition
+/// (`UInt8`/`UInt16`/`UInt32`/`UInt64`/`Float32`) round-trips through a real
+/// bridge parameter and result, and the generated Rust assertion signature
+/// uses the exact mapping from spec section 5.2. `UInt8` and `UInt16` are
+/// exercised at their maxima so a missing `zeroext` attribute on either the
+/// declaration or the call site cannot pass unnoticed (spec section 8 phase 3
+/// step 5).
+#[test]
+fn each_new_scalar_type_round_trips_through_a_bridge_parameter_and_a_result() {
+    let workspace = tempfile::tempdir().expect("failed to create workspace");
+    let package = workspace.path().join("package");
+    copy_fixture_to(&package);
+    fs::write(
+        package.join("src/main.nrs"),
+        concat!(
+            "extern rust \"snacc_user_echo_u8\" fun echo_u8(value: UInt8): UInt8\n",
+            "extern rust \"snacc_user_echo_u16\" fun echo_u16(value: UInt16): UInt16\n",
+            "extern rust \"snacc_user_echo_u32\" fun echo_u32(value: UInt32): UInt32\n",
+            "extern rust \"snacc_user_echo_u64\" fun echo_u64(value: UInt64): UInt64\n",
+            "extern rust \"snacc_user_echo_f32\" fun echo_f32(value: Float32): Float32\n",
+            "print(echo_u8(255u8))\n",
+            "print(echo_u16(65535u16))\n",
+            "print(echo_u32(4294967295u32))\n",
+            "print(echo_u64(18446744073709551615u64))\n",
+            "print(echo_f32(1.5f32))\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        package.join("src/interop.rs"),
+        concat!(
+            "#[unsafe(no_mangle)]\n",
+            "pub extern \"C\" fn snacc_user_echo_u8(value: u8) -> u8 { value }\n\n",
+            "#[unsafe(no_mangle)]\n",
+            "pub extern \"C\" fn snacc_user_echo_u16(value: u16) -> u16 { value }\n\n",
+            "#[unsafe(no_mangle)]\n",
+            "pub extern \"C\" fn snacc_user_echo_u32(value: u32) -> u32 { value }\n\n",
+            "#[unsafe(no_mangle)]\n",
+            "pub extern \"C\" fn snacc_user_echo_u64(value: u64) -> u64 { value }\n\n",
+            "#[unsafe(no_mangle)]\n",
+            "pub extern \"C\" fn snacc_user_echo_f32(value: f32) -> f32 { value }\n",
+        ),
+    )
+    .unwrap();
+
+    let target = tempfile::tempdir().expect("failed to create fixture target directory");
+    let output = cargo_snacc_at(target.path(), &package, &["run", "--offline"]);
+    assert!(
+        output.status.success(),
+        "a bridge using every ABI version 3 addition should build and run:\n{}",
+        combined(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    assert!(stdout.lines().any(|line| line == "255"));
+    assert!(stdout.lines().any(|line| line == "65535"));
+    assert!(stdout.lines().any(|line| line == "4294967295"));
+    assert!(stdout.lines().any(|line| line == "18446744073709551615"));
+    assert!(stdout.lines().any(|line| line == "1.5"));
+
+    let bridges_dir = target.path().join("snacc").join("bridges");
+    let entries: Vec<_> = fs::read_dir(&bridges_dir)
+        .expect("bridges directory was not created")
+        .filter_map(|entry| entry.ok())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    let content = fs::read_to_string(entries[0].path()).unwrap();
+    assert!(
+        content.contains("fn(u8) -> u8"),
+        "missing UInt8 mapping:\n{content}"
+    );
+    assert!(
+        content.contains("fn(u16) -> u16"),
+        "missing UInt16 mapping:\n{content}"
+    );
+    assert!(
+        content.contains("fn(u32) -> u32"),
+        "missing UInt32 mapping:\n{content}"
+    );
+    assert!(
+        content.contains("fn(u64) -> u64"),
+        "missing UInt64 mapping:\n{content}"
+    );
+    assert!(
+        content.contains("fn(f32) -> f32"),
+        "missing Float32 mapping:\n{content}"
+    );
 }
 
 #[test]

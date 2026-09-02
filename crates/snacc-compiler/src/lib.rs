@@ -10,7 +10,7 @@ pub use semantics::checker::{Program, Ty};
 pub use syntax::ast::Program as AstProgram;
 
 /// Contract version for generated objects, runtime imports, and Rust bridges.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Optimization {
