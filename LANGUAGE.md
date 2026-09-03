@@ -7,14 +7,31 @@ program              = { top-level-declaration | block-element } ;
 
 top-level-declaration
                      = function-declaration
-                     | rust-declaration ;
+                     | rust-declaration
+                     | type-declaration
+                     | method-declaration ;
 
-function-declaration = "fun", identifier, parameters, [ ":", builtin-value-type ], "do",
+function-declaration = "fun", identifier, parameters, [ ":", type ], "do",
                        block, "end" ;
 rust-declaration     = "extern", "rust", string-literal, "fun", identifier,
-                       parameters, [ ":", builtin-value-type ] ;
+                       parameters, [ ":", type ] ;
+method-declaration   = "method", qualified-name, parameters, [ ":", type ],
+                       "do", block, "end" ;
 parameters           = "(", [ parameter, { ",", parameter }, [ "," ] ], ")" ;
-parameter            = identifier, ":", builtin-value-type ;
+parameter            = identifier, ":", type ;
+
+type-declaration     = "type", identifier, "is", type-body ;
+type-body            = type
+                     | struct-body
+                     | union-body ;
+struct-body          = "struct", { field-declaration }, "end" ;
+field-declaration    = identifier, ":", type, [ "," ] ;
+union-body           = "union", union-member, { union-member }, "end" ;
+union-member         = "|", ( "Nil"
+                     | identifier, [ "is", struct-body ] ) ;
+
+qualified-name       = identifier, { ".", identifier } ;
+type                 = builtin-value-type | qualified-name ;
 unsigned-type        = "UInt8" | "UInt16" | "UInt32" | "UInt64" ;
 builtin-value-type   = "Int64" | "Dec64" | "Bool" | "Nil"
                      | unsigned-type
@@ -28,26 +45,34 @@ block-element        = variable-declaration
                      | if-form
                      | expression ;
 
-variable-declaration = "let", [ "mut" ], identifier, ":", builtin-value-type,
+variable-declaration = "let", [ "mut" ], identifier, ":", type,
                        "=", expression ;
-assignment           = identifier, "=", expression ;
+place                = ( identifier | "self" ), { ".", identifier } ;
+assignment           = place, "=", expression ;
 
 while-statement      = "while", expression, "do", block, "end" ;
 break-statement      = "break" ;
-if-form              = "if", expression, "then", block,
-                       { "elseif", expression, "then", block },
+if-form              = "if", condition, "then", block,
+                       { "elseif", condition, "then", block },
                        [ "else", block ], "end" ;
+condition            = type-test | expression ;
+type-test            = place, "is", ( qualified-name | "Nil" ),
+                       [ "(", identifier, ")" ] ;
 
 expression           = comparison ;
 comparison           = additive, { comparison-operator, additive } ;
 comparison-operator  = "==" | "!=" | "<" | "<=" | ">" | ">=" ;
 additive             = multiplicative, { ( "+" | "-" ), multiplicative } ;
 multiplicative       = postfix, { ( "*" | "/" ), postfix } ;
-postfix              = atom, { arguments } ;
-arguments            = "(", [ expression, { ",", expression }, [ "," ] ], ")" ;
+postfix              = atom, { arguments | member-suffix } ;
+member-suffix        = ".", identifier, [ arguments ] ;
+arguments            = "(", [ argument, { ",", argument }, [ "," ] ], ")" ;
+argument             = [ identifier, ":" ], expression ;
 
 atom                 = literal
                      | identifier
+                     | "self"
+                     | builtin-value-type
                      | list-literal
                      | print-expression
                      | "(", expression, ")" ;
@@ -80,37 +105,48 @@ digit                = "0" | "1" | "2" | "3" | "4"
    immediately followed by an ASCII letter, digit, or underscore that does not
    complete one of the literal forms above is one invalid token, not a valid
    number followed by an identifier; thus `1u8` and `1.0f32` are valid, while
-   `1u9`, `1u8x`, `1f64`, and `1.0u8` are lexical errors. *)
+   `1u9`, `1u8x`, `1f64`, and `1.0u8` are lexical errors. A `builtin-value-type`
+   is an atom only as a call head, where it removes one represented-type layer
+   (`Int64(id)`); a type name alone is never a value. The grammar admits a named
+   type wherever a `type` appears, including a Rust bridge signature; that a
+   user-defined type may not cross the bridge is a semantic rule, diagnosed by
+   the checker. *)
 ```
 
 String escapes do not exist.
 
-The keywords `fun`, `extern`, `rust`, `let`, `print`, `if`, `then`, `elseif`,
-`else`, `while`, `do`, `break`, `end`, `true`, `false`, `nil`, `null`,
-`Int64`, `Dec64`, `Bool`, `Nil`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, and
-`Float32` are reserved. `mut` is not a reserved keyword; it is recognized only
-in the fixed position immediately after `let`.
-Operators of the same precedence associate left to right. Calls bind more
-tightly than arithmetic, arithmetic binds more tightly than comparison, and
-multiplication and division bind more tightly than addition and subtraction.
-There are no unary operators.
+The keywords `fun`, `extern`, `rust`, `let`, `mut`, `print`, `if`, `then`,
+`elseif`, `else`, `while`, `do`, `break`, `end`, `true`, `false`, `nil`,
+`null`, `type`, `is`, `struct`, `union`, `method`, `self`, `Int64`, `Dec64`,
+`Bool`, `Nil`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, and `Float32` are
+reserved and cannot be used as identifiers.
+Operators of the same precedence associate left to right. Calls, field access,
+and method calls bind more tightly than arithmetic, arithmetic binds more
+tightly than comparison, and multiplication and division bind more tightly
+than addition and subtraction. There are no unary operators.
 
 ## Program structure
 
-A program is a sequence of top-level declarations (functions and Rust bridge
-declarations) interleaved with top-level block elements, in any order.
-Top-level block elements execute in source order; a top-level expression's
-value is discarded. A successful program entry returns process status zero.
+A program is a sequence of top-level declarations (functions, Rust bridge
+declarations, type declarations, and method declarations) interleaved with
+top-level block elements, in any order. Top-level block elements execute in
+source order; a top-level expression's value is discarded. A successful program
+entry returns process status zero.
 
 Function and bridge names share one namespace and must be unique. Each
 external link symbol must also be unique. Parameter names within one
 declaration must be unique. Declarations are visible throughout the program,
 independent of source order, so forward calls and recursion are valid.
 
-Functions are top-level only. A function can read its parameters and lexical
-`let` bindings, but not top-level block values or another function's locals.
-Functions are not values: a call target must be a declared function or bridge
-name.
+Type names occupy a namespace separate from local bindings, and a top-level
+type name must be unique among built-in and user-defined type names. Because a
+bare type constructor and a function call are both written `name(...)`, a
+top-level type name must not duplicate a function or bridge name.
+
+Functions and methods are top-level only. A function can read its parameters
+and lexical `let` bindings, but not top-level block values or another
+function's locals. Functions and methods are not values: a call target must be
+a declared function, bridge, type, or a method reached through a receiver.
 
 ## Types and values
 
@@ -142,9 +178,11 @@ returning a value duplicates its bits and transfers no resource ownership.
 String and list forms are reserved syntax. A conforming compiler must diagnose
 either form as unsupported before native-code generation.
 
-Every parameter, function result, and local binding has an explicit type. The
-only implicit conversion is `Int64` to `Dec64`. It applies to bindings, function
-arguments and results, numeric operands, and branches. No conversion to or from
+Every parameter, function result, method result, field, and local binding has
+an explicit type. There are exactly two implicit conversions: `Int64` to
+`Dec64`, and a direct union member to its containing union. Both apply to
+bindings, arguments, results, and branches; the numeric one also applies to
+operands. No conversion to or from
 `Bool` or `Nil` exists. `UInt8`, `UInt16`, `UInt32`, `UInt64`, and `Float32`
 participate in no implicit conversion at all: not to or from `Int64`, not to
 or from `Dec64`, not to or from each other, and not to or from `Bool` or
@@ -152,9 +190,259 @@ or from `Dec64`, not to or from each other, and not to or from `Bool` or
 one of these five types requires an exact type match; `let byte: UInt8 = 1`
 is a type error, not a contextual reinterpretation of the literal.
 
-No result is not a type. A function or Rust bridge that omits its result type
-produces no result: it cannot be written, stored, passed, returned, or
-compared, and it is distinct from `Nil`.
+No result is not a type. A function, method, or Rust bridge that omits its
+result type produces no result: it cannot be written, stored, passed,
+returned, or compared, and it is distinct from `Nil`.
+
+## User-defined types
+
+One declaration family, `type Name is ...`, introduces nominal represented
+types, structs, and unions. Every user-defined type has nominal identity and a
+finite, compiler-known value layout. A represented type, struct field, or union
+member must not contain itself directly or through a cycle; recursive types
+require an indirection facility that does not exist yet and are rejected before
+lowering. There is no enum, class, inheritance, pointer, or separate `match`
+construct.
+
+`print` does not accept a represented, struct, member, or union value. A
+program prints their scalar fields or explicitly unwraps a represented scalar.
+No user-defined type has an implicit zero value.
+
+### Represented types
+
+~~~snacc
+type UserId is Int64
+let id: UserId = UserId(42)
+print(Int64(id))
+~~~
+
+`UserId` is distinct from `Int64` and from every other type represented by
+`Int64`. It has the same representable values, size, and alignment as its
+immediate representation, but representation identity does not make the two
+assignable. Represented types are not aliases: they do not inherit arithmetic,
+ordered comparison, fields, or methods.
+
+Wrapping and unwrapping are explicit and remove exactly one layer.
+`Name(value)` requires a value of the immediate representation type;
+`Immediate(value)` recovers it. Two values of one represented type support `==`
+and `!=` when the represented type does; the comparison is the representation's.
+
+### Structs
+
+~~~snacc
+type Point is struct
+    x: Dec64,
+    y: Dec64,
+end
+
+type Marker is struct end
+~~~
+
+A struct contains its declared fields in declaration order, and field names are
+unique within the struct. A field's type is fixed by its declaration. Fields are
+readable everywhere; there is no visibility boundary, and field access invokes
+no code.
+
+A struct value is constructed by calling its type with named arguments. Every
+declared field must occur exactly once; missing, duplicate, and unknown field
+names are errors, and positional construction of a non-empty struct is invalid.
+Argument order does not select fields, but argument expressions still evaluate
+from left to right in written order.
+
+~~~snacc
+let point: Point = Point(y: 4.0, x: 3.0)
+print(point.x)
+~~~
+
+An empty struct is valid, has exactly one value, and is constructed with an
+empty argument list (`Marker()`); the parentheses are required, because a type
+name alone is never a value.
+
+Structs are values without object identity: binding, passing, returning, and
+union injection copy the complete value. Two values of the same struct type
+support `==` and `!=` when every field type does; fields compare in declaration
+order with short-circuiting, and all values of one empty struct type are equal.
+Different nominal struct types never compare, even with identical fields.
+Structs support no ordered comparison and no arithmetic.
+
+Fields declare no mutability of their own. Whether `point.x = 5.0` is legal is
+decided entirely by the root variable, exactly as “Declarations and assignment”
+describes.
+
+### Unions
+
+~~~snacc
+type Shape is union
+    | Circle is struct
+        radius: Int64,
+      end
+    | Rectangle is struct
+        length: Int64,
+        width: Int64,
+      end
+end
+
+type Direction is union
+    | East
+    | West
+end
+~~~
+
+Every union member declares a new type inside that union's namespace, so the
+first declaration creates `Shape`, `Shape.Circle`, and `Shape.Rectangle`, and
+never a top-level `Circle`. A member name is unique within its union. A bare
+member is exactly shorthand for an empty struct member: `| East` means
+`| East is struct end`. A member is either a bare or an inline struct; it does
+not name an unrelated existing type and does not nest a second union. A union
+may also declare the member `| Nil`, which carries no value and is the type of
+the contextual literal `nil` in a position expecting that union.
+
+A union value contains exactly one direct member value and a tag identifying
+that member's type. Construction always names the member type, never the union:
+`Shape.Circle(radius: 10)` is valid and `Shape(value)` is not. A value of
+`Shape.Circle` is implicitly assignable to `Shape` in bindings, arguments,
+results, and branch unification. There is no implicit conversion from a union
+to a member, and no member is assignable to a different union.
+
+Two values of the same union type support `==` and `!=` when every member type
+does. Values with different tags are unequal; values with the same tag compare
+their contained member values. A union never compares directly with one of its
+member types. Unions support no ordered comparison and no arithmetic.
+
+A bare member remains a nominal empty type. The language assigns no integer
+discriminant, permits no conversion between a member and an integer, and adds
+no enum declaration category. The runtime tag is unobservable except through a
+type test.
+
+### Methods and `self`
+
+~~~snacc
+method Point.length_squared(): Dec64 do
+    self.x * self.x + self.y * self.y
+end
+
+method Point.translate(dx: Dec64, dy: Dec64) do
+    self.x = self.x + dx
+    self.y = self.y + dy
+end
+
+method Shape.Circle.area(): Int64 do
+    self.radius * self.radius
+end
+~~~
+
+A method's qualified name is a receiver type path followed by exactly one
+method name, so a top-level receiver uses two components and a union-member
+receiver uses three. A method must be declared in the same program as its
+receiver type, is visible independent of declaration order, and its name is
+unique for that receiver; there are no overloads. Two receiver types may reuse
+one method name. Methods and fields have separate roles, and `value.name`
+without `()` always denotes a field, never a method value.
+
+Every method has exactly one implicit receiver named `self`. `self` is a
+keyword: it cannot be renamed, declared as a local, or used outside a method
+body, and there is no `method mut` form or source-level mutable-method
+category. `self` denotes the original receiver storage for the call, so a
+method may assign to `self` as a whole or through its fields:
+
+~~~snacc
+method Point.reset() do
+    self = Point(x: 0.0, y: 0.0)
+end
+~~~
+
+`receiver.name(arguments)` resolves statically from the receiver's exact
+nominal type. It is never virtual and performs no runtime member search. The
+receiver expression evaluates once, before the explicit arguments, which then
+evaluate left to right. At a call head, a qualified path whose first component
+resolves to an in-scope local, parameter, or `self` is a receiver access;
+otherwise the path resolves as a type constructor or top-level callable. This
+rule is independent of capitalization. A bare `name(...)` never calls a local,
+because Snacc has no function values.
+
+A method that only reads `self` may be called on a variable or a temporary. A
+method that may assign through `self` — including through methods it calls —
+requires a mutable receiver root and therefore cannot be called on a temporary
+or on a plain `let` binding:
+
+~~~snacc
+let point: Point = Point(x: 3.0, y: 4.0)
+print(point.length_squared())
+point.translate(1.0, 2.0) // error: point is an immutable root
+
+let mut movable: Point = Point(x: 3.0, y: 4.0)
+movable.translate(1.0, 2.0)
+~~~
+
+Whether a method may write through `self` is an internal fact used only to
+validate call sites. It is not a distinct kind of method, a source annotation,
+or an overload dimension. A method with `: T` returns a value assignable to
+`T`; a method with no result type produces no result and its call is valid only
+in a statement position. Methods are internal declarations: they are never
+exported and `extern rust` has no method form. Methods cannot be nested and
+cannot capture lexical state.
+
+Methods on a union receive the union value. A member method is callable only on
+that member type, ordinarily through a type-test binding.
+
+### Type tests
+
+`is` has one type-relationship meaning in declarations and in conditions. As a
+condition, `place is Union.Member` tests whether the union place currently
+contains that direct member type and produces `Bool`:
+
+~~~snacc
+if direction is Direction.East then
+    east()
+else
+    west()
+end
+~~~
+
+The left side must be a place with the containing union type, and the right
+side must name a direct member of that union. Testing an unrelated type is an
+error rather than a constant `false`, and testing a value against its own
+static type is an error rather than a constant `true`. There is no general
+reflection or structural type test.
+
+`place is Union.Member(name)` additionally binds the contained member value to
+`name` when the test succeeds:
+
+~~~snacc
+if shape is Shape.Circle(circle) then
+    circle.radius * circle.radius
+elseif shape is Shape.Rectangle(rectangle) then
+    rectangle.length * rectangle.width
+end
+~~~
+
+The binding has the exact member type, is an immutable root, and is scoped to
+that branch alone: it does not exist in later conditions, later branches, or
+after the `if`, and its name must be unused everywhere else in the containing
+function or method. Binding an empty member is permitted but unnecessary.
+
+Both forms are valid only as the complete condition of an `if` or `elseif`.
+Each written condition reads its place once. A test's place may be a local, a
+parameter, `self`, or a sequence of direct field accesses rooted at one of
+them; a call result or other computed expression is not a place and must be
+bound to a name first.
+
+A value-form `if` may omit `else` only when every condition is an `is` test,
+every test names the same union-typed place, and every direct member type of
+that union appears exactly once. Such a chain is exhaustive, and the ordinary
+common-result-type rule applies across its branches. If any member is absent,
+any condition is not a qualifying type test, or the conditions inspect
+different places, a value-form chain requires `else`. Testing one member twice
+is an unreachable-branch error, and supplying `else` after covering every
+member is an unreachable-branch error in statement and value context alike.
+Adding a member to a union therefore makes every formerly exhaustive chain that
+lacks `else` fail to check until it handles the new member.
+
+### Native representation
+
+The native layout of every user-defined type is private to one compiler build.
+Source programs cannot observe size, alignment, field offsets, union tags, or
+padding, and no layout guarantee crosses a Rust bridge.
 
 ## Statements and blocks
 
@@ -207,8 +495,15 @@ total = total + count
 Assigning to a name that was not declared `mut` is an error, as is assigning
 a value not assignable to the declared type. `place = expression` is
 accepted only as a block element, never where an expression is required (an
-initializer, an argument, a condition, or a returned value). At this
-milestone an assignment or declaration target is always a bare identifier.
+initializer, an argument, a condition, or a returned value).
+
+An assignment target is a place: a root (a local, a parameter, or `self`)
+followed by zero or more field selectors. Mutability belongs to the root
+alone and reaches through the complete field path. A `let mut` local and
+`self` inside its own method are mutable roots; a plain `let` local, an
+ordinary parameter, and a type-test binding are not, and no field selector
+changes that either way. There is no field-level `mut`, and mutability is
+never a property of a type.
 
 ### `while`
 
@@ -272,12 +567,14 @@ end
 ~~~
 
 An `if` used as the final element of a value-required block is value-form: it
-must produce a value on every reachable path, so it requires an `else`
-branch. (At this milestone there is no union type to check exhaustively
-instead — every value-form `if` needs `else`.) Every reachable branch must end
-in a value-producing expression with a common assignable type; a
-declaration, assignment, `while`, `break`, or no-result call cannot supply
-that value.
+must produce a value on every reachable path, so it requires an `else` branch
+unless an exhaustive type-test chain covers every path (see “Type tests”).
+Every reachable branch must end in a value-producing expression with a common
+assignable type; a declaration, assignment, `while`, `break`, or no-result
+call cannot supply that value.
+
+Each condition of an `if` or `elseif` is either an ordinary `Bool` expression
+or a type test.
 
 ## Expressions
 
@@ -303,8 +600,9 @@ effects.
   these five types, or mixing one of them with `Int64` or `Dec64`, is a type
   error.
 - `<`, `<=`, `>`, and `>=` require numeric operands and produce `Bool`. `==` and
-  `!=` accept numeric operands, two `Bool` operands, or two `Nil` operands and
-  produce `Bool`. Mixed `Int64`/`Dec64` operands are compared as `Dec64`.
+  `!=` accept numeric operands, two `Bool` operands, two `Nil` operands, or two
+  operands of one user-defined type that supports equality, and produce `Bool`.
+  Mixed `Int64`/`Dec64` operands are compared as `Dec64`.
   `UInt8`, `UInt16`, `UInt32`, `UInt64`, and `Float32` operands must match
   exactly for ordered comparison and equality alike; unsigned comparisons use
   unsigned ordering, and `Float32` follows the same NaN rule as `Dec64` (a
@@ -319,11 +617,14 @@ effects.
   itself an expression, whose type is the declared result type. A call to a
   declaration without a result is not an expression: it is valid only as a
   block element whose value is not consumed (for example, as an argument, an
-  initializer, or an operand, it is an error).
+  initializer, or an operand, it is an error). The same rule applies to a
+  method call without a result.
+- `value.field` reads one declared field of a struct or union-member value or
+  place, and invokes no code. `receiver.name(arguments)` is a method call.
 
-A function body is a block. If the function declares a result type, the body
-is value-required and its value becomes the function result; otherwise the
-body is a no-result block.
+A function or method body is a block. If it declares a result type, the body is
+value-required and its value becomes the result; otherwise the body is a
+no-result block.
 
 ## Rust bridge
 
@@ -340,6 +641,13 @@ extern rust "snacc_user_log" fun log(value: Int64)
 
 Its Rust assertion result is `()`, and its C ABI result is `void`. Its call
 has the same no-result restriction as an internal no-result function.
+
+Represented, struct, member, and union types may not appear in an `extern rust`
+parameter or result. Their source-level representation implies no stable C ABI
+representation, and the checker rejects them while collecting declarations,
+before any body is checked. Methods are never exported and `extern rust` has no
+method form. Internal Snacc functions and methods may accept and return every
+user-defined type.
 
 The ABI representation is `i64` for `Int64`, IEEE binary64 for `Dec64`, `u8`
 for `Bool` and `Nil`, `u8`/`u16`/`u32`/`u64` for
@@ -394,6 +702,10 @@ representation `u8`; the generated Rust type assertion verifies width and ABI
 representation but cannot distinguish these three Snacc types from one
 another. Their distinct Snacc meanings remain the declaration author's
 contract.
+
+User-defined types add no ABI representation and do not change the ABI version:
+none of them may cross a Rust bridge, so every boundary contract above is
+unchanged by them.
 
 An ABI version must change when a permitted type, representation, valid-value
 rule, ownership rule, calling convention, required symbol, or required symbol

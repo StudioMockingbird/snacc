@@ -5,14 +5,31 @@ program              = { top-level-declaration | block-element } ;
 
 top-level-declaration
                      = function-declaration
-                     | rust-declaration ;
+                     | rust-declaration
+                     | type-declaration
+                     | method-declaration ;
 
-function-declaration = "fun", identifier, parameters, [ ":", builtin-value-type ], "do",
+function-declaration = "fun", identifier, parameters, [ ":", type ], "do",
                        block, "end" ;
 rust-declaration     = "extern", "rust", string-literal, "fun", identifier,
-                       parameters, [ ":", builtin-value-type ] ;
+                       parameters, [ ":", type ] ;
+method-declaration   = "method", qualified-name, parameters, [ ":", type ],
+                       "do", block, "end" ;
 parameters           = "(", [ parameter, { ",", parameter }, [ "," ] ], ")" ;
-parameter            = identifier, ":", builtin-value-type ;
+parameter            = identifier, ":", type ;
+
+type-declaration     = "type", identifier, "is", type-body ;
+type-body            = type
+                     | struct-body
+                     | union-body ;
+struct-body          = "struct", { field-declaration }, "end" ;
+field-declaration    = identifier, ":", type, [ "," ] ;
+union-body           = "union", union-member, { union-member }, "end" ;
+union-member         = "|", ( "Nil"
+                     | identifier, [ "is", struct-body ] ) ;
+
+qualified-name       = identifier, { ".", identifier } ;
+type                 = builtin-value-type | qualified-name ;
 unsigned-type        = "UInt8" | "UInt16" | "UInt32" | "UInt64" ;
 builtin-value-type   = "Int64" | "Dec64" | "Bool" | "Nil"
                      | unsigned-type
@@ -26,26 +43,34 @@ block-element        = variable-declaration
                      | if-form
                      | expression ;
 
-variable-declaration = "let", [ "mut" ], identifier, ":", builtin-value-type,
+variable-declaration = "let", [ "mut" ], identifier, ":", type,
                        "=", expression ;
-assignment           = identifier, "=", expression ;
+place                = ( identifier | "self" ), { ".", identifier } ;
+assignment           = place, "=", expression ;
 
 while-statement      = "while", expression, "do", block, "end" ;
 break-statement      = "break" ;
-if-form              = "if", expression, "then", block,
-                       { "elseif", expression, "then", block },
+if-form              = "if", condition, "then", block,
+                       { "elseif", condition, "then", block },
                        [ "else", block ], "end" ;
+condition            = type-test | expression ;
+type-test            = place, "is", ( qualified-name | "Nil" ),
+                       [ "(", identifier, ")" ] ;
 
 expression           = comparison ;
 comparison           = additive, { comparison-operator, additive } ;
 comparison-operator  = "==" | "!=" | "<" | "<=" | ">" | ">=" ;
 additive             = multiplicative, { ( "+" | "-" ), multiplicative } ;
 multiplicative       = postfix, { ( "*" | "/" ), postfix } ;
-postfix              = atom, { arguments } ;
-arguments            = "(", [ expression, { ",", expression }, [ "," ] ], ")" ;
+postfix              = atom, { arguments | member-suffix } ;
+member-suffix        = ".", identifier, [ arguments ] ;
+arguments            = "(", [ argument, { ",", argument }, [ "," ] ], ")" ;
+argument             = [ identifier, ":" ], expression ;
 
 atom                 = literal
                      | identifier
+                     | "self"
+                     | builtin-value-type
                      | list-literal
                      | print-expression
                      | "(", expression, ")" ;
@@ -78,4 +103,9 @@ digit                = "0" | "1" | "2" | "3" | "4"
    immediately followed by an ASCII letter, digit, or underscore that does not
    complete one of the literal forms above is one invalid token, not a valid
    number followed by an identifier; thus `1u8` and `1.0f32` are valid, while
-   `1u9`, `1u8x`, `1f64`, and `1.0u8` are lexical errors. *)
+   `1u9`, `1u8x`, `1f64`, and `1.0u8` are lexical errors. A `builtin-value-type`
+   is an atom only as a call head, where it removes one represented-type layer
+   (`Int64(id)`); a type name alone is never a value. The grammar admits a named
+   type wherever a `type` appears, including a Rust bridge signature; that a
+   user-defined type may not cross the bridge is a semantic rule, diagnosed by
+   the checker. *)
