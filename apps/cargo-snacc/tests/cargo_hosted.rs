@@ -216,6 +216,7 @@ fn init_creates_the_complete_host_contract() {
     let manifest = fs::read_to_string(package.join("Cargo.toml")).unwrap();
     assert!(manifest.contains("schema-version = 1"));
     assert!(manifest.contains("snacc-runtime = \"0.1\""));
+    assert!(manifest.contains("ferris-says = \"=0.3.2\""));
     assert!(manifest.contains("check-cfg"));
     assert!(package.join("src/main.nrs").is_file());
     assert!(package.join("src/interop.rs").is_file());
@@ -223,6 +224,53 @@ fn init_creates_the_complete_host_contract() {
     assert!(host.contains("fn snacc_entry_succeeds()"));
     assert!(host.contains("#[cfg(snacc_bridge_assertions)]"));
     assert!(host.contains("include!(env!(\"SNACC_BRIDGE_ASSERTIONS\"))"));
+    assert!(host.contains("use ferris_says::say;"));
+    assert!(host.contains("say(\"Hello from a Snacc application!\", 32, writer)"));
+    assert!(host.contains("fn snacc_main() -> i32;"));
+}
+
+/// RFC 013 acceptance criteria 3 and 8: a fresh generated package resolves the
+/// real `ferris-says = "=0.3.2"` crate from crates.io, builds, and its host
+/// prints both the Ferris greeting and the compiled Snacc program's `0` line.
+/// This test needs network access the first time Cargo resolves the
+/// dependency, so it stays out of the ordinary offline-capable workspace
+/// suite and only runs when explicitly requested (`cargo test -- --ignored`).
+#[test]
+#[ignore = "requires network access to resolve ferris-says from crates.io"]
+fn generated_ferris_package_builds_and_runs() {
+    let workspace = tempfile::tempdir().expect("failed to create init workspace");
+    let package = workspace.path().join("ferris-demo");
+    let init = Command::new(env!("CARGO_BIN_EXE_cargo-snacc"))
+        .arg("init")
+        .arg(&package)
+        .output()
+        .expect("failed to run cargo snacc init");
+    assert!(init.status.success(), "init failed:\n{}", combined(&init));
+
+    let runtime_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/snacc-runtime");
+    let manifest_path = package.join("Cargo.toml");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    let manifest = manifest.replace(
+        "snacc-runtime = \"0.1\"",
+        &format!(
+            "snacc-runtime = {{ path = {:?} }}",
+            runtime_path.to_string_lossy()
+        ),
+    );
+    fs::write(&manifest_path, manifest).unwrap();
+
+    let target = tempfile::tempdir().expect("failed to create build target directory");
+    let run = cargo_snacc_at(target.path(), &package, &["run"]);
+    assert!(run.status.success(), "run failed:\n{}", combined(&run));
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("Hello from a Snacc application!"),
+        "generated package did not print the Ferris greeting:\n{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| line == "0"),
+        "generated package did not print the Snacc program's 0 output:\n{stdout}"
+    );
 }
 
 #[test]

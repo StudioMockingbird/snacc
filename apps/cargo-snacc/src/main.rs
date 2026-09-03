@@ -11,7 +11,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const HOST_MAIN_TEMPLATE: &str = "mod interop;\n\n#[cfg(snacc_bridge_assertions)]\ninclude!(env!(\"SNACC_BRIDGE_ASSERTIONS\"));\n\nunsafe extern \"C\" {\n    fn snacc_main() -> i32;\n}\n\nfn main() {\n    snacc_runtime::force_link();\n    // SAFETY: cargo-snacc links this host with the object defining this ABI.\n    let status = unsafe { snacc_main() };\n    std::process::exit(status);\n}\n\n#[test]\nfn snacc_entry_succeeds() {\n    snacc_runtime::force_link();\n    // SAFETY: cargo-snacc links this harness with the object defining this ABI.\n    assert_eq!(unsafe { snacc_main() }, 0);\n}\n";
+const HOST_MAIN_TEMPLATE: &str = "mod interop;\n\n#[cfg(snacc_bridge_assertions)]\ninclude!(env!(\"SNACC_BRIDGE_ASSERTIONS\"));\n\nuse ferris_says::say;\nuse std::io::{stdout, BufWriter};\n\nunsafe extern \"C\" {\n    fn snacc_main() -> i32;\n}\n\nfn main() {\n    let stdout = stdout();\n    let writer = BufWriter::new(stdout.lock());\n    say(\"Hello from a Snacc application!\", 32, writer)\n        .expect(\"ferris-says failed to write the demo\");\n\n    snacc_runtime::force_link();\n    // SAFETY: cargo-snacc links this host with the object defining this ABI.\n    let status = unsafe { snacc_main() };\n    std::process::exit(status);\n}\n\n#[test]\nfn snacc_entry_succeeds() {\n    snacc_runtime::force_link();\n    // SAFETY: cargo-snacc links this harness with the object defining this ABI.\n    assert_eq!(unsafe { snacc_main() }, 0);\n}\n";
+
+const HOST_MAIN_TEMPLATE_PRE_FERRIS: &str = "mod interop;\n\n#[cfg(snacc_bridge_assertions)]\ninclude!(env!(\"SNACC_BRIDGE_ASSERTIONS\"));\n\nunsafe extern \"C\" {\n    fn snacc_main() -> i32;\n}\n\nfn main() {\n    snacc_runtime::force_link();\n    // SAFETY: cargo-snacc links this host with the object defining this ABI.\n    let status = unsafe { snacc_main() };\n    std::process::exit(status);\n}\n\n#[test]\nfn snacc_entry_succeeds() {\n    snacc_runtime::force_link();\n    // SAFETY: cargo-snacc links this harness with the object defining this ABI.\n    assert_eq!(unsafe { snacc_main() }, 0);\n}\n";
 
 const HOST_MAIN_TEMPLATE_PRE_RFC_007: &str = "mod interop;\n\nunsafe extern \"C\" {\n    fn snacc_main() -> i32;\n}\n\nfn main() {\n    snacc_runtime::force_link();\n    // SAFETY: cargo-snacc links this host with the object defining this ABI.\n    let status = unsafe { snacc_main() };\n    std::process::exit(status);\n}\n\n#[test]\nfn snacc_entry_succeeds() {\n    snacc_runtime::force_link();\n    // SAFETY: cargo-snacc links this harness with the object defining this ABI.\n    assert_eq!(unsafe { snacc_main() }, 0);\n}\n";
 
@@ -180,11 +182,12 @@ fn init(args: &[String]) -> Result<(), CliError> {
     if cargo_toml.contains("[dependencies]") {
         cargo_toml = cargo_toml.replacen(
             "[dependencies]",
-            "[dependencies]\nsnacc-runtime = \"0.1\"",
+            "[dependencies]\nsnacc-runtime = \"0.1\"\nferris-says = \"=0.3.2\"",
             1,
         );
     } else {
-        cargo_toml.push_str("\n[dependencies]\nsnacc-runtime = \"0.1\"\n");
+        cargo_toml
+            .push_str("\n[dependencies]\nsnacc-runtime = \"0.1\"\nferris-says = \"=0.3.2\"\n");
     }
     cargo_toml.push_str(
         "\n[package.metadata.snacc]\nschema-version = 1\nentry = \"src/main.nrs\"\nhost-bin = \"",
@@ -1311,6 +1314,7 @@ fn ensure_cargo_main_template(path: &Path) -> Result<(), CliError> {
         let known = [
             "fn main() {\n    println!(\"Hello, world!\");\n}",
             HOST_MAIN_TEMPLATE_PRE_RFC_007.trim(),
+            HOST_MAIN_TEMPLATE_PRE_FERRIS.trim(),
             HOST_MAIN_TEMPLATE.trim(),
         ];
         if !known.contains(&trimmed) {
@@ -1499,6 +1503,32 @@ mod tests {
         assert!(ensure_cargo_main_template(&host).is_err());
         fs::write(&host, "fn main() {\n    println!(\"Hello, world!\");\n}\n").unwrap();
         assert!(ensure_cargo_main_template(&host).is_ok());
+    }
+
+    #[test]
+    fn init_preflight_recognizes_every_historical_generated_host() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = directory.path().join("main.rs");
+        for template in [
+            HOST_MAIN_TEMPLATE_PRE_RFC_007,
+            HOST_MAIN_TEMPLATE_PRE_FERRIS,
+            HOST_MAIN_TEMPLATE,
+        ] {
+            fs::write(&host, template).unwrap();
+            assert!(
+                ensure_cargo_main_template(&host).is_ok(),
+                "template should be eligible for reinitialization:\n{template}"
+            );
+        }
+    }
+
+    #[test]
+    fn init_preflight_rejects_a_modified_generated_host() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = directory.path().join("main.rs");
+        let modified = HOST_MAIN_TEMPLATE.replace("Hello from a Snacc application!", "edited");
+        fs::write(&host, modified).unwrap();
+        assert!(ensure_cargo_main_template(&host).is_err());
     }
 
     #[test]

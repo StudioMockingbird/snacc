@@ -24,3 +24,10 @@ The main packages are:
 - `snacc`: direct compiler CLI.
 - `cargo-snacc`: Cargo-hosted application tooling.
 - `snacc-workbench`: local browser workbench.
+
+`cargo snacc init` generates a package whose Rust host calls the third-party
+`ferris-says` crate before entering the compiled Snacc program. The first
+`cargo build`/`cargo snacc build` of a freshly generated package needs
+crates.io access to resolve that dependency unless it is already present in
+Cargo's local cache; direct `snacc` compilation remains independent of Cargo,
+registries, and network access.
