@@ -1,0 +1,14 @@
+// Specification 011 section 6.4: a struct and one of its fields overlap, so
+// they cannot both be referenced by one call.
+
+type Point is struct
+    x: Dec64,
+    y: Dec64,
+end
+
+fun use_both(whole: Ref<Point>, part: Ref<Dec64>) do
+    part = whole.y
+end
+
+let mut point: Point = Point(x: 1.0, y: 2.0)
+use_both(point, point.x)

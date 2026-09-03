@@ -907,7 +907,7 @@ fn render_bridge_assertions(checked: &Program, entry: &Path, source: &str) -> St
         let params = extern_decl
             .params
             .iter()
-            .map(|(_, ty)| rust_abi_type(*ty))
+            .map(|param| rust_abi_type(param.ty))
             .collect::<Vec<_>>()
             .join(", ");
         let (line, column) = line_column(source, extern_decl.span.start);

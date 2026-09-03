@@ -1,7 +1,7 @@
 use crate::syntax::ast::{
     Arg, BinaryOp, Block, BlockElement, Condition, Expr, ExternFunc, FieldDecl, Func, IfForm,
-    MethodDecl, Param, PlacePath, PlaceRootName, Program, Span, Spanned, TypeBody, TypeDecl,
-    TypeName, TypeRef, TypeTest, UnionMemberDecl, Value,
+    MethodDecl, Param, ParamMode, PlacePath, PlaceRootName, Program, Span, Spanned, TypeBody,
+    TypeDecl, TypeName, TypeRef, TypeTest, UnionMemberDecl, Value,
 };
 use crate::syntax::lexer::Token;
 use chumsky::{input::ValueInput, prelude::*};
@@ -36,9 +36,18 @@ where
         .labelled("identifier")
 }
 
-/// `type = builtin-type | qualified-name` (Specification 010 section 5). The
-/// parser records the written path; resolution decides what it denotes.
-fn type_ref_parser<'tokens, 'src: 'tokens, I>()
+/// Specification 011 section 5: the permitted declaration sites, named by the
+/// diagnostic every other type position produces.
+const REFERENCE_OUTSIDE_A_PARAMETER: &str = "'Ref<T>' is only valid as the direct type of a function, method, or Rust \
+     bridge parameter; a reference is not storable, so it cannot be a result, a \
+     local, a field, a represented type, or a union member";
+
+const NESTED_REFERENCE: &str =
+    "'Ref<T>' cannot contain another reference; a reference parameter refers to a value type";
+
+/// `value-type = builtin-type | qualified-name` (Specification 010 section 5).
+/// The parser records the written path; resolution decides what it denotes.
+fn value_type_parser<'tokens, 'src: 'tokens, I>()
 -> impl Parser<'tokens, I, Spanned<TypeRef<'src>>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
@@ -52,6 +61,70 @@ where
             .map(TypeRef::Named))
         .map_with(|ty, e| (ty, e.span()))
         .labelled("type")
+        .boxed()
+}
+
+/// `"Ref", "<", value-type, ">"`, wrapped so the referent's span is preserved
+/// and a nested reference is reported as such instead of as a missing type.
+fn reference_type_parser<'tokens, 'src: 'tokens, I>()
+-> impl Parser<'tokens, I, Spanned<TypeRef<'src>>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+{
+    let nested = bracketed_reference(value_type_parser()).validate(|ty, e, emitter| {
+        emitter.emit(Rich::custom(e.span(), NESTED_REFERENCE.to_string()));
+        ty
+    });
+    bracketed_reference(nested.or(value_type_parser())).boxed()
+}
+
+fn bracketed_reference<'tokens, 'src: 'tokens, I, P>(
+    referent: P,
+) -> impl Parser<'tokens, I, Spanned<TypeRef<'src>>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+    P: Parser<'tokens, I, Spanned<TypeRef<'src>>, extra::Err<Rich<'tokens, Token<'src>, Span>>>
+        + Clone,
+{
+    just(Token::Ref)
+        .ignore_then(just(Token::Op("<")))
+        .ignore_then(referent)
+        .then_ignore(just(Token::Op(">")))
+}
+
+/// Every type position except a parameter. `Ref<T>` is still recognised here so
+/// it is rejected with the reason rather than with a generic "expected type",
+/// and the referent stands in for it so one violation yields one diagnostic.
+fn type_ref_parser<'tokens, 'src: 'tokens, I>()
+-> impl Parser<'tokens, I, Spanned<TypeRef<'src>>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+{
+    reference_type_parser()
+        .validate(|ty, e, emitter| {
+            emitter.emit(Rich::custom(
+                e.span(),
+                REFERENCE_OUTSIDE_A_PARAMETER.to_string(),
+            ));
+            ty
+        })
+        .or(value_type_parser())
+        .boxed()
+}
+
+/// `parameter = identifier, ":", ( value-type | reference-parameter-type )`.
+fn param_type_parser<'tokens, 'src: 'tokens, I>() -> impl Parser<
+    'tokens,
+    I,
+    (ParamMode, Spanned<TypeRef<'src>>),
+    extra::Err<Rich<'tokens, Token<'src>, Span>>,
+> + Clone
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+{
+    reference_type_parser()
+        .map(|ty| (ParamMode::Reference, ty))
+        .or(value_type_parser().map(|ty| (ParamMode::Value, ty)))
         .boxed()
 }
 
@@ -392,9 +465,10 @@ where
     let param = ident
         .map_with(|name, e| (name, e.span()))
         .then_ignore(just(Token::Ctrl(':')))
-        .then(type_ref.clone())
-        .map(|((name, name_span), ty)| Param {
+        .then(param_type_parser())
+        .map(|((name, name_span), (mode, ty))| Param {
             name,
+            mode,
             ty,
             span: name_span,
         });
@@ -1005,5 +1079,112 @@ mod tests {
     fn mut_is_reserved_outside_a_declaration() {
         assert_rejects("fun f(mut value: Int64): Int64 do value end");
         assert_rejects("let mut: Int64 = 1");
+    }
+
+    // Specification 011 sections 4-5: `Ref<T>` parses only as a direct
+    // parameter type.
+
+    fn parse_errors(source: &str) -> Vec<String> {
+        let (tokens, lex_errors) = lexer::lexer().parse(source).into_output_errors();
+        assert!(lex_errors.is_empty(), "lex errors: {lex_errors:?}");
+        let tokens = tokens.unwrap();
+        let (_, errors) = program_parser()
+            .parse(
+                tokens
+                    .as_slice()
+                    .map((source.len()..source.len()).into(), |(token, span)| {
+                        (token, span)
+                    }),
+            )
+            .into_output_errors();
+        errors.iter().map(ToString::to_string).collect()
+    }
+
+    fn assert_parse_error_contains(source: &str, needle: &str) {
+        let errors = parse_errors(source);
+        assert!(
+            errors.iter().any(|error| error.contains(needle)),
+            "expected a parse error containing {needle:?} for {source}, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn ref_is_a_reserved_word_and_not_an_identifier() {
+        assert_rejects("let Ref: Int64 = 1");
+        assert_rejects("fun Ref(value: Int64): Int64 do value end");
+    }
+
+    #[test]
+    fn parses_a_reference_parameter_in_every_permitted_declaration() {
+        for source in [
+            "fun add_into(x: Int64, y: Int64, result: Ref<Int64>) do result = x + y end",
+            "type Point is struct x: Dec64, end\n\
+             method Point.give(other: Ref<Dec64>) do other = self.x end",
+            "extern rust \"snacc_user_bump\" fun bump(value: Ref<Int64>)",
+        ] {
+            assert_parses(source);
+        }
+    }
+
+    #[test]
+    fn a_reference_parameter_records_its_mode_and_referent_type() {
+        let program = parse("fun f(a: Int64, b: Ref<Int64>) do b = a end");
+        let args = &program.funcs["f"].args;
+        assert_eq!(args[0].mode, ParamMode::Value);
+        assert_eq!(args[1].mode, ParamMode::Reference);
+        assert_eq!(builtin(&args[1].ty), TypeName::Int64);
+    }
+
+    #[test]
+    fn a_user_defined_referent_keeps_its_written_path() {
+        let program = parse(
+            "type Shape is union | Circle is struct radius: Int64, end | Nil end\n\
+             fun grow(shape: Ref<Shape.Circle>) do shape.radius = 1 end",
+        );
+        let TypeRef::Named(segments) = &program.funcs["grow"].args[0].ty.0 else {
+            panic!("expected a qualified referent path");
+        };
+        assert_eq!(
+            segments.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec!["Shape", "Circle"]
+        );
+    }
+
+    #[test]
+    fn rejects_a_reference_in_every_other_type_position() {
+        for source in [
+            "fun f(value: Int64): Ref<Int64> do value end",
+            "method Point.f(): Ref<Int64> do 1 end",
+            "extern rust \"snacc_user_f\" fun f(value: Int64): Ref<Int64>",
+            "let saved: Ref<Int64> = 1",
+            "type Holder is struct value: Ref<Int64>, end",
+            "type Alias is Ref<Int64>",
+            "type Shape is union | Circle is struct radius: Ref<Int64>, end | Nil end",
+        ] {
+            assert_parse_error_contains(source, "only valid as the direct type of a function");
+        }
+    }
+
+    #[test]
+    fn rejects_a_nested_reference() {
+        assert_parse_error_contains(
+            "fun f(value: Ref<Ref<Int64>>) do print(1) end",
+            "cannot contain another reference",
+        );
+    }
+
+    #[test]
+    fn rejects_an_authored_self_annotation() {
+        // `self` is a keyword, so it can never be written as a parameter name;
+        // no author-written `self` type exists to carry `Ref<T>`.
+        assert_rejects("method Point.f(self: Ref<Point>) do print(1) end");
+    }
+
+    #[test]
+    fn ordered_comparisons_still_parse_as_expressions() {
+        // Specification 011 section 14: `<` and `>` outside a type position are
+        // unchanged, including the two-character forms.
+        let program = parse("print(a < b) print(a > b) print(a <= b) print(a >= b)");
+        assert_eq!(program.body.elements.len(), 4);
     }
 }

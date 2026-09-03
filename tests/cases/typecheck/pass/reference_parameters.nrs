@@ -1,0 +1,64 @@
+// Specification 011 sections 6-10: argument validation, automatic dereference,
+// disjoint field references, reborrowing, and value/reference mixing.
+
+type Point is struct
+    x: Dec64,
+    y: Dec64,
+end
+
+fun add_into(x: Int64, y: Int64, result: Ref<Int64>) do
+    result = x + y
+end
+
+fun increment(value: Ref<Int64>) do
+    value = value + 1
+end
+
+fun twice(value: Ref<Int64>) do
+    increment(value)
+    increment(value)
+end
+
+fun show(value: Int64) do
+    print(value)
+end
+
+fun relay(value: Ref<Int64>) do
+    show(value)
+end
+
+fun exchange(left: Ref<Dec64>, right: Ref<Dec64>) do
+    let saved: Dec64 = left
+    left = right
+    right = saved
+end
+
+fun move_right(point: Ref<Point>, amount: Dec64) do
+    point.x = point.x + amount
+end
+
+method Point.give(other: Ref<Dec64>) do
+    other = self.x
+end
+
+let x: Int64 = 20
+let y: Int64 = 22
+let mut z: Int64 = 0
+add_into(x, y, z)
+print(z)
+
+twice(z)
+relay(z)
+
+// A place read by value and referenced in the same call is valid: the value
+// argument holds the value read before the callee starts.
+add_into(z, z, z)
+
+let mut point: Point = Point(x: 1.0, y: 2.0)
+exchange(point.x, point.y)
+move_right(point, 1.0)
+add_into(1, 2, z)
+
+let mut total: Dec64 = 0.0
+point.give(total)
+print(total)

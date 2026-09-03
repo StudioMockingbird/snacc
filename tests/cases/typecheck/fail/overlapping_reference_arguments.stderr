@@ -1,0 +1,1 @@
+reference arguments 'point' and 'point.x' overlap, so parameters 'whole' and 'part' cannot both have exclusive access

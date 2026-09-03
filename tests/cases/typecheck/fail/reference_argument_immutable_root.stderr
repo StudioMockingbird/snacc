@@ -1,0 +1,1 @@
+'total' is not declared 'mut', so it cannot be passed to the reference parameter 'result' of 'add_into'

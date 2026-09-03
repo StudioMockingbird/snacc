@@ -1,7 +1,8 @@
 use crate::semantics::types::{self, FuncSig, MethodId, MethodSig, TypeDef, TypeId, Types};
 use crate::syntax::ast::{
-    Arg, BinaryOp, Block, BlockElement, Condition, Expr, IfForm, NumLiteral, Param, PlacePath,
-    PlaceRootName, Program as AstProgram, Span, Spanned, TypeName, TypeRef, TypeTest, Value,
+    Arg, BinaryOp, Block, BlockElement, Condition, Expr, IfForm, NumLiteral, Param, ParamMode,
+    PlacePath, PlaceRootName, Program as AstProgram, Span, Spanned, TypeName, TypeRef, TypeTest,
+    Value,
 };
 use std::collections::HashMap;
 
@@ -120,6 +121,24 @@ pub struct Place {
     pub ty: Ty,
 }
 
+/// One resolved parameter. The passing mode travels with the value type, so no
+/// later phase re-derives it from source syntax (Specification 011 section 11).
+/// A `Ref<T>` parameter's `ty` is the referent type `T`.
+#[derive(Clone, Debug)]
+pub struct TParam {
+    pub name: String,
+    pub ty: Ty,
+    pub mode: ParamMode,
+}
+
+/// One checked call argument. Specification 011 section 19 phase 2 step 5 keeps
+/// the two kinds apart so lowering can never copy a reference argument.
+pub enum TArg {
+    Value(TExpr),
+    /// The referent place, resolved once. Lowering passes its address.
+    Reference(Place),
+}
+
 /// How a method call reaches its receiver. A call that may write through `self`
 /// requires the `Place` form; a read-only call may use a temporary, which the
 /// backend gives compiler-owned storage (Specification 010 section 15.3).
@@ -131,7 +150,7 @@ pub enum TReceiver {
 pub struct TMethodCall {
     pub receiver: TReceiver,
     pub method: MethodId,
-    pub args: Vec<TExpr>,
+    pub args: Vec<TArg>,
 }
 
 /// Value-producing checked nodes. Nothing here may stand for a construct
@@ -170,7 +189,7 @@ pub enum TExpr {
     Arith(Box<TExpr>, ArithOp, Box<TExpr>, Ty),
     Cmp(Box<TExpr>, CmpOp, Box<TExpr>, Ty),
     /// A call to a declaration that has a result.
-    Call(String, Vec<TExpr>),
+    Call(String, Vec<TArg>),
     /// A method call that has a result.
     MethodCall(Box<TMethodCall>),
     /// An `if` classified as value-form: every path produces a value, either
@@ -229,7 +248,7 @@ pub enum TStmt {
     /// branch is a no-result block.
     If(TStmtIf),
     /// A call to a declaration without a result.
-    Call(String, Vec<TExpr>),
+    Call(String, Vec<TArg>),
     /// A call to a method without a result.
     MethodCall(TMethodCall),
     /// A value-producing expression whose result is discarded.
@@ -252,7 +271,7 @@ pub struct TBlock {
 }
 
 pub struct TFunc {
-    pub params: Vec<(String, Ty)>,
+    pub params: Vec<TParam>,
     /// `None` is a function without a result; it lowers to LLVM `void`.
     pub result: Option<Ty>,
     pub body: TBlock,
@@ -261,7 +280,7 @@ pub struct TFunc {
 pub struct TMethod {
     pub receiver: TypeId,
     pub name: String,
-    pub params: Vec<(String, Ty)>,
+    pub params: Vec<TParam>,
     pub result: Option<Ty>,
     /// The least-fixed-point receiver-write effect. Internal only: it creates
     /// no source-level method category and is not part of the signature.
@@ -271,7 +290,7 @@ pub struct TMethod {
 
 pub struct TExtern {
     pub symbol: String,
-    pub params: Vec<(String, Ty)>,
+    pub params: Vec<TParam>,
     /// `None` is a bridge without a result; its C ABI result is `void`.
     pub result: Option<Ty>,
     pub span: std::ops::Range<usize>,
@@ -357,6 +376,27 @@ impl<'src> Ctx<'src> {
     fn method_name(&self, method: MethodId) -> String {
         self.method_sigs[method.index()].qualified(&self.types)
     }
+
+    /// Renders a resolved place the way it was written, so an overlap or
+    /// mutability diagnostic can name both argument places (Specification 011
+    /// section 13).
+    fn place_name(&self, place: &Place) -> String {
+        let mut text = place.root.to_string();
+        let mut current = place.root_ty;
+        for index in &place.path {
+            let Ty::User(id) = current else { break };
+            let Some(fields) = self.types.def(id).fields() else {
+                break;
+            };
+            let Some((name, ty)) = fields.get(*index) else {
+                break;
+            };
+            text.push('.');
+            text.push_str(name);
+            current = *ty;
+        }
+        text
+    }
 }
 
 type Env<'src> = Vec<Binding<'src>>;
@@ -434,10 +474,7 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
             &mut ctx,
             &mut env,
             &declaration.args,
-            &declared_params
-                .iter()
-                .map(|(_, ty)| *ty)
-                .collect::<Vec<_>>(),
+            &declared_params,
             Some(self_ty),
         );
         ctx.current_method = Some(MethodId(index as u32));
@@ -463,12 +500,7 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
     for name in extern_names {
         let function = &program.externs[name];
         let signature = &ctx.sigs[name];
-        let params = function
-            .args
-            .iter()
-            .zip(&signature.params)
-            .map(|(param, ty)| (param.name.to_string(), *ty))
-            .collect();
+        let params = signature.params.clone();
         typed_externs.insert(
             name.to_string(),
             TExtern {
@@ -530,24 +562,26 @@ fn begin_region<'src>(
     ctx: &mut Ctx<'src>,
     env: &mut Env<'src>,
     args: &[Param<'src>],
-    types: &[Ty],
+    params: &[TParam],
     self_ty: Option<Ty>,
-) -> Vec<(String, Ty)> {
+) -> Vec<TParam> {
     ctx.declared.clear();
     ctx.loops.clear();
     ctx.self_ty = self_ty;
-    let mut params = Vec::new();
-    for (param, ty) in args.iter().zip(types) {
-        declare(ctx, param.name, param.span, "Parameter");
+    for (arg, param) in args.iter().zip(params) {
+        declare(ctx, arg.name, arg.span, "Parameter");
         env.push(Binding {
-            name: param.name,
-            ty: *ty,
+            name: arg.name,
+            ty: param.ty,
             // Specification 012 section 8: ordinary parameters are immutable.
-            mutable: false,
+            // Specification 011 section 19 phase 2 step 1: a reference parameter
+            // is a mutable root of type `T`, exactly like a `let mut` local, so
+            // every read, write, field selection, and receiver use in the body
+            // goes through the machinery that already exists for those.
+            mutable: param.mode == ParamMode::Reference,
         });
-        params.push((param.name.to_string(), *ty));
     }
-    params
+    params.to_vec()
 }
 
 /// The least fixed point of "this method may write its receiver": a method
@@ -1246,7 +1280,7 @@ fn resolve_type(ctx: &mut Ctx<'_>, ty: &Spanned<TypeRef<'_>>) -> Ty {
 enum CheckedCall {
     Function {
         name: String,
-        args: Vec<TExpr>,
+        args: Vec<TArg>,
         result: Option<Ty>,
     },
     Method {
@@ -1386,24 +1420,17 @@ fn check_function_call<'src>(
 ) -> Option<CheckedCall> {
     let signature = ctx.sigs.get(name).cloned()?;
     reject_named_args(ctx, "a function call", args);
-    let checked = check_positional(ctx, env, args);
-    if signature.params.len() != checked.len() {
+    if signature.params.len() != args.len() {
         ctx.error(
             span,
             format!(
                 "'{name}' called with wrong number of arguments (expected {}, found {})",
                 signature.params.len(),
-                checked.len()
+                args.len()
             ),
         );
     }
-    let mut values = Vec::new();
-    for (index, (value, value_ty, arg_span)) in checked.into_iter().enumerate() {
-        match signature.params.get(index) {
-            Some(expected) => values.push(coerce(ctx, value, value_ty, *expected, arg_span)),
-            None => values.push(value),
-        }
-    }
+    let values = check_args(ctx, env, args, &signature.params, name, None);
     Some(CheckedCall::Function {
         name: name.to_string(),
         args: values,
@@ -1411,17 +1438,166 @@ fn check_function_call<'src>(
     })
 }
 
-fn check_positional<'src>(
+/// Specification 011 sections 6.1-6.4. Arguments are processed left to right;
+/// a value argument is checked and coerced as before, and a reference argument
+/// resolves to exactly one place, which is then validated for mutability, exact
+/// referent type, and disjointness from every other reference in the same call.
+fn check_args<'src>(
     ctx: &mut Ctx<'src>,
     env: &mut Env<'src>,
     args: &[Arg<'src>],
-) -> Vec<(TExpr, Ty, Span)> {
-    args.iter()
-        .map(|arg| {
-            let (value, ty) = check_expr(ctx, env, &arg.value);
-            (value, ty, arg.value.1)
-        })
-        .collect()
+    params: &[TParam],
+    callee: &str,
+    receiver: Option<&Place>,
+) -> Vec<TArg> {
+    let mut checked = Vec::with_capacity(args.len());
+    let mut references: Vec<(String, Place, Span)> = Vec::new();
+    for (index, arg) in args.iter().enumerate() {
+        // An argument with no parameter is already reported as an arity error;
+        // it is still checked so its own diagnostics are not swallowed.
+        let Some(param) = params.get(index) else {
+            checked.push(TArg::Value(check_expr(ctx, env, &arg.value).0));
+            continue;
+        };
+        match param.mode {
+            ParamMode::Value => {
+                let (value, ty) = check_expr(ctx, env, &arg.value);
+                checked.push(TArg::Value(coerce(ctx, value, ty, param.ty, arg.value.1)));
+            }
+            ParamMode::Reference => match check_reference_arg(ctx, env, arg, param, callee) {
+                Some(place) => {
+                    references.push((param.name.clone(), place.clone(), arg.value.1));
+                    checked.push(TArg::Reference(place));
+                }
+                None => checked.push(TArg::Value(TExpr::Nil)),
+            },
+        }
+    }
+    reject_overlap(ctx, &references, receiver);
+    checked
+}
+
+/// Resolves one reference argument. A reference parameter forwarded from an
+/// enclosing signature needs no special case: it is already a mutable root of
+/// its referent type, so it reborrows through this same path.
+fn check_reference_arg<'src>(
+    ctx: &mut Ctx<'src>,
+    env: &mut Env<'src>,
+    arg: &Arg<'src>,
+    param: &TParam,
+    callee: &str,
+) -> Option<Place> {
+    let span = arg.value.1;
+    match as_place(ctx, env, &arg.value) {
+        PlaceOutcome::Resolved(resolved) => {
+            if !resolved.mutable {
+                let root = resolved.place.root.to_string();
+                let name = &param.name;
+                ctx.error(
+                    span,
+                    format!(
+                        "'{root}' is not declared 'mut', so it cannot be passed to the \
+                         reference parameter '{name}' of '{callee}'"
+                    ),
+                );
+            }
+            // Specification 011 sections 6.1 and 9: exactly `T`. Neither the
+            // `Int64`-to-`Dec64` widening nor represented-type equivalence
+            // applies, because the callee addresses the caller's own storage.
+            if resolved.place.ty != param.ty {
+                let expected = ctx.name(param.ty);
+                let found = ctx.name(resolved.place.ty);
+                let name = &param.name;
+                ctx.error(
+                    span,
+                    format!(
+                        "reference parameter '{name}' of '{callee}' requires a place of \
+                         exactly type '{expected}', found '{found}'"
+                    ),
+                );
+            }
+            // Handing a `self`-rooted place to a reference parameter may write
+            // it, exactly as an assignment to that place would, so it feeds the
+            // same receiver-write fixed point (Specification 010 section 19
+            // phase 4). Without this a caller could pass an immutable receiver.
+            if resolved.place.root == PlaceRoot::SelfRef
+                && let Some(method) = ctx.current_method
+            {
+                ctx.direct_writes[method.index()] = true;
+            }
+            Some(resolved.place)
+        }
+        PlaceOutcome::Reported => None,
+        PlaceOutcome::NotAPlace => {
+            // A malformed argument reports its own error first; only a
+            // well-formed value -- a literal, a call result, arithmetic -- needs
+            // the "not a place" diagnostic.
+            let before = ctx.errors.len();
+            check_expr(ctx, env, &arg.value);
+            if ctx.errors.len() == before {
+                let expected = ctx.name(param.ty);
+                let name = &param.name;
+                ctx.error(
+                    span,
+                    format!(
+                        "reference parameter '{name}' of '{callee}' requires an initialized \
+                         mutable place of type '{expected}', but this argument is a value \
+                         with no storage"
+                    ),
+                );
+            }
+            None
+        }
+    }
+}
+
+/// Specification 011 section 3: two places overlap when they are identical or
+/// one is reached by selecting fields from the other. Two paths that first
+/// differ at sibling field indices are disjoint.
+fn overlaps(left: &Place, right: &Place) -> bool {
+    if left.root != right.root {
+        return false;
+    }
+    let shared = left.path.len().min(right.path.len());
+    left.path[..shared] == right.path[..shared]
+}
+
+/// Specification 011 section 6.4: every pair of reference arguments, and each
+/// reference argument against an addressable method receiver. A temporary
+/// receiver has independent storage and cannot overlap a caller place.
+fn reject_overlap(
+    ctx: &mut Ctx<'_>,
+    references: &[(String, Place, Span)],
+    receiver: Option<&Place>,
+) {
+    for (index, (name, place, span)) in references.iter().enumerate() {
+        if let Some(receiver) = receiver
+            && overlaps(place, receiver)
+        {
+            let argument = ctx.place_name(place);
+            let subject = ctx.place_name(receiver);
+            ctx.error(
+                *span,
+                format!(
+                    "reference argument '{argument}' for parameter '{name}' overlaps the \
+                     receiver '{subject}', which the method may access through 'self'"
+                ),
+            );
+        }
+        for (other_name, other, _) in &references[index + 1..] {
+            if overlaps(place, other) {
+                let left = ctx.place_name(place);
+                let right = ctx.place_name(other);
+                ctx.error(
+                    *span,
+                    format!(
+                        "reference arguments '{left}' and '{right}' overlap, so parameters \
+                         '{name}' and '{other_name}' cannot both have exclusive access"
+                    ),
+                );
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1456,25 +1632,32 @@ fn check_method_call<'src>(
     reject_named_args(ctx, "a method call", args);
     let signature_params = ctx.method_sigs[method.index()].params.clone();
     let result = ctx.method_sigs[method.index()].result;
-    let checked = check_positional(ctx, env, args);
-    if signature_params.len() != checked.len() {
+    if signature_params.len() != args.len() {
         let qualified = ctx.method_name(method);
         ctx.error(
             span,
             format!(
                 "'{qualified}' called with wrong number of arguments (expected {}, found {})",
                 signature_params.len(),
-                checked.len()
+                args.len()
             ),
         );
     }
-    let mut values = Vec::new();
-    for (index, (value, value_ty, arg_span)) in checked.into_iter().enumerate() {
-        match signature_params.get(index) {
-            Some((_, expected)) => values.push(coerce(ctx, value, value_ty, *expected, arg_span)),
-            None => values.push(value),
-        }
-    }
+    // Specification 011 section 6.4: an addressable receiver participates in
+    // overlap checking for the complete call, whether or not the method writes.
+    let receiver_place = match &receiver {
+        TReceiver::Place(place) => Some(place.clone()),
+        TReceiver::Value(_) => None,
+    };
+    let qualified = ctx.method_name(method);
+    let values = check_args(
+        ctx,
+        env,
+        args,
+        &signature_params,
+        &qualified,
+        receiver_place.as_ref(),
+    );
     // The effect is not known yet, so the receiver check is deferred to the
     // fixed point (Specification 010 section 19 phase 4).
     ctx.receiver_calls.push(ReceiverCall {
@@ -2469,7 +2652,7 @@ mod tests {
             ));
             let expected = program.funcs["identity"].result;
             assert!(expected.is_some());
-            assert_eq!(program.funcs["identity"].params[0].1, expected.unwrap());
+            assert_eq!(program.funcs["identity"].params[0].ty, expected.unwrap());
             assert_eq!(program.externs["edge"].result, expected);
         }
     }
@@ -3537,6 +3720,422 @@ mod tests {
                  let shape: Shape = Shape.Circle(radius: 2)\nprint(shape.area())"
             ),
             "'Shape' has no method 'area'",
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Specification 011: call-scoped reference parameters.
+    // ---------------------------------------------------------------------
+
+    const ADD_INTO: &str =
+        "fun add_into(x: Int64, y: Int64, result: Ref<Int64>) do result = x + y end\n";
+    const EXCHANGE: &str = "fun exchange(left: Ref<Dec64>, right: Ref<Dec64>) do \
+                            let saved: Dec64 = left left = right right = saved end\n";
+
+    /// The checked arguments of the first top-level call statement.
+    fn top_level_args(program: &Program) -> &[TArg] {
+        program
+            .body
+            .statements
+            .iter()
+            .find_map(|statement| match statement {
+                TStmt::Call(_, args) | TStmt::Expr(TExpr::Call(_, args)) => Some(args.as_slice()),
+                TStmt::MethodCall(call) => Some(call.args.as_slice()),
+                _ => None,
+            })
+            .expect("the top-level body contains a call")
+    }
+
+    /// Conformance 1-2: the canonical example checks, and its reference
+    /// argument survives into the checked program as a resolved place.
+    #[test]
+    fn a_reference_parameter_carries_a_resolved_place_to_lowering() {
+        let program = assert_checks(&format!(
+            "{ADD_INTO}let x: Int64 = 20\nlet y: Int64 = 22\n\
+             let mut z: Int64 = 0\nadd_into(x, y, z)\nprint(z)"
+        ));
+        assert_eq!(
+            program.funcs["add_into"].params[2].mode,
+            ParamMode::Reference
+        );
+        assert_eq!(program.funcs["add_into"].params[2].ty, Ty::Int64);
+        assert_eq!(program.funcs["add_into"].params[0].mode, ParamMode::Value);
+        let args = top_level_args(&program);
+        assert!(matches!(args[0], TArg::Value(_)));
+        assert!(matches!(args[1], TArg::Value(_)));
+        let TArg::Reference(place) = &args[2] else {
+            panic!("the third argument should be a reference place");
+        };
+        assert_eq!(place.root, PlaceRoot::Local("z".into()));
+        assert_eq!(place.ty, Ty::Int64);
+        assert!(place.path.is_empty());
+    }
+
+    /// Conformance 1 and 7.2: inside the callee a reference parameter is an
+    /// ordinary mutable root, so it reads, writes, and selects fields through
+    /// the same machinery a `let mut` local uses.
+    #[test]
+    fn a_reference_parameter_is_a_mutable_root_of_its_referent_type() {
+        assert_checks("fun increment(value: Ref<Int64>) do value = value + 1 end\nprint(0)");
+        // A by-value parameter is still immutable, so the mode -- not the
+        // parameter position -- is what grants the capability.
+        assert_error_contains(
+            "fun increment(value: Int64) do value = value + 1 end\nprint(0)",
+            "'value' is not declared 'mut' and cannot be assigned",
+        );
+    }
+
+    /// Conformance 3: only an initialized mutable place can establish a
+    /// reference.
+    #[test]
+    fn rejects_every_reference_argument_that_is_not_a_mutable_place() {
+        assert_error_contains(
+            &format!("{ADD_INTO}let total: Int64 = 0\nadd_into(20, 22, total)"),
+            "'total' is not declared 'mut', so it cannot be passed to the reference \
+             parameter 'result' of 'add_into'",
+        );
+        for argument in ["0", "make_total()", "1 + 2"] {
+            assert_error_contains(
+                &format!(
+                    "{ADD_INTO}fun make_total(): Int64 do 0 end\nadd_into(20, 22, {argument})"
+                ),
+                "requires an initialized mutable place of type 'Int64', but this argument \
+                 is a value with no storage",
+            );
+        }
+    }
+
+    /// Conformance 4: there is no uninitialized declaration, and an initialized
+    /// mutable local is the operational output form.
+    #[test]
+    fn a_referent_is_always_an_initialized_mutable_local() {
+        assert_rejected_by_parser("let result: Int64");
+        assert_checks(&format!(
+            "{ADD_INTO}let mut result: Int64 = 0\nadd_into(20, 22, result)\nprint(result)"
+        ));
+    }
+
+    /// Conformance 5 and 9: a field place rooted at a mutable variable is a
+    /// valid referent, and the callee reaches the caller's field through it.
+    #[test]
+    fn struct_fields_rooted_at_a_mutable_variable_are_valid_referents() {
+        let program = assert_checks(&format!(
+            "{POINT}fun move_right(point: Ref<Point>, amount: Dec64) do \
+             point.x = point.x + amount end\n\
+             fun bump(value: Ref<Dec64>) do value = value + 1.0 end\n\
+             let mut point: Point = Point(x: 1.0, y: 2.0)\n\
+             bump(point.x)\n\
+             move_right(point, 1.0)"
+        ));
+        let TArg::Reference(place) = &top_level_args(&program)[0] else {
+            panic!("expected a reference argument");
+        };
+        assert_eq!(place.root, PlaceRoot::Local("point".into()));
+        assert_eq!(place.path, vec![0]);
+        assert_eq!(place.ty, Ty::Dec64);
+        // An immutable root is rejected even when the field itself is written.
+        assert_error_contains(
+            &format!(
+                "{POINT}fun bump(value: Ref<Dec64>) do value = value + 1.0 end\n\
+                 let point: Point = Point(x: 1.0, y: 2.0)\nbump(point.x)"
+            ),
+            "'point' is not declared 'mut'",
+        );
+    }
+
+    /// Conformance 6: the referent type is exact. Neither the `Int64`-to-`Dec64`
+    /// widening nor represented-type equivalence establishes a reference.
+    #[test]
+    fn a_reference_argument_requires_the_exact_referent_type() {
+        assert_error_contains(
+            "fun scale(value: Ref<Dec64>) do value = value * 2.0 end\n\
+             let mut count: Int64 = 1\nscale(count)",
+            "reference parameter 'value' of 'scale' requires a place of exactly type \
+             'Dec64', found 'Int64'",
+        );
+        // The same value widens happily when the parameter is by value.
+        assert_checks(
+            "fun scale(value: Dec64): Dec64 do value * 2.0 end\n\
+             let count: Int64 = 1\nprint(scale(count))",
+        );
+        assert_error_contains(
+            "type UserId is Int64\nfun bump(value: Ref<Int64>) do value = value + 1 end\n\
+             let mut id: UserId = UserId(1)\nbump(id)",
+            "requires a place of exactly type 'Int64', found 'UserId'",
+        );
+        assert_error_contains(
+            "type UserId is Int64\nfun bump(value: Ref<UserId>) do value = UserId(1) end\n\
+             let mut raw: Int64 = 1\nbump(raw)",
+            "requires a place of exactly type 'UserId', found 'Int64'",
+        );
+    }
+
+    /// Conformance 7 and 11: an automatic read produces `T`, after which every
+    /// ordinary rule for `T` applies -- including widening and copying into a
+    /// by-value parameter.
+    #[test]
+    fn an_automatic_read_behaves_exactly_like_a_loaded_value() {
+        assert_checks(
+            "fun show(value: Int64) do print(value) end\n\
+             fun widen(value: Dec64): Dec64 do value end\n\
+             fun use_all(value: Ref<Int64>): Bool do\n\
+                 print(value)\n\
+                 show(value)\n\
+                 print(widen(value))\n\
+                 value > 0\n\
+             end\n\
+             let mut count: Int64 = 1\nprint(use_all(count))",
+        );
+    }
+
+    /// Conformance 8: a whole-value assignment through a reference works for
+    /// every category of referent.
+    #[test]
+    fn assignment_through_a_reference_replaces_a_complete_value() {
+        assert_checks(&format!(
+            "{POINT}{SHAPE}type UserId is Int64\n\
+             fun set_scalar(value: Ref<Int64>) do value = 7 end\n\
+             fun set_represented(value: Ref<UserId>) do value = UserId(7) end\n\
+             fun set_struct(value: Ref<Point>) do value = Point(x: 0.0, y: 0.0) end\n\
+             fun set_union(value: Ref<Shape>) do value = Shape.Circle(radius: 1) end\n\
+             let mut scalar: Int64 = 0\n\
+             let mut id: UserId = UserId(0)\n\
+             let mut point: Point = Point(x: 1.0, y: 1.0)\n\
+             let mut shape: Shape = Shape.Circle(radius: 0)\n\
+             set_scalar(scalar)\nset_represented(id)\nset_struct(point)\nset_union(shape)"
+        ));
+        assert_error_contains(
+            "fun set(value: Ref<Int64>) do value = true end\nprint(0)",
+            "expected 'Int64', found 'Bool'",
+        );
+    }
+
+    /// Conformance 10 and 7.3: forwarding is a reborrow with no extra ceremony
+    /// -- the parameter is already a mutable root, so the ordinary place and
+    /// mutability rules accept it.
+    #[test]
+    fn forwarding_a_reference_parameter_reborrows_it() {
+        let program = assert_checks(
+            "fun increment(value: Ref<Int64>) do value = value + 1 end\n\
+             fun twice(value: Ref<Int64>) do increment(value) increment(value) end\n\
+             let mut count: Int64 = 0\ntwice(count)",
+        );
+        let TStmt::Call(_, args) = &program.funcs["twice"].body.statements[0] else {
+            panic!("expected a forwarded call");
+        };
+        let TArg::Reference(place) = &args[0] else {
+            panic!("a forwarded reference parameter stays a reference argument");
+        };
+        assert_eq!(place.root, PlaceRoot::Local("value".into()));
+        // Forwarding a field of a referenced struct reborrows the same way.
+        assert_checks(&format!(
+            "{POINT}fun bump(value: Ref<Dec64>) do value = value + 1.0 end\n\
+             fun bump_x(point: Ref<Point>) do bump(point.x) end\nprint(0)"
+        ));
+        // A by-value parameter still cannot supply a reference.
+        assert_error_contains(
+            "fun increment(value: Ref<Int64>) do value = value + 1 end\n\
+             fun twice(value: Int64) do increment(value) end\nprint(0)",
+            "'value' is not declared 'mut'",
+        );
+    }
+
+    /// Conformance 11: supplying a reference parameter to a by-value parameter
+    /// copies the current referent instead of forwarding the reference.
+    #[test]
+    fn a_reference_parameter_supplied_by_value_is_copied() {
+        let program = assert_checks(
+            "fun show(value: Int64) do print(value) end\n\
+             fun relay(value: Ref<Int64>) do show(value) end\nprint(0)",
+        );
+        let TStmt::Call(_, args) = &program.funcs["relay"].body.statements[0] else {
+            panic!("expected a value call");
+        };
+        assert!(matches!(args[0], TArg::Value(_)));
+    }
+
+    /// Conformance 12-13: overlap is decided from resolved roots and field
+    /// paths. Identical places and prefix relationships overlap; sibling fields
+    /// do not.
+    #[test]
+    fn overlapping_reference_arguments_are_rejected_and_siblings_are_accepted() {
+        assert_error_contains(
+            &format!("{EXCHANGE}let mut value: Dec64 = 1.0\nexchange(value, value)"),
+            "reference arguments 'value' and 'value' overlap, so parameters 'left' and \
+             'right' cannot both have exclusive access",
+        );
+        assert_error_contains(
+            &format!(
+                "{POINT}fun use_both(whole: Ref<Point>, part: Ref<Dec64>) do \
+                 part = whole.y end\n\
+                 let mut point: Point = Point(x: 1.0, y: 2.0)\nuse_both(point, point.x)"
+            ),
+            "reference arguments 'point' and 'point.x' overlap",
+        );
+        // Two statically distinct fields of the same mutable struct are
+        // disjoint, so both may be referenced at once.
+        assert_checks(&format!(
+            "{POINT}{EXCHANGE}let mut point: Point = Point(x: 1.0, y: 2.0)\n\
+             exchange(point.x, point.y)"
+        ));
+        // Two different mutable roots are always disjoint.
+        assert_checks(&format!(
+            "{EXCHANGE}let mut a: Dec64 = 1.0\nlet mut b: Dec64 = 2.0\nexchange(a, b)"
+        ));
+    }
+
+    /// Nested field paths overlap only through a common prefix.
+    #[test]
+    fn overlap_compares_complete_field_paths() {
+        const NESTED: &str = "type Point is struct x: Dec64, y: Dec64, end\n\
+                              type Entity is struct position: Point, velocity: Point, end\n";
+        assert_checks(&format!(
+            "{NESTED}{EXCHANGE}let mut entity: Entity = Entity(\
+             position: Point(x: 0.0, y: 0.0), velocity: Point(x: 0.0, y: 0.0))\n\
+             exchange(entity.position.x, entity.velocity.x)"
+        ));
+        assert_error_contains(
+            &format!(
+                "{NESTED}fun use_both(whole: Ref<Point>, part: Ref<Dec64>) do \
+                 part = whole.y end\n\
+                 let mut entity: Entity = Entity(\
+                 position: Point(x: 0.0, y: 0.0), velocity: Point(x: 0.0, y: 0.0))\n\
+                 use_both(entity.position, entity.position.x)"
+            ),
+            "reference arguments 'entity.position' and 'entity.position.x' overlap",
+        );
+    }
+
+    /// Conformance 14: an addressable receiver participates in overlap checking
+    /// for the whole call, whether or not the method writes through `self`; a
+    /// temporary receiver cannot overlap a caller place.
+    #[test]
+    fn a_method_receiver_participates_in_overlap_checking() {
+        const READ_ONLY: &str = "type Point is struct x: Dec64, y: Dec64, end\n\
+                                 method Point.give(other: Ref<Dec64>) do other = self.x end\n";
+        const WRITING: &str = "type Point is struct x: Dec64, y: Dec64, end\n\
+                               method Point.take(other: Ref<Dec64>) do self.x = other end\n";
+        for source in [READ_ONLY, WRITING] {
+            let name = if std::ptr::eq(source, READ_ONLY) {
+                "give"
+            } else {
+                "take"
+            };
+            assert_error_contains(
+                &format!(
+                    "{source}let mut point: Point = Point(x: 1.0, y: 2.0)\npoint.{name}(point.y)"
+                ),
+                "overlaps the receiver 'point', which the method may access through 'self'",
+            );
+        }
+        // An unrelated mutable place is accepted for either method.
+        assert_checks(&format!(
+            "{READ_ONLY}let mut total: Dec64 = 0.0\n\
+             let point: Point = Point(x: 1.0, y: 2.0)\npoint.give(total)"
+        ));
+        // A temporary receiver has independent storage.
+        assert_checks(&format!(
+            "{READ_ONLY}let mut total: Dec64 = 0.0\nPoint(x: 1.0, y: 2.0).give(total)"
+        ));
+    }
+
+    /// A `self`-rooted reference argument may be written by the callee, so it
+    /// feeds the same receiver-write effect an assignment to `self` would.
+    #[test]
+    fn passing_a_self_rooted_place_by_reference_is_a_receiver_write() {
+        assert_error_contains(
+            &format!(
+                "{POINT}fun bump(value: Ref<Dec64>) do value = value + 1.0 end\n\
+                 method Point.grow() do bump(self.x) end\n\
+                 let point: Point = Point(x: 1.0, y: 2.0)\npoint.grow()"
+            ),
+            "may assign through 'self', so its receiver requires a mutable root",
+        );
+        assert_checks(&format!(
+            "{POINT}fun bump(value: Ref<Dec64>) do value = value + 1.0 end\n\
+             method Point.grow() do bump(self.x) end\n\
+             let mut point: Point = Point(x: 1.0, y: 2.0)\npoint.grow()"
+        ));
+    }
+
+    /// Section 7.2: method lookup uses the referent type `T`, and a
+    /// receiver-writing method is valid because the referent is a mutable root.
+    #[test]
+    fn methods_resolve_through_a_reference_parameter() {
+        assert_checks(&format!(
+            "{POINT}method Point.length(): Dec64 do self.x + self.y end\n\
+             method Point.reset() do self.x = 0.0 end\n\
+             fun report(point: Ref<Point>) do\n\
+                 print(point.length())\n\
+                 point.reset()\n\
+             end\n\
+             let mut point: Point = Point(x: 1.0, y: 2.0)\nreport(point)"
+        ));
+        // A by-value parameter still cannot receive a receiver-writing method.
+        assert_error_contains(
+            &format!(
+                "{POINT}method Point.reset() do self.x = 0.0 end\n\
+                 fun report(point: Point) do point.reset() end\nprint(0)"
+            ),
+            "may assign through 'self', so its receiver requires a mutable root",
+        );
+    }
+
+    /// Conformance 15: a value argument is read before the callee starts, so
+    /// reading a place by value and referencing it in the same call is valid.
+    #[test]
+    fn the_same_place_may_be_read_by_value_and_referenced_in_one_call() {
+        let program = assert_checks(
+            "fun replace(previous: Int64, value: Ref<Int64>) do value = previous + 1 end\n\
+             let mut number: Int64 = 4\nreplace(number, number)",
+        );
+        let args = top_level_args(&program);
+        assert!(matches!(args[0], TArg::Value(_)));
+        assert!(matches!(args[1], TArg::Reference(_)));
+    }
+
+    /// Conformance 16-17: a reference is not storable and cannot be built,
+    /// returned, or named anywhere but a parameter.
+    #[test]
+    fn a_reference_is_never_storable_or_constructible() {
+        for source in [
+            "fun f(value: Ref<Int64>): Ref<Int64> do value end",
+            "let saved: Ref<Int64> = 1",
+            "type Holder is struct value: Ref<Int64>, end",
+            "type Alias is Ref<Int64>",
+            "type Shape is union | Circle is struct radius: Ref<Int64>, end | Nil end",
+            "fun f(value: Ref<Ref<Int64>>) do print(1) end",
+            "method Point.f(self: Ref<Point>) do print(1) end",
+            // No constructor, and `Ref` is reserved so it is not a call head.
+            "let saved: Int64 = Ref(1)",
+        ] {
+            assert_rejected_by_parser(source);
+        }
+        // Returning a reference parameter returns a copy of its referent, which
+        // is an ordinary value result.
+        assert_checks(
+            "fun read(value: Ref<Int64>): Int64 do value end\n\
+             let mut count: Int64 = 1\nprint(read(count))",
+        );
+    }
+
+    /// Reference parameters compose with methods and with Rust bridges.
+    #[test]
+    fn reference_parameters_are_permitted_on_methods_and_bridges() {
+        assert_checks(&format!(
+            "{POINT}method Point.give(other: Ref<Dec64>) do other = self.x end\n\
+             extern rust \"snacc_user_bump\" fun rust_bump(value: Ref<Int64>)\n\
+             let mut total: Dec64 = 0.0\nlet mut count: Int64 = 0\n\
+             let point: Point = Point(x: 1.0, y: 2.0)\n\
+             point.give(total)\nrust_bump(count)"
+        ));
+        // Specification 011 section 12.1: a bridge referent is an ABI scalar.
+        assert_error_contains(
+            &format!(
+                "{POINT}extern rust \"snacc_user_move\" fun rust_move(point: Ref<Point>)\n\
+                 print(0)"
+            ),
+            "only the ABI's permitted types may cross a Rust bridge",
         );
     }
 }

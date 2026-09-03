@@ -280,9 +280,21 @@ pub struct ExternFunc<'src> {
     pub span: Span,
 }
 
+/// How one parameter is passed. Specification 011 section 19 phase 1 step 2
+/// represents `Ref<T>` as a passing mode beside an ordinary value type rather
+/// than as a type of its own, so no reference type is ever storable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParamMode {
+    Value,
+    Reference,
+}
+
 #[derive(Debug)]
 pub struct Param<'src> {
     pub name: &'src str,
+    pub mode: ParamMode,
+    /// The written value type. For [`ParamMode::Reference`] this is the
+    /// referent type `T` of `Ref<T>`, never the reference itself.
     pub ty: Spanned<TypeRef<'src>>,
     pub span: Span,
 }

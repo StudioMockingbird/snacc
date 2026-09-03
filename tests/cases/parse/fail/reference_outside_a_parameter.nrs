@@ -1,0 +1,9 @@
+// Specification 011 section 5: a reference is not storable, so it cannot be a
+// local binding type.
+
+fun increment(value: Ref<Int64>) do
+    value = value + 1
+end
+
+let mut count: Int64 = 0
+let saved: Ref<Int64> = count

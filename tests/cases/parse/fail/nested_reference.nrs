@@ -1,0 +1,5 @@
+// Specification 011 section 4: `Ref<Ref<T>>` is not permitted.
+
+fun forward(value: Ref<Ref<Int64>>) do
+    print(1)
+end

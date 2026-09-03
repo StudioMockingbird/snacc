@@ -1,0 +1,11 @@
+// Specification 011 section 6.1: a temporary has no storage to refer to.
+
+fun add_into(x: Int64, y: Int64, result: Ref<Int64>) do
+    result = x + y
+end
+
+fun make_total(): Int64 do
+    0
+end
+
+add_into(20, 22, make_total())

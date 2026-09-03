@@ -1,0 +1,26 @@
+// Specification 011 sections 4-5: `Ref<T>` in every permitted parameter site.
+
+type Point is struct
+    x: Dec64,
+    y: Dec64,
+end
+
+fun add_into(x: Int64, y: Int64, result: Ref<Int64>) do
+    result = x + y
+end
+
+fun move_right(point: Ref<Point>, amount: Dec64) do
+    point.x = point.x + amount
+end
+
+method Point.give(other: Ref<Dec64>) do
+    other = self.x
+end
+
+extern rust "snacc_user_bump" fun rust_bump(value: Ref<Int64>)
+
+// `<` and `>` outside a type position are still ordered comparisons.
+let mut total: Int64 = 0
+add_into(20, 22, total)
+print(total > 0)
+print(total >= 42)

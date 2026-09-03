@@ -1,0 +1,1 @@
+reference parameter 'value' of 'scale' requires a place of exactly type 'Dec64', found 'Int64'

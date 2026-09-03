@@ -1,10 +1,11 @@
 use crate::Optimization;
 use crate::semantics::checker::{
-    ArithOp, CmpOp, Place, PlaceRoot, Program, TBlock, TCondition, TExpr, TMethodCall, TReceiver,
-    TStmt, TTypeTest, TValueIf, Ty,
+    ArithOp, CmpOp, Place, PlaceRoot, Program, TArg, TBlock, TCondition, TExpr, TMethodCall,
+    TParam, TReceiver, TStmt, TTypeTest, TValueIf, Ty,
 };
 use crate::semantics::types::{TypeDef, TypeId};
 use crate::syntax::ast::NumLiteral;
+use crate::syntax::ast::ParamMode;
 use inkwell::AddressSpace;
 use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::basic_block::BasicBlock;
@@ -268,12 +269,12 @@ fn function_type<'ctx>(
     context: &'ctx Context,
     layout: &[BasicTypeEnum<'ctx>],
     leading: &[BasicMetadataTypeEnum<'ctx>],
-    params: &[(String, Ty)],
+    params: &[TParam],
     result: Option<Ty>,
 ) -> FunctionType<'ctx> {
     let mut llvm_params = leading.to_vec();
-    for (_, ty) in params {
-        llvm_params.push(llvm_ty(context, layout, *ty).into());
+    for param in params {
+        llvm_params.push(llvm_ty(context, layout, param.ty).into());
     }
     match result {
         Some(ty) => llvm_ty(context, layout, ty).fn_type(&llvm_params, false),
@@ -357,12 +358,37 @@ pub fn compile_to_ir(program: &Program, module_name: &str) -> Result<String, Str
     Ok(module.print_to_string().to_string())
 }
 
+/// Specification 011 phase 3 (Milestone 4 task B) lowers `Ref<T>` to a pointer
+/// parameter. Until then the checker accepts reference parameters and this
+/// backend refuses them, rather than emitting a by-value signature that would
+/// silently drop the callee's writes.
+const UNLOWERED_REFERENCE: &str = "reference parameters are checked but not yet lowered to LLVM";
+
+fn reject_unlowered_references(program: &Program) -> Result<(), String> {
+    let declarations = program
+        .funcs
+        .values()
+        .map(|function| &function.params)
+        .chain(program.externs.values().map(|function| &function.params))
+        .chain(program.methods.iter().map(|method| &method.params));
+    for params in declarations {
+        if params
+            .iter()
+            .any(|param| param.mode == ParamMode::Reference)
+        {
+            return Err(UNLOWERED_REFERENCE.to_string());
+        }
+    }
+    Ok(())
+}
+
 fn build_module<'ctx>(
     context: &'ctx Context,
     program: &Program,
     module_name: &str,
     machine: &TargetMachine,
 ) -> Result<Module<'ctx>, String> {
+    reject_unlowered_references(program)?;
     let triple = TargetMachine::get_default_triple();
     let module = context.create_module(module_name);
     let builder = context.create_builder();
@@ -434,8 +460,8 @@ fn build_module<'ctx>(
         builder.position_at_end(entry);
 
         let mut env: Env = Vec::new();
-        for ((name, _), value) in function.params.iter().zip(llvm_function.get_params()) {
-            env.push((name.clone(), Slot::Value(value)));
+        for (param, value) in function.params.iter().zip(llvm_function.get_params()) {
+            env.push((param.name.clone(), Slot::Value(value)));
         }
         cg.body(&mut env, &function.body, function.result)?;
     }
@@ -450,12 +476,12 @@ fn build_module<'ctx>(
             .ok_or_else(|| internal("a lowered method has no receiver parameter"))?
             .into_pointer_value();
         let mut env: Env = vec![(SELF.to_string(), Slot::Mutable(receiver))];
-        for ((name, _), value) in method
+        for (param, value) in method
             .params
             .iter()
             .zip(llvm_function.get_params().into_iter().skip(1))
         {
-            env.push((name.clone(), Slot::Value(value)));
+            env.push((param.name.clone(), Slot::Value(value)));
         }
         cg.body(&mut env, &method.body, method.result)?;
     }
@@ -933,14 +959,27 @@ impl<'ctx> Codegen<'ctx, '_> {
         env: &mut Env<'ctx>,
         loops: &mut Loops<'ctx>,
         name: &str,
-        args: &[TExpr],
+        args: &[TArg],
     ) -> Result<inkwell::values::CallSiteValue<'ctx>, String> {
         let mut llvm_args = Vec::new();
         for arg in args {
-            let value: BasicMetadataValueEnum = self.expr(env, loops, arg)?.into();
-            llvm_args.push(value);
+            llvm_args.push(self.argument(env, loops, arg)?);
         }
         self.invoke(self.functions[name], &llvm_args)
+    }
+
+    /// Specification 011 phase 3 lands reference lowering; until then a checked
+    /// reference argument is refused rather than silently copied by value.
+    fn argument(
+        &self,
+        env: &mut Env<'ctx>,
+        loops: &mut Loops<'ctx>,
+        arg: &TArg,
+    ) -> Result<BasicMetadataValueEnum<'ctx>, String> {
+        match arg {
+            TArg::Value(value) => Ok(self.expr(env, loops, value)?.into()),
+            TArg::Reference(_) => Err(UNLOWERED_REFERENCE.to_string()),
+        }
     }
 
     /// Specification 010 section 15.3: the receiver evaluates exactly once and
@@ -979,7 +1018,7 @@ impl<'ctx> Codegen<'ctx, '_> {
         }
         let mut args: Vec<BasicMetadataValueEnum> = vec![receiver.into()];
         for arg in &call.args {
-            args.push(self.expr(env, loops, arg)?.into());
+            args.push(self.argument(env, loops, arg)?);
         }
         let callee = *self
             .methods

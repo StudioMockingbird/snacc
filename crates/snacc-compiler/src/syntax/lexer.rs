@@ -25,6 +25,9 @@ pub enum Token<'src> {
     Union,
     Method,
     SelfKw,
+    /// `Ref`, reserved by Specification 011 section 4 for the reference
+    /// parameter type. It is never an ordinary identifier.
+    Ref,
     TyDec64,
     TyInt64,
     TyBool,
@@ -66,6 +69,7 @@ impl fmt::Display for Token<'_> {
             Token::Union => write!(f, "union"),
             Token::Method => write!(f, "method"),
             Token::SelfKw => write!(f, "self"),
+            Token::Ref => write!(f, "Ref"),
             Token::TyDec64 => write!(f, "Dec64"),
             Token::TyInt64 => write!(f, "Int64"),
             Token::TyBool => write!(f, "Bool"),
@@ -179,10 +183,16 @@ pub fn lexer<'src>()
         .then_ignore(just('"'))
         .map(Token::Str);
 
-    let op = one_of("+*-/!=<>")
-        .repeated()
-        .at_least(1)
-        .to_slice()
+    // Snacc's only multi-character operators are the four two-character
+    // comparisons, so they are spelled out instead of munched greedily.
+    // Specification 011 section 4 puts `>` in a type position, where a greedy
+    // run would swallow the two closing brackets of `Ref<Ref<T>>` into one
+    // token and hide the nested reference from the parser.
+    let op = just("==")
+        .or(just("!="))
+        .or(just("<="))
+        .or(just(">="))
+        .or(one_of("+*-/!=<>").to_slice())
         .map(Token::Op);
 
     // `.` selects a member and continues a qualified path; `|` introduces a
@@ -202,6 +212,7 @@ pub fn lexer<'src>()
         "union" => Token::Union,
         "method" => Token::Method,
         "self" => Token::SelfKw,
+        "Ref" => Token::Ref,
         "print" => Token::Print,
         "if" => Token::If,
         "then" => Token::Then,
@@ -432,6 +443,42 @@ mod tests {
                 Token::Method,
                 Token::SelfKw,
                 Token::Mut,
+            ]
+        );
+    }
+
+    /// Specification 011 section 4: `Ref` is reserved, and the type brackets are
+    /// the ordinary comparison operator tokens -- never munched into `>>`.
+    #[test]
+    fn ref_is_reserved_and_type_brackets_lex_one_at_a_time() {
+        assert_eq!(
+            lex("Ref<Ref<Int64>>"),
+            vec![
+                Token::Ref,
+                Token::Op("<"),
+                Token::Ref,
+                Token::Op("<"),
+                Token::TyInt64,
+                Token::Op(">"),
+                Token::Op(">"),
+            ]
+        );
+    }
+
+    #[test]
+    fn two_character_comparisons_still_lex_as_one_token() {
+        assert_eq!(
+            lex("a == b != c <= d >= e"),
+            vec![
+                Token::Ident("a"),
+                Token::Op("=="),
+                Token::Ident("b"),
+                Token::Op("!="),
+                Token::Ident("c"),
+                Token::Op("<="),
+                Token::Ident("d"),
+                Token::Op(">="),
+                Token::Ident("e"),
             ]
         );
     }

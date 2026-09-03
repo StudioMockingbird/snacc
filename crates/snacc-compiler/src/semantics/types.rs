@@ -5,9 +5,10 @@
 //! body is resolved, union members are allocated afterwards, and the by-value
 //! layout graph is checked for cycles before expression checking begins.
 
-use crate::semantics::checker::{Error, Ty};
+use crate::semantics::checker::{Error, TParam, Ty};
 use crate::syntax::ast::{
-    ExternFunc, Func, MethodDecl, Param, Program as AstProgram, Span, Spanned, TypeBody, TypeRef,
+    ExternFunc, Func, MethodDecl, Param, ParamMode, Program as AstProgram, Span, Spanned, TypeBody,
+    TypeRef,
 };
 use std::collections::HashMap;
 
@@ -82,7 +83,7 @@ impl TypeDef {
 pub struct MethodSig {
     pub receiver: TypeId,
     pub name: String,
-    pub params: Vec<(String, Ty)>,
+    pub params: Vec<TParam>,
     pub result: Option<Ty>,
     /// Index into the syntax program's `methods`, so bodies can be checked.
     pub decl: usize,
@@ -178,7 +179,7 @@ pub struct Collected {
 
 #[derive(Clone)]
 pub struct FuncSig {
-    pub params: Vec<Ty>,
+    pub params: Vec<TParam>,
     pub result: Option<Ty>,
 }
 
@@ -380,16 +381,19 @@ fn equality_support(defs: &[TypeDef]) -> Vec<bool> {
 
 /// Resolves a parameter list. Duplicate names belong to the function-wide
 /// binding check in the checker, not here.
-fn resolve_params(
-    builder: &Builder,
-    params: &[Param<'_>],
-    errors: &mut Vec<Error>,
-) -> Vec<(String, Ty)> {
+fn resolve_params(builder: &Builder, params: &[Param<'_>], errors: &mut Vec<Error>) -> Vec<TParam> {
     params
         .iter()
         .map(|param| {
+            // Specification 011 section 19 phase 1 step 4: the referent resolves
+            // through ordinary type resolution, and the passing mode is stored
+            // beside the resolved value type.
             let ty = resolve(builder, &param.ty, errors).unwrap_or(Ty::Nil);
-            (param.name.to_string(), ty)
+            TParam {
+                name: param.name.to_string(),
+                ty,
+                mode: param.mode,
+            }
         })
         .collect()
 }
@@ -398,7 +402,7 @@ fn resolve_params(
 /// Rejected here, during declaration collection, so nothing downstream sees one.
 fn reject_bridge_user_types(
     defs: &[Option<TypeDef>],
-    params: &[(String, Ty)],
+    params: &[TParam],
     result: Option<Ty>,
     declaration: &ExternFunc<'_>,
     errors: &mut Vec<Error>,
@@ -412,7 +416,7 @@ fn reject_bridge_user_types(
     };
     let crossing = params
         .iter()
-        .map(|(_, ty)| *ty)
+        .map(|param| param.ty)
         .chain(result)
         .filter(|ty| matches!(ty, Ty::User(_)));
     for ty in crossing {
@@ -424,6 +428,23 @@ fn reject_bridge_user_types(
                 name(ty)
             ),
         });
+    }
+    // Specification 011 section 12.1: a bridge reference refers only to a
+    // permitted by-value scalar. Standalone `Nil` has no storage to refer to.
+    for param in params
+        .iter()
+        .filter(|param| param.mode == ParamMode::Reference)
+    {
+        if param.ty == Ty::Nil {
+            errors.push(Error {
+                span: declaration.span,
+                msg: format!(
+                    "'Ref<Nil>' cannot cross a Rust bridge; a bridge reference refers \
+                     only to a permitted ABI scalar, and '{}' is not one",
+                    name(param.ty)
+                ),
+            });
+        }
     }
 }
 
@@ -584,13 +605,7 @@ pub fn collect(program: &AstProgram<'_>, errors: &mut Vec<Error>) -> Collected {
             .ret
             .as_ref()
             .and_then(|ty| resolve(&builder, ty, errors));
-        sigs.insert(
-            name.to_string(),
-            FuncSig {
-                params: params.into_iter().map(|(_, ty)| ty).collect(),
-                result,
-            },
-        );
+        sigs.insert(name.to_string(), FuncSig { params, result });
     }
     let mut extern_names: Vec<&str> = program.externs.keys().copied().collect();
     extern_names.sort_unstable();
@@ -602,13 +617,7 @@ pub fn collect(program: &AstProgram<'_>, errors: &mut Vec<Error>) -> Collected {
             .as_ref()
             .and_then(|ty| resolve(&builder, ty, errors));
         reject_bridge_user_types(&builder.defs, &params, result, function, errors);
-        sigs.insert(
-            name.to_string(),
-            FuncSig {
-                params: params.into_iter().map(|(_, ty)| ty).collect(),
-                result,
-            },
-        );
+        sigs.insert(name.to_string(), FuncSig { params, result });
     }
 
     // Specification 010 section 6.1: one call head cannot mean two things.

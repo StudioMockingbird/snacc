@@ -1,0 +1,8 @@
+// Specification 011 section 6.1: a reference argument needs a mutable root.
+
+fun add_into(x: Int64, y: Int64, result: Ref<Int64>) do
+    result = x + y
+end
+
+let total: Int64 = 0
+add_into(20, 22, total)
