@@ -648,6 +648,60 @@ A function or method body is a block. If it declares a result type, the body is
 value-required and its value becomes the result; otherwise the body is a
 no-result block.
 
+## Recursion
+
+A function or method may call itself directly, or two or more callables may
+call one another (mutual recursion), including a call to a declaration that
+appears later in the source. Recursion introduces no syntax and no distinct
+call form: declarations are visible throughout the program independent of
+source order, so a recursive or forward call resolves through the ordinary
+declaration table and is checked with the same argument, result, no-result,
+and diagnostic rules as any other call.
+
+~~~snacc
+fun factorial(n: Int64): Int64 do
+    if n == 0 then
+        1
+    else
+        n * factorial(n - 1)
+    end
+end
+
+fun even(n: Int64): Bool do
+    if n == 0 then true else odd(n - 1) end
+end
+
+fun odd(n: Int64): Bool do
+    if n == 0 then false else even(n - 1) end
+end
+~~~
+
+A method may recursively call itself or another statically resolved method.
+Ordinary receiver-mutability rules still apply at every call site: the "may
+assign through `self`" fact is computed as a fixed point over the whole
+call graph, so it remains correct through a self-recursive or mutually
+recursive method cycle. If any method reachable from a call — through any
+number of intermediate calls, including back through the caller itself —
+assigns through `self`, every method in that cycle is treated as assigning
+through `self`, and every call site that reaches it still requires a mutable
+receiver root.
+
+Snacc does not require a syntactic base case and does not prove termination.
+A function or method that recurses without bound is well-typed:
+
+~~~snacc
+fun loop() do
+    loop()
+end
+~~~
+
+Unbounded recursion exhausts the native call stack, or fails some other
+platform-dependent way, at runtime; the compiler diagnoses neither
+nontermination nor probable stack overflow. Snacc makes no tail-call
+guarantee: an implementation may eliminate a tail call when doing so preserves
+observable behavior, but a program cannot depend on that optimization, and a
+recursive call is not required to run in constant stack space.
+
 ## Reference parameters
 
 `Ref<T>` declares a call-scoped mutable reference to caller-owned storage of

@@ -1,0 +1,1 @@
+'RecPoint.rec_bump' may assign through 'self', so its receiver requires a mutable root, but 'point' is not mutable
