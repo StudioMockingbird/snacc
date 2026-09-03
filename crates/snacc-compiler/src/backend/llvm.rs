@@ -424,7 +424,7 @@ fn build_module<'ctx>(
         module: &module,
         functions: &functions,
         methods: &methods,
-        types: &program.types,
+        program,
         layout: &layout,
     };
 
@@ -491,8 +491,9 @@ struct Codegen<'ctx, 'a> {
     functions: &'a HashMap<String, FunctionValue<'ctx>>,
     /// Lowered methods, indexed by `MethodId`.
     methods: &'a [FunctionValue<'ctx>],
-    /// Resolved type definitions, indexed by `TypeId`.
-    types: &'a [TypeDef],
+    /// The checked program, read for type definitions and the receiver-write
+    /// effect, both indexed by their resolved ID.
+    program: &'a Program,
     /// LLVM types for those definitions, indexed by `TypeId`.
     layout: &'a [BasicTypeEnum<'ctx>],
 }
@@ -513,12 +514,16 @@ impl<'ctx> Codegen<'ctx, '_> {
         }
     }
 
+    fn def(&self, id: TypeId) -> &'_ TypeDef {
+        &self.program.types[id.index()]
+    }
+
     /// The declared type of one field of a struct or union-member type.
     fn field_ty(&self, ty: Ty, index: usize) -> Result<Ty, String> {
         let Ty::User(id) = ty else {
             return Err(internal("a field path reached a built-in type"));
         };
-        self.types[id.index()]
+        self.def(id)
             .fields()
             .and_then(|fields| fields.get(index))
             .map(|(_, ty)| *ty)
@@ -527,7 +532,7 @@ impl<'ctx> Codegen<'ctx, '_> {
 
     /// A union member's deterministic source-order tag.
     fn member_tag(&self, member: TypeId) -> Result<u32, String> {
-        match &self.types[member.index()] {
+        match self.def(member) {
             TypeDef::UnionMember { tag, .. } => Ok(*tag),
             _ => Err(internal(
                 "injection named a type that is not a union member",
@@ -949,19 +954,29 @@ impl<'ctx> Codegen<'ctx, '_> {
         loops: &mut Loops<'ctx>,
         call: &TMethodCall,
     ) -> Result<inkwell::values::CallSiteValue<'ctx>, String> {
-        let receiver = match &call.receiver {
+        let (receiver, borrowed) = match &call.receiver {
             TReceiver::Place(place) => match self.place_ptr(env, place)? {
-                Some((ptr, _)) => ptr,
+                Some((ptr, _)) => (ptr, true),
                 None => {
                     let value = self.place_value(env, place)?;
-                    self.materialize(value, SELF)?
+                    (self.materialize(value, SELF)?, false)
                 }
             },
             TReceiver::Value(value) => {
                 let value = self.expr(env, loops, value)?;
-                self.materialize(value, SELF)?
+                (self.materialize(value, SELF)?, false)
             }
         };
+        // Compiler-owned storage is discarded when the call returns, so a
+        // method that may assign through `self` must have reached the caller's
+        // own storage. The checker enforces a mutable receiver root for exactly
+        // that case; this catches the write being silently dropped if it ever
+        // did not.
+        if !borrowed && self.program.methods[call.method.index()].writes_receiver {
+            return Err(internal(
+                "a receiver-writing method call reached a receiver with no caller storage",
+            ));
+        }
         let mut args: Vec<BasicMetadataValueEnum> = vec![receiver.into()];
         for arg in &call.args {
             args.push(self.expr(env, loops, arg)?.into());
@@ -1106,7 +1121,7 @@ impl<'ctx> Codegen<'ctx, '_> {
             }
             .map_err(|error| error.to_string());
         };
-        match &self.types[id.index()] {
+        match self.def(id) {
             // A represented type is its target at runtime, so it delegates.
             TypeDef::Represented { target, .. } => self.equal(*target, left, right),
             TypeDef::Struct { fields, .. } | TypeDef::UnionMember { fields, .. } => {
