@@ -74,6 +74,90 @@ fn every_new_scalar_lowers_to_llvm() {
     }
 }
 
+/// Specification 010 sections 15.2-15.4 and conformance items 20 and 29. These
+/// are the lowering facts the run corpus cannot observe from stdout: a union's
+/// LLVM shape, its deterministic `i32` source-order tags, the zero-initialized
+/// aggregate every injection starts from, and the hidden receiver pointer.
+#[test]
+fn unions_lower_to_a_tag_and_one_storage_field_per_member() {
+    let ir = emit_llvm_ir(
+        "type Shade is union\n\
+        \x20   | Dim\n\
+        \x20   | Mid is struct\n\
+        \x20       level: Int64,\n\
+        \x20     end\n\
+        \x20   | Full is struct\n\
+        \x20       level: Int64,\n\
+        \x20       hue: Int64,\n\
+        \x20     end\n\
+         end\n\
+         method Shade.Full.total(): Int64 do self.level + self.hue end\n\
+         fun wrap(level: Int64): Shade do Shade.Mid(level: level) end\n\
+         fun rank(shade: Shade): Int64 do\n\
+        \x20   if shade is Shade.Dim then 0\n\
+        \x20   elseif shade is Shade.Mid(mid) then mid.level\n\
+        \x20   elseif shade is Shade.Full(full) then full.total()\n\
+        \x20   end\n\
+         end\n\
+         print(rank(wrap(3)))\n",
+    )
+    .unwrap_or_else(|error| panic!("LLVM emission failed: {error:?}"));
+
+    // One `i32` tag plus one storage field per member, in source order.
+    assert!(
+        ir.contains("%Shade = type { i32, %Shade.Dim, %Shade.Mid, %Shade.Full }"),
+        "wrong union layout in:\n{ir}"
+    );
+    assert!(
+        ir.contains("%Shade.Dim = type {}"),
+        "an empty member is not an empty struct in:\n{ir}"
+    );
+
+    // Every `is` test compares the stored tag against its member's source
+    // position, so the three tags are exactly 0, 1, and 2.
+    let mut tags: Vec<&str> = ir
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("%is"))
+        .filter_map(|line| line.rsplit_once("icmp eq i32 %tag"))
+        .map(|(_, rest)| rest.rsplit_once(", ").expect("a tag comparison").1)
+        .collect();
+    tags.sort_unstable();
+    assert_eq!(tags, ["0", "1", "2"], "wrong union tags in:\n{ir}");
+
+    // Injection starts from the complete union's zero initializer, so every
+    // inactive member slot is deterministic rather than poison.
+    let injections: Vec<&str> = ir
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("insertvalue %Shade "))
+        .collect();
+    assert!(!injections.is_empty(), "no union injection in:\n{ir}");
+    for injection in injections {
+        assert!(
+            injection.contains("%Shade.Dim zeroinitializer")
+                && injection.contains("%Shade.Full zeroinitializer"),
+            "an injection skipped zero initialization: {injection}"
+        );
+    }
+
+    // A method is an internal function whose hidden first parameter is the
+    // receiver's address; the symbol is derived from the receiver and method
+    // IDs and is not public ABI.
+    assert!(
+        ir.lines().any(
+            |line| line.starts_with("define internal i64 @snacc_method_") && line.contains("(ptr ")
+        ),
+        "no method with a hidden receiver pointer in:\n{ir}"
+    );
+
+    // A proven-exhaustive chain has no `else`; its fall-through traps instead
+    // of producing a value.
+    assert!(
+        ir.contains("unreachable"),
+        "an exhaustive chain kept a fall-through value path in:\n{ir}"
+    );
+}
+
 /// Specification 009 section 5.2: sub-word bridge parameters and results carry
 /// the same `zeroext` attribute rustc emits for `extern "C"` `u8`/`u16`, on the
 /// declaration and on the call site. `UInt32` and wider carry none.

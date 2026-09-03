@@ -98,7 +98,18 @@ pub fn emit_object(source: &str) -> Result<Vec<u8>, Diagnostics> {
 /// no object file preserves, can be inspected.
 pub fn emit_llvm_ir(source: &str) -> Result<String, Diagnostics> {
     let program = check(source)?;
-    backend::llvm::compile_to_ir(&program, "snacc").map_err(Diagnostics::backend)
+    backend::llvm::compile_to_ir(&program, "snacc").map_err(backend_failure)
+}
+
+/// Specification 010 section 19 phase 5 step 7: a lowering failure the backend
+/// marks as a compiler bug -- an LLVM verifier rejection, or a checked-program
+/// invariant the checker promised and did not deliver -- is reported as an
+/// internal error rather than an ordinary backend diagnostic.
+fn backend_failure(error: String) -> Diagnostics {
+    match error.strip_prefix(backend::llvm::INTERNAL_ERROR) {
+        Some(detail) => Diagnostics::internal(detail.to_string()),
+        None => Diagnostics::backend(error),
+    }
 }
 
 pub fn target_triple() -> String {
@@ -122,5 +133,5 @@ pub fn emit_object_with_options(
             optimization: options.optimization,
             abi_version: ABI_VERSION,
         })
-        .map_err(Diagnostics::backend)
+        .map_err(backend_failure)
 }

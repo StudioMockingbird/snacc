@@ -870,6 +870,13 @@ fn rust_abi_type(ty: Ty) -> &'static str {
         Ty::UInt32 => "u32",
         Ty::UInt64 => "u64",
         Ty::Float32 => "f32",
+        // Specification 010 section 16: declaration collection rejects every
+        // user-defined type at every `extern rust` parameter and result, so a
+        // bridge signature that reaches assertion rendering never contains one.
+        Ty::User(_) => unreachable!(
+            "internal error: user-defined type reached bridge rendering; \
+             Specification 010 section 16 rejects it during declaration collection"
+        ),
     }
 }
 

@@ -1,0 +1,183 @@
+// Specification 010 conformance 5, 7-11, 14, 17-18, 20, 25, and 29, executed
+// through a real compiled program. Every user-defined value is observed through
+// a scalar field, an unwrap, or a Bool, because section 14 does not let `print`
+// take a user-defined type.
+
+type Meters is Int64
+
+type Vec2 is struct
+    x: Dec64,
+    y: Dec64,
+end
+
+type Tag is struct end
+
+type Nested is struct
+    origin: Vec2,
+    span: Vec2,
+end
+
+// A scalar field of every Specification 009 width, carried inside a struct.
+type Packet is struct
+    code: UInt8,
+    ratio: Float32,
+end
+
+type Figure is union
+    | Dot
+    | Segment is struct
+        length: Int64,
+      end
+    | Box is struct
+        width: Int64,
+        height: Int64,
+      end
+end
+
+type Maybe is union
+    | Some is struct
+        value: Meters,
+      end
+    | Nil
+end
+
+method Vec2.dot_self(): Dec64 do
+    self.x * self.x + self.y * self.y
+end
+
+method Vec2.shift(dx: Dec64, dy: Dec64) do
+    self.x = self.x + dx
+    self.y = self.y + dy
+end
+
+method Vec2.clear() do
+    self = Vec2(x: 0.0, y: 0.0)
+end
+
+method Figure.Box.area(): Int64 do
+    self.width * self.height
+end
+
+// An exhaustive `is` chain over every member -- one empty, two data-carrying --
+// produces a value with no `else` at all.
+fun figure_area(figure: Figure): Int64 do
+    if figure is Figure.Dot then
+        0
+    elseif figure is Figure.Segment(segment) then
+        segment.length
+    elseif figure is Figure.Box(shape) then
+        shape.area()
+    end
+end
+
+// The no-binding form is an ordinary Bool condition for every member tag.
+fun figure_is_box(figure: Figure): Bool do
+    if figure is Figure.Box then
+        true
+    else
+        false
+    end
+end
+
+fun maybe_meters(maybe: Maybe): Int64 do
+    if maybe is Maybe.Some(present) then
+        Int64(present.value)
+    elseif maybe is Nil then
+        0 - 1
+    end
+end
+
+// A no-result function (RFC 008) reading struct fields of Specification 009
+// scalar types.
+fun report(packet: Packet) do
+    print(packet.code)
+    print(packet.ratio)
+end
+
+fun trace(value: Int64): Int64 do
+    print(value)
+    value
+end
+
+// A represented type wraps and unwraps exactly one layer and compares through
+// its representation.
+let distance: Meters = Meters(120)
+print(Int64(distance))
+print(distance == Meters(120))
+print(distance == Meters(121))
+
+// An empty struct has exactly one value.
+print(Tag() == Tag())
+
+// Struct equality is field-by-field in declaration order and ignores the order
+// the named arguments were written in.
+print(Vec2(x: 1.5, y: 2.5) == Vec2(y: 2.5, x: 1.5))
+print(Vec2(x: 1.5, y: 2.5) == Vec2(x: 1.5, y: 9.5))
+
+let outer_nest: Nested = Nested(origin: Vec2(x: 1.0, y: 2.0), span: Vec2(x: 3.0, y: 4.0))
+let same_nest: Nested = Nested(origin: Vec2(x: 1.0, y: 2.0), span: Vec2(x: 3.0, y: 4.0))
+let other_nest: Nested = Nested(origin: Vec2(x: 1.0, y: 2.0), span: Vec2(x: 3.0, y: 9.0))
+print(outer_nest == same_nest)
+print(outer_nest == other_nest)
+
+// Union equality compares tags first, then only the active member.
+let dot: Figure = Figure.Dot()
+let dot_again: Figure = Figure.Dot()
+let segment: Figure = Figure.Segment(length: 7)
+let boxed: Figure = Figure.Box(width: 3, height: 4)
+let boxed_again: Figure = Figure.Box(width: 3, height: 4)
+let boxed_other: Figure = Figure.Box(width: 3, height: 5)
+print(dot == dot_again)
+print(dot == segment)
+print(segment == boxed)
+print(boxed == boxed_again)
+print(boxed == boxed_other)
+
+// A union value retains and reads every member shape, including a member method
+// reached through a type-test binding.
+print(figure_area(dot))
+print(figure_area(segment))
+print(figure_area(boxed))
+
+print(figure_is_box(dot))
+print(figure_is_box(segment))
+print(figure_is_box(boxed))
+
+// A `Nil` member, reached through the contextual `nil` spelling.
+let absent: Maybe = nil
+let present: Maybe = Maybe.Some(value: Meters(5))
+print(maybe_meters(absent))
+print(maybe_meters(present))
+print(absent == nil)
+print(present == nil)
+print(absent == present)
+
+// A read-only method works on an immutable variable and on a temporary.
+let fixed: Vec2 = Vec2(x: 3.0, y: 4.0)
+print(fixed.dot_self())
+print(Vec2(x: 1.0, y: 2.0).dot_self())
+
+// A field-writing method and a whole-`self`-replacing method both write the
+// caller's storage through a mutable root.
+let mut movable: Vec2 = Vec2(x: 3.0, y: 4.0)
+movable.shift(1.0, 2.0)
+print(movable.x)
+print(movable.y)
+print(movable.dot_self())
+movable.clear()
+print(movable.dot_self())
+
+// Root mutability reaches through a complete field path.
+let mut nest: Nested = Nested(origin: Vec2(x: 1.0, y: 2.0), span: Vec2(x: 3.0, y: 4.0))
+nest.origin.x = 9.0
+print(nest.origin.x)
+print(nest.span.y)
+print(nest == outer_nest)
+
+// Constructor arguments evaluate once, from left to right, in the order they
+// were written -- not in field declaration order.
+let traced: Nested = Nested(span: Vec2(x: trace(1), y: trace(2)), origin: Vec2(x: trace(3), y: trace(4)))
+print(traced.origin.x)
+print(traced.span.y)
+
+report(Packet(code: 200u8, ratio: 1.5f32))
