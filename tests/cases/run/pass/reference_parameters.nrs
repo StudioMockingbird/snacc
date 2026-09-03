@@ -1,0 +1,179 @@
+// Specification 011 conformance 1-2, 4-5, 7-11, 13, 15, and 23, executed
+// through a real compiled program. The declaration-site and call-site
+// rejections (items 3, 6, 12, 14, 16-17) are diagnostics, so they live in the
+// parse and typecheck corpora instead.
+
+type RefCount is Int64
+
+type RefPoint is struct
+    x: Int64,
+    y: Int64,
+end
+
+type RefShape is union
+    | RefEmpty
+    | RefFilled is struct
+        size: Int64,
+      end
+end
+
+// Conformance 2: the canonical example from section 4.
+fun ref_add_into(x: Int64, y: Int64, result: Ref<Int64>) do
+    result = x + y
+end
+
+// Conformance 1: an automatic read participates in arithmetic and the write is
+// observed by the caller.
+fun ref_bump(counter: Ref<Int64>, by: Int64) do
+    counter = counter + by
+end
+
+fun ref_double(value: Int64): Int64 do
+    value * 2
+end
+
+// Conformance 7, 23: an automatic read is an ordinary `Int64` for printing,
+// comparison, a value call, and the `Int64` to `Dec64` widening. No print
+// symbol beyond the existing `Int64` one is involved.
+fun ref_observe(value: Ref<Int64>): Dec64 do
+    print(value)
+    print(value > 0)
+    print(ref_double(value))
+    value + 0.5
+end
+
+// Conformance 10: forwarding a reference parameter reborrows it for the nested
+// call, which reaches the original caller storage.
+fun ref_forward(target: Ref<Int64>) do
+    ref_bump(target, 10)
+end
+
+// Conformance 11: passing a reference parameter to a value parameter copies the
+// value it holds at that moment.
+fun ref_copy_then_change(value: Ref<Int64>): Int64 do
+    let copied: Int64 = value
+    value = value + 100
+    copied
+end
+
+// Conformance 15: the value argument observes the pre-call value even though
+// the same place is also passed by reference.
+fun ref_replace(previous: Int64, value: Ref<Int64>) do
+    value = previous + 1
+end
+
+// Conformance 8: assignment through a reference replaces a complete
+// represented, struct, and union value.
+fun ref_set_count(count: Ref<RefCount>) do
+    count = RefCount(7)
+end
+
+fun ref_reset_point(point: Ref<RefPoint>) do
+    point = RefPoint(x: 0, y: 0)
+end
+
+fun ref_fill(shape: Ref<RefShape>) do
+    shape = RefShape.RefFilled(size: 3)
+end
+
+// Conformance 9: field reads and writes through `Ref<Struct>` affect the
+// caller's struct.
+fun ref_move_point(point: Ref<RefPoint>, dx: Int64, dy: Int64) do
+    point.x = point.x + dx
+    point.y = point.y + dy
+end
+
+fun ref_exchange(left: Ref<Int64>, right: Ref<Int64>) do
+    let saved: Int64 = left
+    left = right
+    right = saved
+end
+
+method RefPoint.ref_scale(factor: Int64) do
+    self.x = self.x * factor
+    self.y = self.y * factor
+end
+
+// A reference parameter is a mutable root, so a receiver-writing method may be
+// called through one.
+fun ref_scale_through(point: Ref<RefPoint>, factor: Int64) do
+    point.ref_scale(factor)
+end
+
+// A method may itself take a reference parameter; the receiver and the
+// reference are distinct roots here, so they do not overlap.
+method RefPoint.ref_grow(step: Ref<Int64>) do
+    self.x = self.x + step
+    step = step + 1
+end
+
+// Conformance 2, 4: an initialized mutable local used operationally as an
+// output parameter.
+let ref_x: Int64 = 20
+let ref_y: Int64 = 22
+let mut ref_z: Int64 = 0
+ref_add_into(ref_x, ref_y, ref_z)
+print(ref_z)
+
+// Conformance 1: the callee reads and changes the caller's mutable local. The
+// second call also reads the same place by value, before the borrow begins.
+let mut ref_counter: Int64 = 1
+ref_bump(ref_counter, 4)
+print(ref_counter)
+ref_bump(ref_counter, ref_counter)
+print(ref_counter)
+
+// Conformance 7, 23.
+let mut ref_observed: Int64 = 6
+print(ref_observe(ref_observed))
+
+// Conformance 10.
+let mut ref_forwarded: Int64 = 1
+ref_forward(ref_forwarded)
+print(ref_forwarded)
+
+// Conformance 11: the copy holds the value taken before the write.
+let mut ref_copied: Int64 = 3
+print(ref_copy_then_change(ref_copied))
+print(ref_copied)
+
+// Conformance 15: `previous` is 4, so the referent becomes 5, not 6.
+let mut ref_number: Int64 = 4
+ref_replace(ref_number, ref_number)
+print(ref_number)
+
+// Conformance 8.
+let mut ref_count: RefCount = RefCount(1)
+ref_set_count(ref_count)
+print(Int64(ref_count))
+
+let mut ref_point: RefPoint = RefPoint(x: 3, y: 4)
+ref_reset_point(ref_point)
+print(ref_point.x)
+print(ref_point.y)
+
+let mut ref_shape: RefShape = RefShape.RefEmpty()
+ref_fill(ref_shape)
+let ref_expected: RefShape = RefShape.RefFilled(size: 3)
+print(ref_shape == ref_expected)
+
+// Conformance 9.
+let mut ref_moved: RefPoint = RefPoint(x: 1, y: 2)
+ref_move_point(ref_moved, 10, 20)
+print(ref_moved.x)
+print(ref_moved.y)
+
+// Conformance 5, 13: two statically distinct fields of one mutable struct pass
+// by reference together.
+ref_exchange(ref_moved.x, ref_moved.y)
+print(ref_moved.x)
+print(ref_moved.y)
+
+ref_scale_through(ref_moved, 2)
+print(ref_moved.x)
+print(ref_moved.y)
+
+let mut ref_step: Int64 = 5
+ref_moved.ref_grow(ref_step)
+print(ref_moved.x)
+print(ref_step)

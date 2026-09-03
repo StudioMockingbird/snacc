@@ -6,11 +6,11 @@ mod syntax;
 use chumsky::prelude::*;
 
 pub use diagnostics::{Diagnostic, DiagnosticPhase, Diagnostics};
-pub use semantics::checker::{Program, Ty};
-pub use syntax::ast::Program as AstProgram;
+pub use semantics::checker::{Program, TParam, Ty};
+pub use syntax::ast::{ParamMode, Program as AstProgram};
 
 /// Contract version for generated objects, runtime imports, and Rust bridges.
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Optimization {

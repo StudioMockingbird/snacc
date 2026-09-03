@@ -265,6 +265,10 @@ fn declare<'ctx>(
 /// A declaration without a result lowers to an LLVM `void` function; no value
 /// type stands in for its absent result. `leading` supplies the hidden receiver
 /// pointer of a method (Specification 010 section 15.3) and is empty otherwise.
+///
+/// Specification 011 section 11: a `Ref<T>` parameter lowers to a pointer to
+/// the caller's storage. Pointers are opaque in this LLVM version, so the
+/// referent's own type never appears in the signature.
 fn function_type<'ctx>(
     context: &'ctx Context,
     layout: &[BasicTypeEnum<'ctx>],
@@ -274,7 +278,10 @@ fn function_type<'ctx>(
 ) -> FunctionType<'ctx> {
     let mut llvm_params = leading.to_vec();
     for param in params {
-        llvm_params.push(llvm_ty(context, layout, param.ty).into());
+        llvm_params.push(match param.mode {
+            ParamMode::Value => llvm_ty(context, layout, param.ty).into(),
+            ParamMode::Reference => context.ptr_type(AddressSpace::default()).into(),
+        });
     }
     match result {
         Some(ty) => llvm_ty(context, layout, ty).fn_type(&llvm_params, false),
@@ -291,6 +298,17 @@ enum Slot<'ctx> {
 }
 
 type Env<'ctx> = Vec<(String, Slot<'ctx>)>;
+
+/// How one incoming parameter binds. A `Ref<T>` parameter is a mutable root of
+/// its referent (Specification 011 section 7), and its incoming LLVM value is
+/// already the address of the caller's storage -- so it binds as the very slot
+/// shape a `let mut` local uses, with no `alloca` of its own.
+fn param_slot<'ctx>(param: &TParam, value: BasicValueEnum<'ctx>) -> Slot<'ctx> {
+    match param.mode {
+        ParamMode::Value => Slot::Value(value),
+        ParamMode::Reference => Slot::Mutable(value.into_pointer_value()),
+    }
+}
 
 /// Returns the host triple used for native object emission.
 pub fn target_triple() -> String {
@@ -358,37 +376,12 @@ pub fn compile_to_ir(program: &Program, module_name: &str) -> Result<String, Str
     Ok(module.print_to_string().to_string())
 }
 
-/// Specification 011 phase 3 (Milestone 4 task B) lowers `Ref<T>` to a pointer
-/// parameter. Until then the checker accepts reference parameters and this
-/// backend refuses them, rather than emitting a by-value signature that would
-/// silently drop the callee's writes.
-const UNLOWERED_REFERENCE: &str = "reference parameters are checked but not yet lowered to LLVM";
-
-fn reject_unlowered_references(program: &Program) -> Result<(), String> {
-    let declarations = program
-        .funcs
-        .values()
-        .map(|function| &function.params)
-        .chain(program.externs.values().map(|function| &function.params))
-        .chain(program.methods.iter().map(|method| &method.params));
-    for params in declarations {
-        if params
-            .iter()
-            .any(|param| param.mode == ParamMode::Reference)
-        {
-            return Err(UNLOWERED_REFERENCE.to_string());
-        }
-    }
-    Ok(())
-}
-
 fn build_module<'ctx>(
     context: &'ctx Context,
     program: &Program,
     module_name: &str,
     machine: &TargetMachine,
 ) -> Result<Module<'ctx>, String> {
-    reject_unlowered_references(program)?;
     let triple = TargetMachine::get_default_triple();
     let module = context.create_module(module_name);
     let builder = context.create_builder();
@@ -461,7 +454,7 @@ fn build_module<'ctx>(
 
         let mut env: Env = Vec::new();
         for (param, value) in function.params.iter().zip(llvm_function.get_params()) {
-            env.push((param.name.clone(), Slot::Value(value)));
+            env.push((param.name.clone(), param_slot(param, value)));
         }
         cg.body(&mut env, &function.body, function.result)?;
     }
@@ -481,7 +474,7 @@ fn build_module<'ctx>(
             .iter()
             .zip(llvm_function.get_params().into_iter().skip(1))
         {
-            env.push((param.name.clone(), Slot::Value(value)));
+            env.push((param.name.clone(), param_slot(param, value)));
         }
         cg.body(&mut env, &method.body, method.result)?;
     }
@@ -968,8 +961,9 @@ impl<'ctx> Codegen<'ctx, '_> {
         self.invoke(self.functions[name], &llvm_args)
     }
 
-    /// Specification 011 phase 3 lands reference lowering; until then a checked
-    /// reference argument is refused rather than silently copied by value.
+    /// Specification 011 section 11: a reference argument passes the address of
+    /// its checked place, never a copy of its value. The checker already
+    /// required a mutable root, so `place_ptr` always finds storage here.
     fn argument(
         &self,
         env: &mut Env<'ctx>,
@@ -978,7 +972,12 @@ impl<'ctx> Codegen<'ctx, '_> {
     ) -> Result<BasicMetadataValueEnum<'ctx>, String> {
         match arg {
             TArg::Value(value) => Ok(self.expr(env, loops, value)?.into()),
-            TArg::Reference(_) => Err(UNLOWERED_REFERENCE.to_string()),
+            TArg::Reference(place) => match self.place_ptr(env, place)? {
+                Some((ptr, _)) => Ok(ptr.into()),
+                None => Err(internal(
+                    "a reference argument reached a place with no storage",
+                )),
+            },
         }
     }
 

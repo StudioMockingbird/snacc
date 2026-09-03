@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use snacc_compiler::{
-    CompileOptions, Diagnostics, Optimization, Program, Ty, check, emit_object_with_options,
+    CompileOptions, Diagnostics, Optimization, ParamMode, Program, TParam, Ty, check,
+    emit_object_with_options,
 };
 use std::env;
 use std::fs;
@@ -880,6 +881,17 @@ fn rust_abi_type(ty: Ty) -> &'static str {
     }
 }
 
+/// Specification 011 section 12.2: `Ref<T>` maps to `&mut R` where `R` is the
+/// referent's existing scalar mapping. A value parameter and a reference
+/// parameter are never interchangeable, so the assertion spells the reference
+/// out and a mode change fails the generated `const _` on the next build.
+fn rust_abi_param_type(param: &TParam) -> String {
+    match param.mode {
+        ParamMode::Value => rust_abi_type(param.ty).to_string(),
+        ParamMode::Reference => format!("&mut {}", rust_abi_type(param.ty)),
+    }
+}
+
 /// A bridge without a result (`TExtern.result: None`) has a C ABI result of
 /// `void`; the Rust assertion for it spells that out as `-> ()` explicitly
 /// rather than omitting the arrow, so every generated line keeps the same
@@ -907,7 +919,7 @@ fn render_bridge_assertions(checked: &Program, entry: &Path, source: &str) -> St
         let params = extern_decl
             .params
             .iter()
-            .map(|param| rust_abi_type(param.ty))
+            .map(rust_abi_param_type)
             .collect::<Vec<_>>()
             .join(", ");
         let (line, column) = line_column(source, extern_decl.span.start);

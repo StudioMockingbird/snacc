@@ -197,3 +197,69 @@ fn sub_word_bridge_declarations_and_calls_carry_zeroext() {
         );
     }
 }
+
+/// Specification 011 section 11: the lowering facts the run corpus cannot
+/// observe from stdout. A `Ref<T>` parameter is a `ptr` in the signature and
+/// binds directly to the incoming value -- unlike a `let mut` local, it gets no
+/// `alloca` of its own -- and every call site (internal, forwarded, and bridge)
+/// passes the caller's address with no intervening copy.
+#[test]
+fn a_reference_parameter_lowers_to_a_pointer_with_no_alloca_of_its_own() {
+    let ir = emit_llvm_ir(
+        "extern rust \"snacc_user_scale\" fun scale(value: Ref<Int64>, by: Int64)\n\
+         fun add_into(x: Int64, y: Int64, result: Ref<Int64>) do result = x + y end\n\
+         fun forward(target: Ref<Int64>) do add_into(1, 2, target) end\n\
+         let mut z: Int64 = 0\n\
+         add_into(20, 22, z)\n\
+         forward(z)\n\
+         scale(z, 3)\n\
+         print(z)\n",
+    )
+    .unwrap_or_else(|error| panic!("LLVM emission failed: {error:?}"));
+
+    // The referent's own type never appears: pointers are opaque, and a value
+    // parameter beside a reference one keeps its by-value type.
+    assert!(
+        ir.contains("define internal void @snacc_fn_add_into(i64 %0, i64 %1, ptr %2)"),
+        "wrong reference parameter signature in:\n{ir}"
+    );
+    assert!(
+        ir.contains("declare void @snacc_user_scale(ptr, i64)"),
+        "wrong bridge reference parameter signature in:\n{ir}"
+    );
+
+    // The whole point of Design Decision 2: the incoming value already is the
+    // address, so the callee allocates nothing and stores straight through it.
+    let body = ir
+        .split("define internal void @snacc_fn_add_into")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}").next())
+        .expect("add_into was not lowered");
+    assert!(
+        !body.contains("alloca"),
+        "a reference parameter must not get an alloca of its own:\n{body}"
+    );
+    assert!(
+        body.contains("store i64 %add, ptr %2"),
+        "an assignment through a reference must store through the incoming pointer:\n{body}"
+    );
+
+    // A `let mut` local, by contrast, does allocate -- and that same allocation
+    // is what every reference argument passes, unloaded and uncopied, including
+    // the reborrow that forwards its own incoming pointer straight on.
+    assert!(
+        ir.contains("%z = alloca i64"),
+        "missing local storage in:\n{ir}"
+    );
+    for expected in [
+        "call void @snacc_fn_add_into(i64 20, i64 22, ptr %z)",
+        "call void @snacc_fn_forward(ptr %z)",
+        "call void @snacc_user_scale(ptr %z, i64 3)",
+        "call void @snacc_fn_add_into(i64 1, i64 2, ptr %0)",
+    ] {
+        assert!(
+            ir.contains(expected),
+            "a reference argument did not pass an address directly ({expected}):\n{ir}"
+        );
+    }
+}

@@ -31,7 +31,10 @@ union-member         = "|", ( "Nil"
                      | identifier, [ "is", struct-body ] ) ;
 
 qualified-name       = identifier, { ".", identifier } ;
-type                 = builtin-value-type | qualified-name ;
+type                 = value-type | reference-parameter-type ;
+reference-parameter-type
+                     = "Ref", "<", value-type, ">" ;
+value-type           = builtin-value-type | qualified-name ;
 unsigned-type        = "UInt8" | "UInt16" | "UInt32" | "UInt64" ;
 builtin-value-type   = "Int64" | "Dec64" | "Bool" | "Nil"
                      | unsigned-type
@@ -110,7 +113,10 @@ digit                = "0" | "1" | "2" | "3" | "4"
    (`Int64(id)`); a type name alone is never a value. The grammar admits a named
    type wherever a `type` appears, including a Rust bridge signature; that a
    user-defined type may not cross the bridge is a semantic rule, diagnosed by
-   the checker. *)
+   the checker. A `reference-parameter-type` is permitted only as the direct
+   declared type of a `parameter`; it is rejected in every other `type`
+   position, and `Ref<Ref<T>>` is never permitted. The `<` and `>` around a
+   referent are type delimiters, not ordered comparisons. *)
 ```
 
 String escapes do not exist.
@@ -118,7 +124,7 @@ String escapes do not exist.
 The keywords `fun`, `extern`, `rust`, `let`, `mut`, `print`, `if`, `then`,
 `elseif`, `else`, `while`, `do`, `break`, `end`, `true`, `false`, `nil`,
 `null`, `type`, `is`, `struct`, `union`, `method`, `self`, `Int64`, `Dec64`,
-`Bool`, `Nil`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, and `Float32` are
+`Bool`, `Nil`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, `Float32`, and `Ref` are
 reserved and cannot be used as identifiers.
 Operators of the same precedence associate left to right. Calls, field access,
 and method calls bind more tightly than arithmetic, arithmetic binds more
@@ -626,6 +632,100 @@ A function or method body is a block. If it declares a result type, the body is
 value-required and its value becomes the result; otherwise the body is a
 no-result block.
 
+## Reference parameters
+
+`Ref<T>` declares a call-scoped mutable reference to caller-owned storage of
+type `T`. It may be the direct declared type of a top-level function
+parameter, an explicit method parameter, or an `extern rust` parameter, and
+nowhere else:
+
+~~~snacc
+fun add_into(x: Int64, y: Int64, result: Ref<Int64>) do
+    result = x + y
+end
+
+let x: Int64 = 20
+let y: Int64 = 22
+let mut z: Int64 = 0
+add_into(x, y, z)
+print(z) // 42
+~~~
+
+`Ref<T>` is not a value type and never becomes one. It may not be a function or
+method result, a local binding type, a struct field type, a represented type's
+representation, a union or union-member type, the author-written type of
+`self`, or nested inside another type, including another reference: `Ref<Ref<T>>`
+does not exist. There is no address-of or dereference operator, no reference
+literal, and no way to construct, store, return, or compare a reference. A
+reference therefore cannot outlive the call that created it, and no escape
+analysis is required.
+
+An argument for a `Ref<T>` parameter is written like any other argument, and
+must be an initialized mutable place of exact type `T`: a `let mut` local, a
+reference parameter, `self`, or a field path rooted at one of those. A literal,
+a call result, an arithmetic or conditional result, and a plain `let` binding
+are all rejected. The referent type is matched exactly: neither the `Int64` to
+`Dec64` widening nor a represented type's equivalence to its representation
+applies, so an `Int64` place is not a valid argument for `Ref<Dec64>`, and a
+`UserId` place is not one for `Ref<Int64>`.
+
+Inside the callee, a reference parameter is dereferenced automatically. Its
+name denotes the referent, so it reads, participates in arithmetic and
+comparison, prints, converts, and is passed by value exactly as a `T` would be,
+and assigning to it replaces the caller's complete value:
+
+~~~snacc
+fun bump(counter: Ref<Int64>, by: Int64) do
+    counter = counter + by
+end
+~~~
+
+Field selection, field assignment, and method calls through a reference
+parameter reach the caller's storage the same way, and a reference parameter is
+a mutable root, so a receiver-writing method may be called on one. Passing a
+reference parameter to another `Ref<T>` parameter reborrows it for the nested
+call and needs no extra syntax; passing it to a value parameter copies its
+current value at that moment.
+
+Each `Ref<T>` parameter has exclusive access to its referent for the duration
+of the call. Two reference arguments in one call must not overlap, and two
+places overlap when they are identical or one is reached by selecting fields
+from the other. Two distinct fields of the same struct do not overlap:
+
+~~~snacc
+exchange(value, value)     // error: overlapping reference arguments
+exchange(point.x, point.y) // valid when point is a mutable root
+use_both(point, point.x)   // error when both parameters are Ref
+~~~
+
+For a method call, an addressable receiver place participates in the same
+check, whether the method writes through `self` or only reads it. A temporary
+receiver has independent storage and cannot overlap a caller place.
+
+Arguments are processed left to right. A value argument evaluates to and keeps
+its value; a reference argument evaluates its place once and keeps that place's
+identity. Every borrow begins only after all arguments are processed, so
+reading a place by value and also passing it by reference in the same call is
+valid, and the value argument holds the value read before the call:
+
+~~~snacc
+fun replace(previous: Int64, value: Ref<Int64>) do
+    value = previous + 1
+end
+
+let mut number: Int64 = 4
+replace(number, number)
+print(number) // 5
+~~~
+
+A write through a reference is visible to the caller immediately and stays
+visible after the call returns. `Ref<T>` provides no transaction, rollback, or
+definite-write semantics: a function may return without changing its referent,
+and every write completed before the selected return remains visible.
+
+Changing a parameter between `T` and `Ref<T>` is a breaking signature change
+for every caller and, for a bridge, for the host.
+
 ## Rust bridge
 
 `extern rust` declares a host function implemented with the platform C ABI. Its
@@ -658,6 +758,30 @@ attribute the target C ABI requires, matching Rust's and Clang's `zeroext`
 behavior; `Bool` carries the same attribute for consistency. Rust bridges
 must not unwind across the ABI boundary.
 
+A bridge parameter may use `Ref<T>` only when `T` is one of those by-value
+scalars; standalone `Nil` has no storage to refer to and is excluded, as is
+every user-defined type. `Ref<T>` maps to `&mut R`, where `R` is the referent's
+own ABI representation:
+
+| Snacc | Rust bridge parameter |
+| --- | --- |
+| `Ref<Int64>` | `&mut i64` |
+| `Ref<Dec64>` | `&mut f64` |
+| `Ref<Bool>` | `&mut u8` |
+| `Ref<UInt8>` / `Ref<UInt16>` / `Ref<UInt32>` / `Ref<UInt64>` | `&mut u8` / `&mut u16` / `&mut u32` / `&mut u64` |
+| `Ref<Float32>` | `&mut f32` |
+
+The generated assertion spells the reference out, so a value parameter and a
+reference parameter are never interchangeable even when their representations
+match. The compiler passes a non-null, correctly aligned, initialized,
+exclusively borrowed `T`. The bridge may read and write it for the duration of
+the call. It must not retain its address, and must not create any reference,
+pointer, callback, thread, or external state that can reach it after the call
+returns. Before returning, it must leave a valid Snacc `T` representation; in
+particular a `&mut u8` standing for `Ref<Bool>` must contain zero or one.
+Violating this contract is invalid host code and need not be diagnosed by the
+Snacc compiler.
+
 A bridge function is a `pub` item of the host crate's `interop` module, reachable
 at `crate::interop::<symbol>`. Its Rust item name is exactly the declared link
 symbol. It carries `#[unsafe(no_mangle)]` and uses the `extern "C"` ABI, and it
@@ -668,14 +792,15 @@ linker's responsibility.
 
 ## ABI version and ownership
 
-The current Snacc ABI version is 3. The version covers the `snacc_main` entry,
+The current Snacc ABI version is 4. The version covers the `snacc_main` entry,
 the required `snacc_print_*` runtime imports, the permitted Rust bridge types
-(including the no-result bridge signature added in ABI version 2 and the
-fixed-width unsigned and `Float32` types added in ABI version 3), their
-representations and valid values, the C calling convention, and the ownership
-rules for values crossing those boundaries.
+(including the no-result bridge signature added in ABI version 2, the
+fixed-width unsigned and `Float32` types added in ABI version 3, and the
+`Ref<T>` bridge parameters added in ABI version 4), their representations and
+valid values, the C calling convention, and the ownership rules for values
+crossing those boundaries.
 
-ABI version 3 exports `snacc_main` as `extern "C" fn() -> i32` and imports:
+ABI version 4 exports `snacc_main` as `extern "C" fn() -> i32` and imports:
 
 | Symbol | Rust signature |
 | --- | --- |
@@ -689,15 +814,18 @@ ABI version 3 exports `snacc_main` as `extern "C" fn() -> i32` and imports:
 | `snacc_print_u64` | `extern "C" fn(u64)` |
 | `snacc_print_f32` | `extern "C" fn(f32)` |
 
-Every value permitted across an ABI version 3 Rust bridge is a scalar passed
-or returned by value, or no value at all (a no-result bridge's C ABI result is
-`void`). Crossing the boundary copies the value. No allocation, pointer,
-reference, borrow, destructor obligation, or resource ownership crosses with
-it. A Rust bridge may retain its scalar copy; Rust-owned state otherwise
-remains behind the bridge. Pointers, buffers, aggregates, and handles are not
-ABI version 3 values.
+Every value permitted across an ABI version 4 Rust bridge is a scalar passed
+or returned by value, a `Ref<T>` parameter borrowing one such scalar for the
+duration of the call, or no value at all (a no-result bridge's C ABI result is
+`void`). Crossing the boundary by value copies the value; no allocation,
+destructor obligation, or resource ownership crosses with it, and a Rust bridge
+may retain its scalar copy. A `Ref<T>` parameter borrows caller storage rather
+than transferring it: the bridge may read and write the referent during the
+call and must not retain access to it afterwards. No reference is returned, and
+no bridge result is a reference. Buffers, aggregates, and handles are not ABI
+version 4 values.
 
-At ABI version 3, `UInt8`, `Bool`, and standalone `Nil` share the Rust
+At ABI version 4, `UInt8`, `Bool`, and standalone `Nil` share the Rust
 representation `u8`; the generated Rust type assertion verifies width and ABI
 representation but cannot distinguish these three Snacc types from one
 another. Their distinct Snacc meanings remain the declaration author's

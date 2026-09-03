@@ -815,6 +815,172 @@ fn each_new_scalar_type_round_trips_through_a_bridge_parameter_and_a_result() {
     );
 }
 
+/// Specification 011 conformance 18-20 and 23: every permitted scalar referent
+/// round-trips through a real Rust bridge that writes its `&mut R`, the
+/// generated assertion distinguishes `T` from `Ref<T>` and maps the latter to
+/// `&mut R`, a bridge write of a valid `Bool` representation is observed
+/// correctly, and printing a referenced scalar needs no new runtime symbol.
+#[test]
+fn every_scalar_referent_round_trips_through_a_real_rust_bridge() {
+    let workspace = tempfile::tempdir().expect("failed to create workspace");
+    let package = workspace.path().join("package");
+    copy_fixture_to(&package);
+    fs::write(
+        package.join("src/main.nrs"),
+        concat!(
+            "extern rust \"snacc_user_ref_i64\" fun ref_i64(slot: Ref<Int64>)\n",
+            "extern rust \"snacc_user_ref_f64\" fun ref_f64(slot: Ref<Dec64>)\n",
+            "extern rust \"snacc_user_ref_bool\" fun ref_bool(slot: Ref<Bool>)\n",
+            "extern rust \"snacc_user_ref_u8\" fun ref_u8(slot: Ref<UInt8>)\n",
+            "extern rust \"snacc_user_ref_u16\" fun ref_u16(slot: Ref<UInt16>)\n",
+            "extern rust \"snacc_user_ref_u32\" fun ref_u32(slot: Ref<UInt32>)\n",
+            "extern rust \"snacc_user_ref_u64\" fun ref_u64(slot: Ref<UInt64>)\n",
+            "extern rust \"snacc_user_ref_f32\" fun ref_f32(slot: Ref<Float32>)\n",
+            // The same scalar by value and by reference in one program, so the
+            // two assertions must differ.
+            "extern rust \"snacc_user_echo_i64\" fun echo_i64(value: Int64): Int64\n",
+            "let mut whole: Int64 = 1\n",
+            "let mut fraction: Dec64 = 0.5\n",
+            "let mut flag: Bool = false\n",
+            "let mut byte: UInt8 = 1u8\n",
+            "let mut short: UInt16 = 1u16\n",
+            "let mut word: UInt32 = 1u32\n",
+            "let mut long: UInt64 = 1u64\n",
+            "let mut single: Float32 = 0.5f32\n",
+            "ref_i64(whole)\n",
+            "ref_f64(fraction)\n",
+            "ref_bool(flag)\n",
+            "ref_u8(byte)\n",
+            "ref_u16(short)\n",
+            "ref_u32(word)\n",
+            "ref_u64(long)\n",
+            "ref_f32(single)\n",
+            "print(whole)\n",
+            "print(fraction)\n",
+            "print(flag)\n",
+            "print(byte)\n",
+            "print(short)\n",
+            "print(word)\n",
+            "print(long)\n",
+            "print(single)\n",
+            "print(echo_i64(whole))\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        package.join("src/interop.rs"),
+        concat!(
+            "#[unsafe(no_mangle)]\n",
+            "pub extern \"C\" fn snacc_user_ref_i64(slot: &mut i64) { *slot += 41; }\n\n",
+            "#[unsafe(no_mangle)]\n",
+            "pub extern \"C\" fn snacc_user_ref_f64(slot: &mut f64) { *slot += 1.0; }\n\n",
+            // Conformance 20: the host must leave a valid Bool representation.
+            "#[unsafe(no_mangle)]\n",
+            "pub extern \"C\" fn snacc_user_ref_bool(slot: &mut u8) { *slot = 1; }\n\n",
+            "#[unsafe(no_mangle)]\n",
+            "pub extern \"C\" fn snacc_user_ref_u8(slot: &mut u8) { *slot = 255; }\n\n",
+            "#[unsafe(no_mangle)]\n",
+            "pub extern \"C\" fn snacc_user_ref_u16(slot: &mut u16) { *slot = 65535; }\n\n",
+            "#[unsafe(no_mangle)]\n",
+            "pub extern \"C\" fn snacc_user_ref_u32(slot: &mut u32) { *slot = 4294967295; }\n\n",
+            "#[unsafe(no_mangle)]\n",
+            "pub extern \"C\" fn snacc_user_ref_u64(slot: &mut u64) { *slot = u64::MAX; }\n\n",
+            "#[unsafe(no_mangle)]\n",
+            "pub extern \"C\" fn snacc_user_ref_f32(slot: &mut f32) { *slot += 1.0; }\n\n",
+            "#[unsafe(no_mangle)]\n",
+            "pub extern \"C\" fn snacc_user_echo_i64(value: i64) -> i64 { value }\n",
+        ),
+    )
+    .unwrap();
+
+    let target = tempfile::tempdir().expect("failed to create fixture target directory");
+    let output = cargo_snacc_at(target.path(), &package, &["run", "--offline"]);
+    assert!(
+        output.status.success(),
+        "a bridge using every ABI version 4 reference referent should build and run:\n{}",
+        combined(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    for expected in [
+        "42",
+        "1.5",
+        "true",
+        "255",
+        "65535",
+        "4294967295",
+        "18446744073709551615",
+        "1.5",
+    ] {
+        assert!(
+            stdout.lines().any(|line| line == expected),
+            "a bridge reference write was not observed ({expected}):\n{stdout}"
+        );
+    }
+
+    // Conformance 19: the assertion spells the reference out, and the by-value
+    // assertion for the same scalar stays distinct from it.
+    let bridges_dir = target.path().join("snacc").join("bridges");
+    let entries: Vec<_> = fs::read_dir(&bridges_dir)
+        .expect("bridges directory was not created")
+        .filter_map(|entry| entry.ok())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    let content = fs::read_to_string(entries[0].path()).unwrap();
+    for expected in [
+        "fn(&mut i64) -> ()",
+        "fn(&mut f64) -> ()",
+        "fn(&mut u8) -> ()",
+        "fn(&mut u16) -> ()",
+        "fn(&mut u32) -> ()",
+        "fn(&mut u64) -> ()",
+        "fn(&mut f32) -> ()",
+        "fn(i64) -> i64",
+    ] {
+        assert!(
+            content.contains(expected),
+            "missing reference mapping {expected}:\n{content}"
+        );
+    }
+}
+
+/// Specification 011 conformance 22: an ABI version 3 cache object (the version
+/// predating this milestone's ABI 4 bump) is not reused once the compiler
+/// declares ABI version 4.
+#[test]
+fn abi_3_cache_manifests_are_never_reused_after_the_abi_4_bump() {
+    let target = tempfile::tempdir().expect("failed to create fixture target directory");
+    let build = cargo_snacc(target.path(), &["build", "--offline", "--verbose"]);
+    assert!(
+        build.status.success(),
+        "build failed:\n{}",
+        combined(&build)
+    );
+
+    let manifest_path = find_manifest(&target.path().join("snacc"))
+        .expect("content-addressed cache manifest was not written");
+    let encoded = fs::read_to_string(&manifest_path).unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    manifest["abi_version"] = serde_json::json!(3);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let rebuilt = cargo_snacc(target.path(), &["build", "--offline", "--verbose"]);
+    assert!(
+        rebuilt.status.success(),
+        "rebuild failed:\n{}",
+        combined(&rebuilt)
+    );
+    assert!(
+        String::from_utf8_lossy(&rebuilt.stdout).contains("Snacc object rebuilt"),
+        "an ABI-3 cache manifest must not be reused for an ABI-{}-build:\n{}",
+        snacc_compiler::ABI_VERSION,
+        combined(&rebuilt)
+    );
+}
+
 #[test]
 fn plain_cargo_check_succeeds_without_cargo_snacc() {
     let target = tempfile::tempdir().expect("failed to create fixture target directory");
