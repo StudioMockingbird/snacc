@@ -1,0 +1,5 @@
+fun describe(value: UInt8 | Nil): UInt8 do
+    if value is UInt8(byte) then
+        byte
+    end
+end

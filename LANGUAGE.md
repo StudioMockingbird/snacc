@@ -31,10 +31,13 @@ union-member         = "|", ( "Nil"
                      | identifier, [ "is", struct-body ] ) ;
 
 qualified-name       = identifier, { ".", identifier } ;
-type                 = value-type | reference-parameter-type ;
+type                 = reference-parameter-type | sum-type ;
 reference-parameter-type
-                     = "Ref", "<", value-type, ">" ;
-value-type           = builtin-value-type | qualified-name ;
+                     = "Ref", "<", sum-type, ">" ;
+sum-type             = primary-value-type, { "|", primary-value-type } ;
+primary-value-type   = builtin-value-type
+                     | qualified-name
+                     | "(", sum-type, ")" ;
 unsigned-type        = "UInt8" | "UInt16" | "UInt32" | "UInt64" ;
 builtin-value-type   = "Int64" | "Dec64" | "Bool" | "Nil"
                      | unsigned-type
@@ -59,8 +62,9 @@ if-form              = "if", condition, "then", block,
                        { "elseif", condition, "then", block },
                        [ "else", block ], "end" ;
 condition            = type-test | expression ;
-type-test            = place, "is", ( qualified-name | "Nil" ),
-                       [ "(", identifier, ")" ] ;
+type-test            = place, "is", member-path, [ "(", identifier, ")" ] ;
+member-path          = member-segment, { ".", member-segment } ;
+member-segment       = identifier | builtin-value-type ;
 
 expression           = comparison ;
 comparison           = additive, { comparison-operator, additive } ;
@@ -119,7 +123,17 @@ digit                = "0" | "1" | "2" | "3" | "4"
    checker. A `reference-parameter-type` is permitted only as the direct
    declared type of a `parameter`; it is rejected in every other `type`
    position, and `Ref<Ref<T>>` is never permitted. The `<` and `>` around a
-   referent are type delimiters, not ordered comparisons. *)
+   referent are type delimiters, not ordered comparisons. A `sum-type` with
+   only one `primary-value-type` and no `|` collapses to that primary
+   directly rather than a one-member sum. The grammar admits a `sum-type`
+   wherever a `type` appears, including a represented type's body and a Rust
+   bridge signature; that an inline sum cannot be a represented type's
+   immediate representation, cannot cross a Rust bridge, and requires at
+   least two distinct members (with `Nil` only alongside a non-`Nil` member)
+   are semantic rules, also diagnosed by the checker. A `member-path` in a
+   `type-test` may mix `identifier` and `builtin-value-type` segments; that it
+   names exactly one direct member of the tested union or inline sum is a
+   semantic rule as well. *)
 ```
 
 String escapes do not exist.
@@ -168,12 +182,13 @@ point has type `Dec64`.
 
 `Bool` contains `true` and `false`.
 
-`Nil` is not a standalone type. It is spelled only as a union member, and it is
-rejected as a variable, parameter, function, method or bridge result, field,
-represented type, or `Ref<T>` referent. `nil`, and its alternate spelling
+`Nil` is not a standalone type. It is spelled only as a union member or as one
+member of an inline sum type (see "Inline sum types"), and it is rejected as a
+variable, parameter, function, method or bridge result, field, represented
+type, or `Ref<T>` referent on its own. `nil`, and its alternate spelling
 `null`, names that member and has no type of its own: it is valid only where
-exactly one expected union type directly contains `Nil`. `print(nil)` and
-`nil == nil` supply no such type and are rejected.
+exactly one expected union type or inline sum directly contains `Nil`.
+`print(nil)` and `nil == nil` supply no such type and are rejected.
 
 `UInt8`, `UInt16`, `UInt32`, and `UInt64` are unsigned integers of the named
 bit width, holding integers from 0 through 2^N - 1. An unsigned literal has
@@ -463,6 +478,91 @@ lacks `else` fail to check until it handles the new member.
 The native layout of every user-defined type is private to one compiler build.
 Source programs cannot observe size, alignment, field offsets, union tags, or
 padding, and no layout guarantee crosses a Rust bridge.
+
+## Inline sum types
+
+`|` combines two or more existing types into a structural sum wherever a
+`type` is written, including a function or method result, a parameter, a
+local, a field, and the referent of `Ref<T>`:
+
+~~~snacc
+fun find(index: Int64): UInt8 | Nil do
+    nil
+end
+
+fun replace(value: Ref<UInt8 | Nil>) do
+    value = nil
+end
+
+type CacheEntry is struct
+    value: UInt8 | Nil,
+end
+~~~
+
+An inline sum's identity is the unordered set of its direct member types, so
+written order and parenthesized grouping are not significant:
+`UInt8 | Nil`, `Nil | UInt8`, and `(UInt8) | Nil` name one type, and
+`(UInt8 | Bool) | Nil` and `UInt8 | (Bool | Nil)` name another. A source sum
+must name at least two distinct members; repeating a member, including after
+flattening a parenthesized group, is an error rather than a silent
+deduplication. `Nil` is permitted as a member only alongside at least one
+non-`Nil` member, exactly like a named union. A named union may itself be one
+member of an inline sum (`Shape | Nil`); its own members do not flatten into
+the inline sum. `Ref<T>` is not a value-type member: `Ref<UInt8> | Nil` is
+invalid, while `Ref<UInt8 | Nil>` -- a reference to sum-typed storage -- is
+valid. An inline sum cannot be a represented type's immediate representation,
+because a represented type is opened by calling its representation's type
+name, and an inline sum has no such callable name.
+
+A value of a direct member type injects implicitly into an expected inline
+sum: an exact member match is used when one exists, and otherwise the value
+converts through the one existing `Int64`-to-`Dec64` conversion when exactly
+one member accepts it. `nil` selects an expected sum's `Nil` member the same
+way it selects a union's. An inline sum value is assignable to another inline
+sum only when their member sets are identical; there is no implicit
+subset-to-superset conversion, so widening a sum requires decomposing it and
+re-injecting each bound member under the wider type.
+
+`is` decomposes an inline sum exactly like a union, except the tested member
+may be any one direct member -- a built-in scalar, a named type, or a named
+union -- not only a qualified union-member name:
+
+~~~snacc
+if result is UInt8(byte) then
+    print(byte)
+elseif result is Nil then
+    print(0u8)
+end
+~~~
+
+The binding has the exact tested member's type. A test names only a direct
+member: testing a type nested inside a named-union member requires a second
+test after binding that union. An `if`/`elseif` chain over an inline sum is
+exhaustive, and may omit `else`, when it tests the same place and covers every
+direct member exactly once, under the same rules as a named union's chain.
+
+Forming a new inline sum from otherwise unrelated branch values still requires
+an explicit expected sum type -- from a declaration, parameter, field, result,
+or enclosing expression -- exactly like a union; Snacc never synthesizes a
+sum type merely because two branches disagree.
+
+For its first version, an inline sum reuses a named union's tagged
+representation: a private, deterministically tagged storage field for each
+direct member, with exactly one member active at a time. Copying, moving, and
+destroying a sum act on its active member alone. Two values of one inline sum
+support `==` and `!=` when every direct member does: different active members
+compare unequal, and equal active members compare using that member's
+equality. An inline sum supports no ordered comparison, arithmetic, field
+access, direct printing, or method declaration; a program decomposes the value
+with `is` first. Source programs cannot observe a sum's tag, member order, or
+layout, exactly as for a named union.
+
+An inline sum is never identical to a named union, even when every possible
+runtime value looks the same, and there is no `Option<T>` type: `T | Nil` is
+the direct spelling for an optional value. Represented, struct, union, and
+inline sum types may not appear in an `extern rust` parameter or result,
+including an inline sum whose members individually have bridge
+representations; their layouts are compiler-private.
 
 ## Statements and blocks
 
@@ -813,11 +913,13 @@ Its Rust assertion result is `()`, and its C ABI result is `void`. Its call
 has the same no-result restriction as an internal no-result function.
 
 Represented, struct, member, and union types may not appear in an `extern rust`
-parameter or result. Their source-level representation implies no stable C ABI
-representation, and the checker rejects them while collecting declarations,
-before any body is checked. Methods are never exported and `extern rust` has no
-method form. Internal Snacc functions and methods may accept and return every
-user-defined type.
+parameter or result, and neither may an inline sum type, even one whose
+members individually have bridge representations. Their source-level
+representation implies no stable C ABI representation, and the checker
+rejects them while collecting declarations, before any body is checked.
+Methods are never exported and `extern rust` has no method form. Internal
+Snacc functions and methods may accept and return every user-defined type and
+inline sum.
 
 The ABI representation is `i64` for `Int64`, IEEE binary64 for `Dec64`, `u8`
 for `Bool`, `u8`/`u16`/`u32`/`u64` for
@@ -862,7 +964,7 @@ linker's responsibility.
 
 ## ABI version and ownership
 
-The current Snacc ABI version is 5. The version covers the `snacc_main` entry,
+The current Snacc ABI version is 6. The version covers the `snacc_main` entry,
 the required `snacc_print_*` runtime imports, the permitted Rust bridge types
 (including the no-result bridge signature added in ABI version 2, the
 fixed-width unsigned and `Float32` types added in ABI version 3, and the
@@ -872,7 +974,7 @@ representations and
 valid values, the C calling convention, and the ownership rules for values
 crossing those boundaries.
 
-ABI version 5 exports `snacc_main` as `extern "C" fn() -> i32` and imports:
+ABI version 6 exports `snacc_main` as `extern "C" fn() -> i32` and imports:
 
 | Symbol | Rust signature |
 | --- | --- |
@@ -885,7 +987,7 @@ ABI version 5 exports `snacc_main` as `extern "C" fn() -> i32` and imports:
 | `snacc_print_u64` | `extern "C" fn(u64)` |
 | `snacc_print_f32` | `extern "C" fn(f32)` |
 
-Every value permitted across an ABI version 5 Rust bridge is a scalar passed
+Every value permitted across an ABI version 6 Rust bridge is a scalar passed
 or returned by value, a `Ref<T>` parameter borrowing one such scalar for the
 duration of the call, or no value at all (a no-result bridge's C ABI result is
 `void`). Crossing the boundary by value copies the value; no allocation,
@@ -894,9 +996,9 @@ may retain its scalar copy. A `Ref<T>` parameter borrows caller storage rather
 than transferring it: the bridge may read and write the referent during the
 call and must not retain access to it afterwards. No reference is returned, and
 no bridge result is a reference. Buffers, aggregates, and handles are not ABI
-version 5 values.
+version 6 values.
 
-At ABI version 5, `UInt8` and `Bool` share the Rust representation `u8`; the
+At ABI version 6, `UInt8` and `Bool` share the Rust representation `u8`; the
 generated Rust type assertion verifies width and ABI representation but cannot
 distinguish these two Snacc types from one another. Their distinct Snacc
 meanings remain the declaration author's contract. Standalone `Nil` was a
@@ -906,7 +1008,16 @@ runtime, or cached artifact is accepted by a version 5 build.
 
 User-defined types add no ABI representation and do not change the ABI version:
 none of them may cross a Rust bridge, so every boundary contract above is
-unchanged by them.
+unchanged by them. Inline sum types are the same: none of them may cross a
+Rust bridge either, not even one whose members individually have bridge
+representations, so no permitted type, representation, required symbol, or
+calling-convention rule above changes at version 6. The version still
+advances from 5 to 6 when inline sum types are added, because their new
+compiler-internal tag-plus-fields lowering is treated as an ABI-relevant
+compiler change: it forces every object and cache entry built by an older
+compiler to be rebuilt rather than reused, even one that never itself uses an
+inline sum. No version 5 object, runtime, or cached artifact is accepted by a
+version 6 build.
 
 An ABI version must change when a permitted type, representation, valid-value
 rule, ownership rule, calling convention, required symbol, or required symbol

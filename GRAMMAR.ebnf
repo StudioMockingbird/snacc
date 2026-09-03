@@ -29,10 +29,13 @@ union-member         = "|", ( "Nil"
                      | identifier, [ "is", struct-body ] ) ;
 
 qualified-name       = identifier, { ".", identifier } ;
-type                 = value-type | reference-parameter-type ;
+type                 = reference-parameter-type | sum-type ;
 reference-parameter-type
-                     = "Ref", "<", value-type, ">" ;
-value-type           = builtin-value-type | qualified-name ;
+                     = "Ref", "<", sum-type, ">" ;
+sum-type             = primary-value-type, { "|", primary-value-type } ;
+primary-value-type   = builtin-value-type
+                     | qualified-name
+                     | "(", sum-type, ")" ;
 unsigned-type        = "UInt8" | "UInt16" | "UInt32" | "UInt64" ;
 builtin-value-type   = "Int64" | "Dec64" | "Bool" | "Nil"
                      | unsigned-type
@@ -57,8 +60,9 @@ if-form              = "if", condition, "then", block,
                        { "elseif", condition, "then", block },
                        [ "else", block ], "end" ;
 condition            = type-test | expression ;
-type-test            = place, "is", ( qualified-name | "Nil" ),
-                       [ "(", identifier, ")" ] ;
+type-test            = place, "is", member-path, [ "(", identifier, ")" ] ;
+member-path          = member-segment, { ".", member-segment } ;
+member-segment       = identifier | builtin-value-type ;
 
 expression           = comparison ;
 comparison           = additive, { comparison-operator, additive } ;
@@ -117,4 +121,14 @@ digit                = "0" | "1" | "2" | "3" | "4"
    checker. A `reference-parameter-type` is permitted only as the direct
    declared type of a `parameter`; it is rejected in every other `type`
    position, and `Ref<Ref<T>>` is never permitted. The `<` and `>` around a
-   referent are type delimiters, not ordered comparisons. *)
+   referent are type delimiters, not ordered comparisons. A `sum-type` with
+   only one `primary-value-type` and no `|` collapses to that primary
+   directly rather than a one-member sum. The grammar admits a `sum-type`
+   wherever a `type` appears, including a represented type's body and a Rust
+   bridge signature; that an inline sum cannot be a represented type's
+   immediate representation, cannot cross a Rust bridge, and requires at
+   least two distinct members (with `Nil` only alongside a non-`Nil` member)
+   are semantic rules, also diagnosed by the checker. A `member-path` in a
+   `type-test` may mix `identifier` and `builtin-value-type` segments; that it
+   names exactly one direct member of the tested union or inline sum is a
+   semantic rule as well. *)

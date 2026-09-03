@@ -1,0 +1,1 @@
+extern rust "snacc_user_maybe" fun maybe(): UInt8 | Nil

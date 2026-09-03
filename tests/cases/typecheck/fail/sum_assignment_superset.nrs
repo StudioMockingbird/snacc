@@ -1,0 +1,2 @@
+let narrow: UInt8 | Nil = nil
+let wide: Bool | Nil | UInt8 = narrow

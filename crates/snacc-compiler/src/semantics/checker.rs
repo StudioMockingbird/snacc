@@ -338,6 +338,11 @@ pub struct Program {
     pub types: Vec<TypeDef>,
     /// Every checked method, indexed by `MethodId`.
     pub methods: Vec<TMethod>,
+    /// Every interned inline sum's normalized member list, indexed by
+    /// `SumId` (Specification 018 section 4). Lowering assigns each member's
+    /// deterministic tag from its position here, the same way a named
+    /// union's tag is its member's declaration position.
+    pub sums: Vec<Vec<Ty>>,
     pub body: TBlock,
 }
 
@@ -579,11 +584,15 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
         return Err(Failure::Unknown(detail));
     }
     if ctx.errors.is_empty() {
+        // Read before `ctx.types.defs` moves out below: `all_sums` borrows
+        // the whole `Types` value, which a partial move would break.
+        let sums = ctx.types.all_sums().to_vec();
         Ok(Program {
             funcs: typed_funcs,
             externs: typed_externs,
             types: ctx.types.defs,
             methods: typed_methods,
+            sums,
             body,
         })
     } else {

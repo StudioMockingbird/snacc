@@ -18,8 +18,8 @@ use std::{
 use tempfile::TempDir;
 
 #[test]
-fn runtime_implements_abi_version_five() {
-    assert_eq!(snacc_runtime::ABI_VERSION, 5);
+fn runtime_implements_abi_version_six() {
+    assert_eq!(snacc_runtime::ABI_VERSION, 6);
 }
 
 fn run(command: &mut Command, what: &str) -> Output {

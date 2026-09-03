@@ -158,6 +158,70 @@ fn unions_lower_to_a_tag_and_one_storage_field_per_member() {
     );
 }
 
+/// Specification 018 section 8 and Phase 4 items 1-3: an inline sum reuses
+/// the named-union tag-plus-fields shape, its member tags are its canonical
+/// (sorted) member order rather than declaration order, and every injection
+/// starts from the complete sum's zero initializer -- the same lowering-only
+/// facts the run corpus cannot observe from stdout.
+#[test]
+fn inline_sums_lower_to_a_tag_and_one_zero_initialized_storage_field_per_member() {
+    let ir = emit_llvm_ir(
+        "fun pick(flag: Bool, byte: UInt8): UInt8 | Nil do\n\
+        \x20   if flag then byte else nil end\n\
+         end\n\
+         fun rank(value: UInt8 | Nil): UInt8 do\n\
+        \x20   if value is UInt8(byte) then byte elseif value is Nil then 0u8 end\n\
+         end\n\
+         print(rank(pick(true, 7u8)))\n",
+    )
+    .unwrap_or_else(|error| panic!("LLVM emission failed: {error:?}"));
+
+    // One `i32` tag plus one storage field per member. `Nil` lowers as a
+    // scalar field here (like `Bool`), not as the zero-field struct a named
+    // union's `Nil` member would be, because an inline sum member is never
+    // itself a `TypeId`.
+    assert!(
+        ir.contains("%sum.0 = type { i32, i8, i8 }"),
+        "wrong sum layout in:\n{ir}"
+    );
+
+    // Canonical member order sorts `Nil` before `UInt8` (Specification 018
+    // section 4), so `is Nil` and `is UInt8(...)` compare the stored tag
+    // against 0 and 1 respectively -- not their written source order.
+    let mut tags: Vec<&str> = ir
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("%is"))
+        .filter_map(|line| line.rsplit_once("icmp eq i32 %tag"))
+        .map(|(_, rest)| rest.rsplit_once(", ").expect("a tag comparison").1)
+        .collect();
+    tags.sort_unstable();
+    assert_eq!(tags, ["0", "1"], "wrong sum tags in:\n{ir}");
+
+    // Injection starts from the complete sum's zero initializer, so every
+    // slot still inactive at the point the active member is written is a
+    // deterministic zero, never poison or undef (Phase 4 item 3). The tag
+    // write folds into a compile-time constant (both its operands are
+    // constants), so the runtime `insertvalue` that installs the
+    // non-constant active member starts from that already-tagged,
+    // still-all-zero-elsewhere constant rather than from `undef`.
+    let injections: Vec<&str> = ir
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("insertvalue %sum.0 "))
+        .collect();
+    assert!(!injections.is_empty(), "no sum injection in:\n{ir}");
+    for injection in injections {
+        assert!(
+            injection.contains("{ i32 1, i8 0, i8 0 }"),
+            "an injection did not start from an all-zero-but-tag base: {injection}"
+        );
+    }
+    assert!(
+        !ir.contains("undef") && !ir.contains("poison"),
+        "an inactive sum field was left uninitialized in:\n{ir}"
+    );
+}
+
 /// Specification 009 section 5.2: sub-word bridge parameters and results carry
 /// the same `zeroext` attribute rustc emits for `extern "C"` `u8`/`u16`, on the
 /// declaration and on the call site. `UInt32` and wider carry none.

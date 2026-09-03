@@ -1,0 +1,1 @@
+type MaybeByte is UInt8 | Nil

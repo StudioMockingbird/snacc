@@ -1,0 +1,56 @@
+// Specification 018 conformance 4, 7, 8, 9, and 10: a function returning a
+// scalar inline sum, contextual `nil` injection, an exhaustive `is`
+// decomposition, a named union as one opaque sum member, and sum equality --
+// executed through a real compiled program, not just type-checked.
+
+type SumShape is union
+    | Circle is struct
+        radius: Int64,
+      end
+    | Rectangle is struct
+        length: Int64,
+        width: Int64,
+      end
+end
+
+fun sum_maybe_byte(found: Bool, byte: UInt8): UInt8 | Nil do
+    if found then byte else nil end
+end
+
+fun sum_describe_byte(value: UInt8 | Nil): UInt8 do
+    if value is UInt8(byte) then
+        byte
+    elseif value is Nil then
+        0u8
+    end
+end
+
+fun sum_shape_area(value: SumShape | Nil): Int64 do
+    if value is SumShape(shape) then
+        if shape is SumShape.Circle(circle) then
+            circle.radius * circle.radius
+        elseif shape is SumShape.Rectangle(rectangle) then
+            rectangle.length * rectangle.width
+        end
+    elseif value is Nil then
+        0 - 1
+    end
+end
+
+let sum_present: UInt8 | Nil = sum_maybe_byte(true, 7u8)
+let sum_absent: UInt8 | Nil = sum_maybe_byte(false, 7u8)
+print(sum_describe_byte(sum_present))
+print(sum_describe_byte(sum_absent))
+
+let circle: SumShape = SumShape.Circle(radius: 3)
+let rectangle: SumShape = SumShape.Rectangle(length: 4, width: 5)
+print(sum_shape_area(circle))
+print(sum_shape_area(rectangle))
+print(sum_shape_area(nil))
+
+// Equality follows every member; different active members compare unequal,
+// and a sum value compares against contextual `nil`.
+print(sum_present == sum_absent)
+print(sum_present == sum_maybe_byte(true, 7u8))
+print(sum_present == nil)
+print(sum_absent == nil)

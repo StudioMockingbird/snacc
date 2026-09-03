@@ -1,0 +1,49 @@
+// Specification 018 conformance 1-2, 4, 6, 8: inline sums in a function
+// result and a struct field, normalized member order and grouping producing
+// one identical type, direct-value and contextual-`nil` injection, identical
+// sum-to-sum assignment, and a named union as one opaque sum member.
+
+type Shape is union
+    | Circle is struct
+        radius: Int64,
+      end
+    | Rectangle is struct
+        length: Int64,
+        width: Int64,
+      end
+end
+
+type CacheEntry is struct
+    value: UInt8 | Nil,
+end
+
+fun classify(value: Shape | Nil): Int64 do
+    if value is Shape(shape) then
+        if shape is Shape.Circle(circle) then
+            circle.radius
+        elseif shape is Shape.Rectangle(rectangle) then
+            rectangle.length
+        end
+    elseif value is Nil then
+        0
+    end
+end
+
+fun maybe_byte(found: Bool, byte: UInt8): UInt8 | Nil do
+    if found then byte else nil end
+end
+
+let narrow: UInt8 | Nil = nil
+let same_members_different_order: Nil | UInt8 = narrow
+let grouped: (UInt8 | Bool) | Nil = nil
+
+let entry: CacheEntry = CacheEntry(value: nil)
+let filled: CacheEntry = CacheEntry(value: 7u8)
+
+// A named union's own member value does not directly inject into an inline
+// sum; only an already-`Shape`-typed value does.
+let circle: Shape = Shape.Circle(radius: 3)
+
+print(classify(nil))
+print(classify(circle))
+print(maybe_byte(true, 9u8) == maybe_byte(true, 9u8))

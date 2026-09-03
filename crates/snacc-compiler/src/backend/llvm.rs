@@ -1,9 +1,9 @@
 use crate::Optimization;
 use crate::semantics::checker::{
     ArithOp, CmpOp, Place, PlaceRoot, Program, TArg, TBlock, TCondition, TExpr, TMethodCall,
-    TParam, TReceiver, TStmt, TTypeTest, TValueIf, Ty,
+    TParam, TReceiver, TStmt, TSumTypeTest, TTypeTest, TValueIf, Ty,
 };
-use crate::semantics::types::{TypeDef, TypeId};
+use crate::semantics::types::{SumId, TypeDef, TypeId};
 use crate::syntax::ast::NumLiteral;
 use crate::syntax::ast::ParamMode;
 use inkwell::AddressSpace;
@@ -49,24 +49,27 @@ fn scalar_ty(context: &Context, ty: Ty) -> BasicTypeEnum<'_> {
         Ty::UInt32 => context.i32_type().into(),
         Ty::UInt16 => context.i16_type().into(),
         Ty::Bool | Ty::Nil | Ty::UInt8 => context.i8_type().into(),
-        // Every caller routes `Ty::User` through the layout table first.
+        // Every caller routes `Ty::User` and `Ty::Sum` through their layout
+        // tables first (see `llvm_ty`).
         Ty::User(_) => unreachable!("a user-defined type resolves through the layout table"),
-        // Specification 018 (Task B) has not yet given inline sums a lowering
-        // strategy; front-end checking (Task A) never emits one into a
-        // program this backend runs on.
-        Ty::Sum(_) => unreachable!("inline sum lowering is not implemented yet"),
+        Ty::Sum(_) => unreachable!("an inline sum resolves through the sum layout table"),
     }
 }
 
-/// The value/storage type for any checked type. User-defined types are looked
-/// up in the layout table built by [`build_layout`].
+/// The value/storage type for any checked type. A user-defined type is looked
+/// up in the layout table built by [`build_layout`]; an inline sum is looked
+/// up in that same call's sum layout table, indexed by `SumId` instead of
+/// `TypeId` (Specification 018 section 8 reuses named-union lowering, but a
+/// sum has no `TypeId` of its own to share that table with).
 fn llvm_ty<'ctx>(
     context: &'ctx Context,
     layout: &[BasicTypeEnum<'ctx>],
+    sums: &[BasicTypeEnum<'ctx>],
     ty: Ty,
 ) -> BasicTypeEnum<'ctx> {
     match ty {
         Ty::User(id) => layout[id.index()],
+        Ty::Sum(id) => sums[id.index()],
         scalar => scalar_ty(context, scalar),
     }
 }
@@ -75,14 +78,21 @@ fn llvm_ty<'ctx>(
 /// representation's LLVM type and gets no named type of its own; a struct and a
 /// union member lower to a named LLVM struct in field order; a union lowers to
 /// `{i32 tag, member_0, ..., member_n}`, one storage field per member.
+/// Specification 018 section 8 reuses that same tag-plus-fields shape for an
+/// inline sum, keyed by `SumId` instead of `TypeId` since a sum has no
+/// declared name of its own.
 ///
 /// Every named type is predeclared opaque first, then bodies are set through a
 /// depth-first walk, so a type is always laid out after everything it contains
-/// by value.
+/// by value. A struct field or sum member may go the other way too (a sum
+/// member may be a user-defined type, and a struct field may be an inline
+/// sum), so both walks share one `Layout` and resolve into each other on
+/// demand.
 fn build_layout<'ctx>(
     context: &'ctx Context,
     defs: &[TypeDef],
-) -> Result<Vec<BasicTypeEnum<'ctx>>, String> {
+    sums: &[Vec<Ty>],
+) -> Result<(Vec<BasicTypeEnum<'ctx>>, Vec<BasicTypeEnum<'ctx>>), String> {
     let named: Vec<Option<StructType<'ctx>>> = defs
         .iter()
         .map(|def| match def {
@@ -90,27 +100,49 @@ fn build_layout<'ctx>(
             _ => Some(context.opaque_struct_type(def.name())),
         })
         .collect();
+    // A sum has no source name; `sum.<id>` is a debug-only LLVM identifier,
+    // never observable from Snacc source (Specification 018 section 8).
+    let sum_named: Vec<StructType<'ctx>> = (0..sums.len())
+        .map(|index| context.opaque_struct_type(&format!("sum.{index}")))
+        .collect();
     let mut state = Layout {
         defs,
+        sums,
         named,
+        sum_named,
         resolved: vec![None; defs.len()],
         visiting: vec![false; defs.len()],
+        sum_resolved: vec![None; sums.len()],
+        sum_visiting: vec![false; sums.len()],
     };
     for index in 0..defs.len() {
         state.resolve(context, TypeId(index as u32))?;
     }
-    Ok(state
+    for index in 0..sums.len() {
+        state.resolve_sum(context, SumId(index as u32))?;
+    }
+    let types = state
         .resolved
         .into_iter()
         .map(|ty| ty.expect("every declared type resolves to an LLVM type"))
-        .collect())
+        .collect();
+    let sums = state
+        .sum_resolved
+        .into_iter()
+        .map(|ty| ty.expect("every interned sum resolves to an LLVM type"))
+        .collect();
+    Ok((types, sums))
 }
 
 struct Layout<'ctx, 'a> {
     defs: &'a [TypeDef],
+    sums: &'a [Vec<Ty>],
     named: Vec<Option<StructType<'ctx>>>,
+    sum_named: Vec<StructType<'ctx>>,
     resolved: Vec<Option<BasicTypeEnum<'ctx>>>,
     visiting: Vec<bool>,
+    sum_resolved: Vec<Option<BasicTypeEnum<'ctx>>>,
+    sum_visiting: Vec<bool>,
 }
 
 impl<'ctx> Layout<'ctx, '_> {
@@ -150,6 +182,37 @@ impl<'ctx> Layout<'ctx, '_> {
         Ok(ty)
     }
 
+    /// An inline sum's `{i32 tag, member_0, ..., member_n}` layout, in the
+    /// sum's canonical (sorted) member order -- the same order lowering later
+    /// reads a member's position from to assign its deterministic tag
+    /// (Specification 018 Phase 4 item 1). A `Nil` member is a scalar here
+    /// (`Ty::Nil` lowers through `scalar_ty` like `Bool`), not a zero-field
+    /// struct the way a named union's `Nil` member is: unlike a union member,
+    /// an inline sum member is never itself a `TypeId`.
+    fn resolve_sum(
+        &mut self,
+        context: &'ctx Context,
+        id: SumId,
+    ) -> Result<BasicTypeEnum<'ctx>, String> {
+        if let Some(ty) = self.sum_resolved[id.index()] {
+            return Ok(ty);
+        }
+        if std::mem::replace(&mut self.sum_visiting[id.index()], true) {
+            // The checker's layout-cycle check walks through a sum's direct
+            // members into any user-defined type among them, so this can only
+            // mean that proof was wrong.
+            return Err(internal("an inline sum contains itself by value"));
+        }
+        let members = self.sums[id.index()].clone();
+        let mut types: Vec<BasicTypeEnum<'ctx>> = vec![context.i32_type().into()];
+        types.extend(self.resolve_all(context, members)?);
+        let named = self.sum_named[id.index()];
+        named.set_body(&types, false);
+        self.sum_visiting[id.index()] = false;
+        self.sum_resolved[id.index()] = Some(named.into());
+        Ok(named.into())
+    }
+
     fn resolve_all(
         &mut self,
         context: &'ctx Context,
@@ -168,6 +231,7 @@ impl<'ctx> Layout<'ctx, '_> {
     ) -> Result<BasicTypeEnum<'ctx>, String> {
         match ty {
             Ty::User(id) => self.resolve(context, id),
+            Ty::Sum(id) => self.resolve_sum(context, id),
             scalar => Ok(scalar_ty(context, scalar)),
         }
     }
@@ -280,6 +344,7 @@ fn declare<'ctx>(
 fn function_type<'ctx>(
     context: &'ctx Context,
     layout: &[BasicTypeEnum<'ctx>],
+    sums: &[BasicTypeEnum<'ctx>],
     leading: &[BasicMetadataTypeEnum<'ctx>],
     params: &[TParam],
     result: Option<Ty>,
@@ -287,12 +352,12 @@ fn function_type<'ctx>(
     let mut llvm_params = leading.to_vec();
     for param in params {
         llvm_params.push(match param.mode {
-            ParamMode::Value => llvm_ty(context, layout, param.ty).into(),
+            ParamMode::Value => llvm_ty(context, layout, sums, param.ty).into(),
             ParamMode::Reference => context.ptr_type(AddressSpace::default()).into(),
         });
     }
     match result {
-        Some(ty) => llvm_ty(context, layout, ty).fn_type(&llvm_params, false),
+        Some(ty) => llvm_ty(context, layout, sums, ty).fn_type(&llvm_params, false),
         None => context.void_type().fn_type(&llvm_params, false),
     }
 }
@@ -397,7 +462,7 @@ fn build_module<'ctx>(
     module.set_data_layout(&machine.get_target_data().get_data_layout());
 
     // Named types come first: every function signature below may mention one.
-    let layout = build_layout(context, &program.types)?;
+    let (layout, sum_layout) = build_layout(context, &program.types, &program.sums)?;
 
     // Every function is declared before any body is lowered, so recursion and
     // forward calls do not depend on source or hash-map iteration order.
@@ -407,7 +472,14 @@ fn build_module<'ctx>(
             context,
             &module,
             &function.symbol,
-            function_type(context, &layout, &[], &function.params, function.result),
+            function_type(
+                context,
+                &layout,
+                &sum_layout,
+                &[],
+                &function.params,
+                function.result,
+            ),
             None,
         );
         functions.insert(name.clone(), llvm_function);
@@ -417,7 +489,14 @@ fn build_module<'ctx>(
             context,
             &module,
             &format!("snacc_fn_{name}"),
-            function_type(context, &layout, &[], &function.params, function.result),
+            function_type(
+                context,
+                &layout,
+                &sum_layout,
+                &[],
+                &function.params,
+                function.result,
+            ),
             Some(Linkage::Internal),
         );
         functions.insert(name.clone(), llvm_function);
@@ -437,6 +516,7 @@ fn build_module<'ctx>(
             function_type(
                 context,
                 &layout,
+                &sum_layout,
                 &[receiver_param],
                 &method.params,
                 method.result,
@@ -453,6 +533,7 @@ fn build_module<'ctx>(
         methods: &methods,
         program,
         layout: &layout,
+        sums: &sum_layout,
     };
 
     for (name, function) in &program.funcs {
@@ -523,14 +604,27 @@ struct Codegen<'ctx, 'a> {
     program: &'a Program,
     /// LLVM types for those definitions, indexed by `TypeId`.
     layout: &'a [BasicTypeEnum<'ctx>],
+    /// LLVM types for every interned inline sum, indexed by `SumId`
+    /// (Specification 018 section 8).
+    sums: &'a [BasicTypeEnum<'ctx>],
 }
 
 /// Basic blocks a `break` may branch to, innermost last.
 type Loops<'ctx> = Vec<BasicBlock<'ctx>>;
 
+/// An `if`/`elseif` arm's pending binding, deferred from [`Codegen::arm_condition`]
+/// to [`Codegen::bind`] so it loads only on the successful edge. Kept as two
+/// variants rather than folded into one shape because a union member's tag is
+/// already resolved (`TTypeTest::tag`) while a sum member's tag is computed
+/// from canonical order on demand (`Codegen::sum_member_tag`).
+enum ArmBinding<'t> {
+    Union(&'t TTypeTest),
+    Sum(&'t TSumTypeTest),
+}
+
 impl<'ctx> Codegen<'ctx, '_> {
     fn ty(&self, ty: Ty) -> BasicTypeEnum<'ctx> {
-        llvm_ty(self.context, self.layout, ty)
+        llvm_ty(self.context, self.layout, self.sums, ty)
     }
 
     /// The named LLVM struct behind a type that has fields, or a union.
@@ -565,6 +659,23 @@ impl<'ctx> Codegen<'ctx, '_> {
                 "injection named a type that is not a union member",
             )),
         }
+    }
+
+    /// An inline sum member's deterministic tag (Specification 018 Phase 4
+    /// item 1): its position in the sum's canonical (sorted) member list, the
+    /// same list `SumTable::intern` built and the checker's `InjectSum` and
+    /// `SumTest` nodes both refer back to by `SumId` alone -- neither records
+    /// a tag itself, since assigning one is lowering's job.
+    fn sum_member_tag(&self, sum: SumId, member: Ty) -> Result<u32, String> {
+        self.program.sums[sum.index()]
+            .iter()
+            .position(|candidate| *candidate == member)
+            .map(|index| index as u32)
+            .ok_or_else(|| {
+                internal(
+                    "a sum type test or injection named a type that is not a member of the sum",
+                )
+            })
     }
 
     fn current_function(&self) -> FunctionValue<'ctx> {
@@ -897,16 +1008,18 @@ impl<'ctx> Codegen<'ctx, '_> {
         Ok(())
     }
 
-    /// An `if`/`elseif` arm's condition. A type test compares the union place's
-    /// stored tag against the tag the checker already resolved
-    /// (Specification 010 section 15.4). The returned test, when present,
-    /// carries a binding that must be loaded on the successful edge only.
+    /// An `if`/`elseif` arm's condition. A type test compares the tested
+    /// place's stored tag against the tag the checker resolved for a named
+    /// union (Specification 010 section 15.4) or lowering computes on the fly
+    /// from canonical member order for an inline sum (Specification 018
+    /// Phase 4 item 1). The returned binding, when present, must be loaded on
+    /// the successful edge only.
     fn arm_condition<'t>(
         &self,
         env: &mut Env<'ctx>,
         loops: &mut Loops<'ctx>,
         condition: &'t TCondition,
-    ) -> Result<(IntValue<'ctx>, Option<&'t TTypeTest>), String> {
+    ) -> Result<(IntValue<'ctx>, Option<ArmBinding<'t>>), String> {
         match condition {
             TCondition::Expr(expression) => Ok((self.condition(env, loops, expression)?, None)),
             TCondition::Test(test) => {
@@ -920,26 +1033,56 @@ impl<'ctx> Codegen<'ctx, '_> {
                     .builder
                     .build_int_compare(IntPredicate::EQ, tag.into_int_value(), expected, "is")
                     .map_err(|error| error.to_string())?;
-                Ok((compared, test.binding.is_some().then_some(test)))
+                Ok((
+                    compared,
+                    test.binding.is_some().then_some(ArmBinding::Union(test)),
+                ))
             }
-            // Specification 018 (Task B) has not yet lowered an inline sum
-            // type test; Task A's checker never emits one into a program
-            // this backend runs on.
-            TCondition::SumTest(_) => Err(internal("inline sum type tests are not lowered yet")),
+            TCondition::SumTest(test) => {
+                let member_tag = self.sum_member_tag(test.sum, test.member)?;
+                let tag =
+                    self.union_field(env, &test.place, 0, self.context.i32_type().into(), "tag")?;
+                let expected = self
+                    .context
+                    .i32_type()
+                    .const_int(u64::from(member_tag), false);
+                let compared = self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, tag.into_int_value(), expected, "is")
+                    .map_err(|error| error.to_string())?;
+                Ok((
+                    compared,
+                    test.binding.is_some().then_some(ArmBinding::Sum(test)),
+                ))
+            }
         }
     }
 
     /// Loads a successful type test's binding. Called only after the builder is
     /// positioned in the arm's `then` block, so an inactive member is never
     /// read on the failing edge.
-    fn bind(&self, env: &mut Env<'ctx>, bound: Option<&TTypeTest>) -> Result<(), String> {
-        let Some(test) = bound else { return Ok(()) };
-        let Some((name, ty)) = &test.binding else {
-            return Ok(());
-        };
-        let value = self.union_field(env, &test.place, test.tag + 1, self.ty(*ty), name)?;
-        env.push((name.clone(), Slot::Value(value)));
-        Ok(())
+    fn bind(&self, env: &mut Env<'ctx>, bound: Option<ArmBinding<'_>>) -> Result<(), String> {
+        match bound {
+            None => Ok(()),
+            Some(ArmBinding::Union(test)) => {
+                let Some((name, ty)) = &test.binding else {
+                    return Ok(());
+                };
+                let value = self.union_field(env, &test.place, test.tag + 1, self.ty(*ty), name)?;
+                env.push((name.clone(), Slot::Value(value)));
+                Ok(())
+            }
+            Some(ArmBinding::Sum(test)) => {
+                let Some((name, ty)) = &test.binding else {
+                    return Ok(());
+                };
+                let member_tag = self.sum_member_tag(test.sum, test.member)?;
+                let value =
+                    self.union_field(env, &test.place, member_tag + 1, self.ty(*ty), name)?;
+                env.push((name.clone(), Slot::Value(value)));
+                Ok(())
+            }
+        }
     }
 
     fn condition(
@@ -1146,38 +1289,44 @@ impl<'ctx> Codegen<'ctx, '_> {
     }
 
     /// Type-directed structural equality producing an `i1`
-    /// (Specification 010 sections 7.3, 8.4, and 9.2).
+    /// (Specification 010 sections 7.3, 8.4, and 9.2). Specification 018
+    /// section 8 extends this structurally to an inline sum, reusing
+    /// [`Self::equal_union`]'s tag-then-active-member strategy through
+    /// [`Self::equal_sum`].
     fn equal(
         &self,
         ty: Ty,
         left: BasicValueEnum<'ctx>,
         right: BasicValueEnum<'ctx>,
     ) -> Result<IntValue<'ctx>, String> {
-        let Ty::User(id) = ty else {
-            return if is_float(ty) {
-                self.builder.build_float_compare(
+        match ty {
+            Ty::User(id) => match self.def(id) {
+                // A represented type is its target at runtime, so it delegates.
+                TypeDef::Represented { target, .. } => self.equal(*target, left, right),
+                TypeDef::Struct { fields, .. } | TypeDef::UnionMember { fields, .. } => {
+                    self.equal_fields(fields, left, right)
+                }
+                TypeDef::Union { members, .. } => self.equal_union(members, left, right),
+            },
+            Ty::Sum(id) => self.equal_sum(&self.program.sums[id.index()], left, right),
+            _ if is_float(ty) => self
+                .builder
+                .build_float_compare(
                     FloatPredicate::OEQ,
                     left.into_float_value(),
                     right.into_float_value(),
                     "eq",
                 )
-            } else {
-                self.builder.build_int_compare(
+                .map_err(|error| error.to_string()),
+            _ => self
+                .builder
+                .build_int_compare(
                     IntPredicate::EQ,
                     left.into_int_value(),
                     right.into_int_value(),
                     "eq",
                 )
-            }
-            .map_err(|error| error.to_string());
-        };
-        match self.def(id) {
-            // A represented type is its target at runtime, so it delegates.
-            TypeDef::Represented { target, .. } => self.equal(*target, left, right),
-            TypeDef::Struct { fields, .. } | TypeDef::UnionMember { fields, .. } => {
-                self.equal_fields(fields, left, right)
-            }
-            TypeDef::Union { members, .. } => self.equal_union(members, left, right),
+                .map_err(|error| error.to_string()),
         }
     }
 
@@ -1300,6 +1449,87 @@ impl<'ctx> Codegen<'ctx, '_> {
                 .build_extract_value(as_struct(right)?, field, "member")
                 .map_err(|error| error.to_string())?;
             let equal = self.equal(Ty::User(*member), left, right)?;
+            let current = self
+                .builder
+                .get_insert_block()
+                .expect("a comparison has an insertion block");
+            self.builder
+                .build_unconditional_branch(done)
+                .map_err(|error| error.to_string())?;
+            incoming.push((equal, current));
+        }
+
+        self.builder.position_at_end(done);
+        self.phi_bool(&incoming)
+    }
+
+    /// An inline sum's equality: identical strategy to [`Self::equal_union`]
+    /// (Specification 018 section 8 reuses named-union equality unchanged),
+    /// except a member's deterministic tag is its position in `members`
+    /// rather than a `TypeId`'s own tag, since a sum member is not always one.
+    fn equal_sum(
+        &self,
+        members: &[Ty],
+        left: BasicValueEnum<'ctx>,
+        right: BasicValueEnum<'ctx>,
+    ) -> Result<IntValue<'ctx>, String> {
+        let function = self.current_function();
+        let done = self.context.append_basic_block(function, "sum_eq_done");
+        let matched = self.context.append_basic_block(function, "sum_eq_matched");
+        let left_tag = self
+            .builder
+            .build_extract_value(as_struct(left)?, 0, "tag")
+            .map_err(|error| error.to_string())?
+            .into_int_value();
+        let right_tag = self
+            .builder
+            .build_extract_value(as_struct(right)?, 0, "tag")
+            .map_err(|error| error.to_string())?
+            .into_int_value();
+        let same = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, left_tag, right_tag, "tag_eq")
+            .map_err(|error| error.to_string())?;
+        let entry = self
+            .builder
+            .get_insert_block()
+            .expect("a comparison has an insertion block");
+        self.builder
+            .build_conditional_branch(same, matched, done)
+            .map_err(|error| error.to_string())?;
+        // Different tags are unequal without touching either payload.
+        let mut incoming = vec![(self.context.bool_type().const_zero(), entry)];
+
+        self.builder.position_at_end(matched);
+        let unknown = self.context.append_basic_block(function, "sum_eq_unknown");
+        let cases: Vec<_> = (0..members.len())
+            .map(|tag| {
+                (
+                    self.context.i32_type().const_int(tag as u64, false),
+                    self.context.append_basic_block(function, "sum_eq_member"),
+                )
+            })
+            .collect();
+        self.builder
+            .build_switch(left_tag, unknown, &cases)
+            .map_err(|error| error.to_string())?;
+        // A stored tag outside the sum's members means construction wrote one
+        // that does not exist.
+        self.builder.position_at_end(unknown);
+        self.exhausted()?;
+
+        for (tag, (member, (_, block))) in members.iter().zip(cases).enumerate() {
+            let field = tag as u32 + 1;
+            self.builder.position_at_end(block);
+            let left = self
+                .builder
+                .build_extract_value(as_struct(left)?, field, "member")
+                .map_err(|error| error.to_string())?;
+            let right = self
+                .builder
+                .build_extract_value(as_struct(right)?, field, "member")
+                .map_err(|error| error.to_string())?;
+            let equal = self.equal(*member, left, right)?;
             let current = self
                 .builder
                 .get_insert_block()
@@ -1437,10 +1667,33 @@ impl<'ctx> Codegen<'ctx, '_> {
                     .map_err(|error| error.to_string())?;
                 Ok(injected.into_struct_value().into())
             }
-            // Specification 018 (Task B) has not yet given inline sum
-            // injection a lowering strategy; Task A's checker never emits
-            // one into a program this backend runs on.
-            TExpr::InjectSum { .. } => Err(internal("inline sum injection is not lowered yet")),
+            // Specification 018 section 8 and Phase 4 items 2-3 reuse
+            // `TExpr::Inject`'s strategy exactly: start from the complete
+            // sum's zero initializer, then write the tag and the active
+            // member, so an inactive field is always deterministic. Only the
+            // tag source differs -- a sum member's tag is its position in the
+            // canonical member list, computed on demand, since `InjectSum`
+            // never records one itself.
+            TExpr::InjectSum { sum, member, value } => {
+                let value = self.expr(env, loops, value)?;
+                let tag = self.sum_member_tag(*sum, *member)?;
+                let zeroed = self.struct_ty(Ty::Sum(*sum))?.const_zero();
+                let tagged = self
+                    .builder
+                    .build_insert_value(
+                        zeroed,
+                        self.context.i32_type().const_int(u64::from(tag), false),
+                        0,
+                        "tag",
+                    )
+                    .map_err(|error| error.to_string())?
+                    .into_struct_value();
+                let injected = self
+                    .builder
+                    .build_insert_value(tagged, value, tag + 1, "member")
+                    .map_err(|error| error.to_string())?;
+                Ok(injected.into_struct_value().into())
+            }
             TExpr::Arith(left, op, right, ty) => {
                 let ty = *ty;
                 let left = self.expr(env, loops, left)?;
@@ -1459,8 +1712,8 @@ impl<'ctx> Codegen<'ctx, '_> {
                     .map_err(|e| e.to_string())?;
                     return Ok(value.into());
                 }
-                if matches!(ty, Ty::Bool | Ty::Nil | Ty::User(_)) {
-                    return Err("checker produced non-numeric arithmetic".into());
+                if matches!(ty, Ty::Bool | Ty::Nil | Ty::User(_) | Ty::Sum(_)) {
+                    return Err(internal("checker produced non-numeric arithmetic"));
                 }
                 // Plain `add`/`sub`/`mul` on an N-bit integer already wrap
                 // modulo 2^N; no no-wrap flag may be added or the modular
@@ -1487,10 +1740,12 @@ impl<'ctx> Codegen<'ctx, '_> {
                 let right = self.expr(env, loops, right)?;
                 let builder = self.builder;
                 let ordered = !matches!(op, CmpOp::Eq | CmpOp::NotEq);
-                if ordered && matches!(operand_ty, Ty::Bool | Ty::Nil | Ty::User(_)) {
-                    return Err("checker allowed an ordered non-numeric comparison".into());
+                if ordered && matches!(operand_ty, Ty::Bool | Ty::Nil | Ty::User(_) | Ty::Sum(_)) {
+                    return Err(internal(
+                        "checker allowed an ordered non-numeric comparison",
+                    ));
                 }
-                let comparison = if matches!(operand_ty, Ty::User(_)) {
+                let comparison = if matches!(operand_ty, Ty::User(_) | Ty::Sum(_)) {
                     // Recursive, type-directed equality; `!=` is its negation.
                     let equal = self.equal(operand_ty, left, right)?;
                     match op {

@@ -76,6 +76,13 @@ impl SumTable {
     pub fn members(&self, id: SumId) -> &[Ty] {
         &self.members[id.index()]
     }
+
+    /// Every interned sum's normalized members, indexed by `SumId`. Used once,
+    /// at the end of checking, to hand the backend (Specification 018 Task B)
+    /// a lowering-only snapshot of the table alongside the checked `Program`.
+    pub fn all(&self) -> &[Vec<Ty>] {
+        &self.members
+    }
 }
 
 /// The result of comparing an inline sum's raw (possibly duplicated,
@@ -278,6 +285,15 @@ impl Types {
     /// resolution, continuing the same table declaration collection built.
     pub fn intern_sum(&mut self, members: Vec<Ty>) -> SumId {
         self.sums.intern(members)
+    }
+
+    /// Every interned inline sum's normalized member list, indexed by
+    /// `SumId` (Specification 018 Task B): a lowering-only snapshot handed to
+    /// the checked `Program` once checking finishes, so the backend does not
+    /// need the rest of the type table -- only each sum's own member order --
+    /// to build its LLVM layout and deterministic tags.
+    pub fn all_sums(&self) -> &[Vec<Ty>] {
+        self.sums.all()
     }
 }
 
