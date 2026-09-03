@@ -690,11 +690,9 @@ fn each_bridge_type_round_trips_through_a_parameter_and_a_result() {
             "extern rust \"snacc_user_echo_int\" fun echo_int(value: Int64): Int64\n",
             "extern rust \"snacc_user_echo_dec\" fun echo_dec(value: Dec64): Dec64\n",
             "extern rust \"snacc_user_echo_bool\" fun echo_bool(value: Bool): Bool\n",
-            "extern rust \"snacc_user_echo_nil\" fun echo_nil(value: Nil): Nil\n",
             "print(echo_int(1))\n",
             "print(echo_dec(1.5))\n",
             "print(echo_bool(true))\n",
-            "print(echo_nil(nil))\n",
         ),
     )
     .unwrap();
@@ -706,9 +704,7 @@ fn each_bridge_type_round_trips_through_a_parameter_and_a_result() {
             "#[unsafe(no_mangle)]\n",
             "pub extern \"C\" fn snacc_user_echo_dec(value: f64) -> f64 { value }\n\n",
             "#[unsafe(no_mangle)]\n",
-            "pub extern \"C\" fn snacc_user_echo_bool(value: u8) -> u8 { value }\n\n",
-            "#[unsafe(no_mangle)]\n",
-            "pub extern \"C\" fn snacc_user_echo_nil(value: u8) -> u8 { value }\n",
+            "pub extern \"C\" fn snacc_user_echo_bool(value: u8) -> u8 { value }\n",
         ),
     )
     .unwrap();
@@ -724,7 +720,6 @@ fn each_bridge_type_round_trips_through_a_parameter_and_a_result() {
     assert!(stdout.lines().any(|line| line == "1"));
     assert!(stdout.lines().any(|line| line == "1.5"));
     assert!(stdout.lines().any(|line| line == "true"));
-    assert!(stdout.lines().any(|line| line == "nil"));
 }
 
 /// Specification 009 conformance 12-13: every ABI version 3 addition
@@ -976,6 +971,44 @@ fn abi_3_cache_manifests_are_never_reused_after_the_abi_4_bump() {
     assert!(
         String::from_utf8_lossy(&rebuilt.stdout).contains("Snacc object rebuilt"),
         "an ABI-3 cache manifest must not be reused for an ABI-{}-build:\n{}",
+        snacc_compiler::ABI_VERSION,
+        combined(&rebuilt)
+    );
+}
+
+/// Specification 012 conformance 18: an ABI version 4 cache object (the version
+/// predating this milestone's ABI 5 bump) is not reused once the compiler
+/// declares ABI version 5.
+#[test]
+fn abi_4_cache_manifests_are_never_reused_after_the_abi_5_bump() {
+    let target = tempfile::tempdir().expect("failed to create fixture target directory");
+    let build = cargo_snacc(target.path(), &["build", "--offline", "--verbose"]);
+    assert!(
+        build.status.success(),
+        "build failed:\n{}",
+        combined(&build)
+    );
+
+    let manifest_path = find_manifest(&target.path().join("snacc"))
+        .expect("content-addressed cache manifest was not written");
+    let encoded = fs::read_to_string(&manifest_path).unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    manifest["abi_version"] = serde_json::json!(4);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let rebuilt = cargo_snacc(target.path(), &["build", "--offline", "--verbose"]);
+    assert!(
+        rebuilt.status.success(),
+        "rebuild failed:\n{}",
+        combined(&rebuilt)
+    );
+    assert!(
+        String::from_utf8_lossy(&rebuilt.stdout).contains("Snacc object rebuilt"),
+        "an ABI-4 cache manifest must not be reused for an ABI-{}-build:\n{}",
         snacc_compiler::ABI_VERSION,
         combined(&rebuilt)
     );

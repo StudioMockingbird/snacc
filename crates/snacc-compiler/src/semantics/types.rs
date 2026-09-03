@@ -8,7 +8,7 @@
 use crate::semantics::checker::{Error, TParam, Ty};
 use crate::syntax::ast::{
     ExternFunc, Func, MethodDecl, Param, ParamMode, Program as AstProgram, Span, Spanned, TypeBody,
-    TypeRef,
+    TypeName, TypeRef,
 };
 use std::collections::HashMap;
 
@@ -210,10 +210,32 @@ impl Builder {
     }
 }
 
+/// Specification 012 section 10 and section 13's "Standalone `Nil` type" row.
+/// `Nil` is spelled only as a union member, which the parser recognizes on its
+/// own (`Token::TyNil` in the union-member rule) and never routes through type
+/// resolution, so every `TypeRef::Builtin(TypeName::Nil)` that reaches a
+/// resolver is a standalone use and is rejected here.
+pub const STANDALONE_NIL: &str = "'Nil' is not a standalone type; it is permitted only as a \
+                                  member of a union that also declares a non-Nil member";
+
+/// Specification 012 section 10 and section 13's "`nil` without one expected
+/// Nil-containing union" row. `nil` names a union's `Nil` member, so a use with
+/// no expected union type behind it -- `print(nil)`, `nil == nil` -- has no type
+/// at all.
+pub const CONTEXTLESS_NIL: &str = "'nil' has no type of its own; it is valid only where one \
+                                   expected union type directly contains 'Nil'";
+
 /// Resolves one written type. Returns `None` after reporting an unresolved or
-/// malformed path.
+/// malformed path, or a standalone `Nil`.
 fn resolve(builder: &Builder, ty: &Spanned<TypeRef<'_>>, errors: &mut Vec<Error>) -> Option<Ty> {
     match &ty.0 {
+        TypeRef::Builtin(TypeName::Nil) => {
+            errors.push(Error {
+                span: ty.1,
+                msg: STANDALONE_NIL.to_string(),
+            });
+            None
+        }
         TypeRef::Builtin(name) => Some(Ty::from(*name)),
         TypeRef::Named(segments) => {
             let first = segments[0].0;

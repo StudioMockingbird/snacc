@@ -1,0 +1,1 @@
+'Nil' is not a standalone type; it is permitted only as a member of a union that also declares a non-Nil member

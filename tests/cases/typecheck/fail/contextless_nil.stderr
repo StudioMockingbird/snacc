@@ -1,0 +1,1 @@
+'nil' has no type of its own; it is valid only where one expected union type directly contains 'Nil'

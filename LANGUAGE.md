@@ -113,7 +113,10 @@ digit                = "0" | "1" | "2" | "3" | "4"
    (`Int64(id)`); a type name alone is never a value. The grammar admits a named
    type wherever a `type` appears, including a Rust bridge signature; that a
    user-defined type may not cross the bridge is a semantic rule, diagnosed by
-   the checker. A `reference-parameter-type` is permitted only as the direct
+   the checker. The grammar likewise admits `Nil` wherever a
+   `builtin-value-type` appears; that `Nil` is spelled as a value type only as
+   a `union-member` or a `type-test` is a semantic rule, also diagnosed by the
+   checker. A `reference-parameter-type` is permitted only as the direct
    declared type of a `parameter`; it is rejected in every other `type`
    position, and `Ref<Ref<T>>` is never permitted. The `<` and `>` around a
    referent are type delimiters, not ordered comparisons. *)
@@ -163,8 +166,14 @@ minus, a negative value is formed by subtraction.
 `Dec64` is an IEEE 754 binary64 value. A numeric literal containing a decimal
 point has type `Dec64`.
 
-`Bool` contains `true` and `false`. `Nil` contains the single value `nil`; `null`
-is an alternate spelling of that value.
+`Bool` contains `true` and `false`.
+
+`Nil` is not a standalone type. It is spelled only as a union member, and it is
+rejected as a variable, parameter, function, method or bridge result, field,
+represented type, or `Ref<T>` referent. `nil`, and its alternate spelling
+`null`, names that member and has no type of its own: it is valid only where
+exactly one expected union type directly contains `Nil`. `print(nil)` and
+`nil == nil` supply no such type and are rejected.
 
 `UInt8`, `UInt16`, `UInt32`, and `UInt64` are unsigned integers of the named
 bit width, holding integers from 0 through 2^N - 1. An unsigned literal has
@@ -189,16 +198,17 @@ an explicit type. There are exactly two implicit conversions: `Int64` to
 `Dec64`, and a direct union member to its containing union. Both apply to
 bindings, arguments, results, and branches; the numeric one also applies to
 operands. No conversion to or from
-`Bool` or `Nil` exists. `UInt8`, `UInt16`, `UInt32`, `UInt64`, and `Float32`
+`Bool` exists. `UInt8`, `UInt16`, `UInt32`, `UInt64`, and `Float32`
 participate in no implicit conversion at all: not to or from `Int64`, not to
-or from `Dec64`, not to or from each other, and not to or from `Bool` or
-`Nil`. Every declaration, assignment, argument, result, and branch involving
+or from `Dec64`, not to or from each other, and not to or from
+`Bool`. Every declaration, assignment, argument, result, and branch involving
 one of these five types requires an exact type match; `let byte: UInt8 = 1`
 is a type error, not a contextual reinterpretation of the literal.
 
 No result is not a type. A function, method, or Rust bridge that omits its
 result type produces no result: it cannot be written, stored, passed,
-returned, or compared, and it is distinct from `Nil`.
+returned, or compared. It is not a value of any kind, and in particular it is
+not a union's `Nil` member.
 
 ## User-defined types
 
@@ -301,7 +311,11 @@ member is exactly shorthand for an empty struct member: `| East` means
 `| East is struct end`. A member is either a bare or an inline struct; it does
 not name an unrelated existing type and does not nest a second union. A union
 may also declare the member `| Nil`, which carries no value and is the type of
-the contextual literal `nil` in a position expecting that union.
+the contextual literal `nil` in a position expecting that union. `Nil` is the
+only place a union member is spelled with a reserved type name. A union
+declares `Nil` at most once and never as its only member, and `is Nil` tests
+that member without a binding: `is Nil(name)` is rejected because the member
+carries no value.
 
 A union value contains exactly one direct member value and a tag identifying
 that member's type. Construction always names the member type, never the union:
@@ -606,8 +620,10 @@ effects.
   these five types, or mixing one of them with `Int64` or `Dec64`, is a type
   error.
 - `<`, `<=`, `>`, and `>=` require numeric operands and produce `Bool`. `==` and
-  `!=` accept numeric operands, two `Bool` operands, two `Nil` operands, or two
+  `!=` accept numeric operands, two `Bool` operands, or two
   operands of one user-defined type that supports equality, and produce `Bool`.
+  One operand may be `nil` when the other is a union that directly contains
+  `Nil`; `nil == nil` has no such type and is rejected.
   Mixed `Int64`/`Dec64` operands are compared as `Dec64`.
   `UInt8`, `UInt16`, `UInt32`, `UInt64`, and `Float32` operands must match
   exactly for ordered comparison and equality alike; unsigned comparisons use
@@ -750,17 +766,17 @@ method form. Internal Snacc functions and methods may accept and return every
 user-defined type.
 
 The ABI representation is `i64` for `Int64`, IEEE binary64 for `Dec64`, `u8`
-for `Bool` and `Nil`, `u8`/`u16`/`u32`/`u64` for
+for `Bool`, `u8`/`u16`/`u32`/`u64` for
 `UInt8`/`UInt16`/`UInt32`/`UInt64`, and IEEE binary32 (`f32`) for `Float32`. A
-host must encode `false` as zero, `true` as one, and `nil` as zero. `UInt8`
+host must encode `false` as zero and `true` as one. `UInt8`
 and `UInt16` sub-word parameters and results carry the zero-extension
 attribute the target C ABI requires, matching Rust's and Clang's `zeroext`
 behavior; `Bool` carries the same attribute for consistency. Rust bridges
 must not unwind across the ABI boundary.
 
 A bridge parameter may use `Ref<T>` only when `T` is one of those by-value
-scalars; standalone `Nil` has no storage to refer to and is excluded, as is
-every user-defined type. `Ref<T>` maps to `&mut R`, where `R` is the referent's
+scalars; every user-defined type is excluded, and `Nil` is not a type that can
+be written there at all. `Ref<T>` maps to `&mut R`, where `R` is the referent's
 own ABI representation:
 
 | Snacc | Rust bridge parameter |
@@ -792,29 +808,30 @@ linker's responsibility.
 
 ## ABI version and ownership
 
-The current Snacc ABI version is 4. The version covers the `snacc_main` entry,
+The current Snacc ABI version is 5. The version covers the `snacc_main` entry,
 the required `snacc_print_*` runtime imports, the permitted Rust bridge types
 (including the no-result bridge signature added in ABI version 2, the
 fixed-width unsigned and `Float32` types added in ABI version 3, and the
-`Ref<T>` bridge parameters added in ABI version 4), their representations and
+`Ref<T>` bridge parameters added in ABI version 4, and the removal of
+standalone `Nil` and of the `snacc_print_nil` import in ABI version 5), their
+representations and
 valid values, the C calling convention, and the ownership rules for values
 crossing those boundaries.
 
-ABI version 4 exports `snacc_main` as `extern "C" fn() -> i32` and imports:
+ABI version 5 exports `snacc_main` as `extern "C" fn() -> i32` and imports:
 
 | Symbol | Rust signature |
 | --- | --- |
 | `snacc_print_f64` | `extern "C" fn(f64)` |
 | `snacc_print_i64` | `extern "C" fn(i64)` |
 | `snacc_print_bool` | `extern "C" fn(u8)` |
-| `snacc_print_nil` | `extern "C" fn()` |
 | `snacc_print_u8` | `extern "C" fn(u8)` |
 | `snacc_print_u16` | `extern "C" fn(u16)` |
 | `snacc_print_u32` | `extern "C" fn(u32)` |
 | `snacc_print_u64` | `extern "C" fn(u64)` |
 | `snacc_print_f32` | `extern "C" fn(f32)` |
 
-Every value permitted across an ABI version 4 Rust bridge is a scalar passed
+Every value permitted across an ABI version 5 Rust bridge is a scalar passed
 or returned by value, a `Ref<T>` parameter borrowing one such scalar for the
 duration of the call, or no value at all (a no-result bridge's C ABI result is
 `void`). Crossing the boundary by value copies the value; no allocation,
@@ -823,13 +840,15 @@ may retain its scalar copy. A `Ref<T>` parameter borrows caller storage rather
 than transferring it: the bridge may read and write the referent during the
 call and must not retain access to it afterwards. No reference is returned, and
 no bridge result is a reference. Buffers, aggregates, and handles are not ABI
-version 4 values.
+version 5 values.
 
-At ABI version 4, `UInt8`, `Bool`, and standalone `Nil` share the Rust
-representation `u8`; the generated Rust type assertion verifies width and ABI
-representation but cannot distinguish these three Snacc types from one
-another. Their distinct Snacc meanings remain the declaration author's
-contract.
+At ABI version 5, `UInt8` and `Bool` share the Rust representation `u8`; the
+generated Rust type assertion verifies width and ABI representation but cannot
+distinguish these two Snacc types from one another. Their distinct Snacc
+meanings remain the declaration author's contract. Standalone `Nil` was a
+version 4 bridge type and is not a version 5 one; `snacc_print_nil` was a
+version 4 required import and is not a version 5 one. No version 4 object,
+runtime, or cached artifact is accepted by a version 5 build.
 
 User-defined types add no ABI representation and do not change the ABI version:
 none of them may cross a Rust bridge, so every boundary contract above is

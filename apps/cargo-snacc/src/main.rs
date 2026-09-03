@@ -865,18 +865,19 @@ fn rust_abi_type(ty: Ty) -> &'static str {
     match ty {
         Ty::Int64 => "i64",
         Ty::Dec64 => "f64",
-        Ty::Bool | Ty::Nil => "u8",
+        Ty::Bool => "u8",
         Ty::UInt8 => "u8",
         Ty::UInt16 => "u16",
         Ty::UInt32 => "u32",
         Ty::UInt64 => "u64",
         Ty::Float32 => "f32",
-        // Specification 010 section 16: declaration collection rejects every
-        // user-defined type at every `extern rust` parameter and result, so a
-        // bridge signature that reaches assertion rendering never contains one.
-        Ty::User(_) => unreachable!(
-            "internal error: user-defined type reached bridge rendering; \
-             Specification 010 section 16 rejects it during declaration collection"
+        // Specification 010 section 16 rejects every user-defined type at every
+        // `extern rust` parameter and result, and Specification 012 section 12
+        // removes standalone `Nil` from the bridge entirely. Declaration
+        // collection rejects both, so neither reaches assertion rendering.
+        Ty::User(_) | Ty::Nil => unreachable!(
+            "internal error: a user-defined type or standalone 'Nil' reached bridge \
+             rendering; declaration collection rejects both"
         ),
     }
 }
@@ -1503,7 +1504,7 @@ mod tests {
     #[test]
     fn render_bridge_assertions_sorts_by_snacc_name_and_maps_types() {
         let source = concat!(
-            "extern rust \"snacc_user_zeta\" fun zeta(value: Bool): Nil\n",
+            "extern rust \"snacc_user_zeta\" fun zeta(value: Bool)\n",
             "extern rust \"snacc_user_alpha\" fun alpha(a: Int64, b: Dec64): Bool\n",
             "print(0)\n"
         );
@@ -1521,7 +1522,7 @@ mod tests {
         assert!(alpha_line.contains("fn(i64, f64) -> u8"));
         assert!(alpha_line.contains("crate::interop::snacc_user_alpha"));
         assert!(alpha_line.contains("// snacc: alpha (src/main.nrs:2:1)"));
-        assert!(zeta_line.contains("fn(u8) -> u8"));
+        assert!(zeta_line.contains("fn(u8) -> ()"));
         assert!(zeta_line.contains("// snacc: zeta (src/main.nrs:1:1)"));
     }
 

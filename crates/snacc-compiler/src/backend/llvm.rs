@@ -198,8 +198,7 @@ fn is_unsigned(ty: Ty) -> bool {
     }
 }
 
-/// The runtime import that prints one scalar. `Nil` carries no value, so it
-/// prints through a niladic import.
+/// The runtime import that prints one scalar.
 fn print_import<'ctx>(
     context: &'ctx Context,
     ty: Ty,
@@ -213,10 +212,11 @@ fn print_import<'ctx>(
         Ty::UInt32 => "snacc_print_u32",
         Ty::UInt64 => "snacc_print_u64",
         Ty::Bool => "snacc_print_bool",
-        Ty::Nil => return Ok(("snacc_print_nil", Vec::new())),
-        // Specification 010 section 14: the checker rejects printing a
-        // user-defined type, so one never reaches lowering.
+        // Specification 010 section 14 rejects printing a user-defined type and
+        // Specification 012 section 10 leaves no standalone `Nil` value at all,
+        // so neither reaches lowering.
         Ty::User(_) => return Err(internal("a user-defined type reached 'print' lowering")),
+        Ty::Nil => return Err(internal("a standalone 'Nil' reached 'print' lowering")),
     };
     Ok((symbol, vec![scalar_ty(context, ty).into()]))
 }
@@ -1546,11 +1546,7 @@ impl<'ctx> Codegen<'ctx, '_> {
             TExpr::Print(value, ty) => {
                 let value = self.expr(env, loops, value)?;
                 let function = self.print_import(*ty)?;
-                let args = match ty {
-                    Ty::Nil => Vec::new(),
-                    _ => vec![value.into()],
-                };
-                self.invoke(function, &args)?;
+                self.invoke(function, &[value.into()])?;
                 Ok(value)
             }
         }

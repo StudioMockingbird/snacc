@@ -18,8 +18,8 @@ use std::{
 use tempfile::TempDir;
 
 #[test]
-fn runtime_implements_abi_version_four() {
-    assert_eq!(snacc_runtime::ABI_VERSION, 4);
+fn runtime_implements_abi_version_five() {
+    assert_eq!(snacc_runtime::ABI_VERSION, 5);
 }
 
 fn run(command: &mut Command, what: &str) -> Output {
@@ -43,7 +43,7 @@ fn run(command: &mut Command, what: &str) -> Output {
 const RUNTIME_SOURCE: &str = include_str!("../src/lib.rs");
 
 /// Appended to `RUNTIME_SOURCE` so one compiled probe binary can exercise
-/// any of the nine print symbols by argv, e.g. `probe f64 1.5` or `probe nil`.
+/// any of the eight print symbols by argv, e.g. `probe f64 1.5` or `probe u8 7`.
 /// Calling a `pub extern "C" fn` directly by name (not through an FFI
 /// declaration) is ordinary, safe Rust -- no `unsafe` required.
 const PROBE_MAIN: &str = r#"
@@ -55,7 +55,6 @@ fn main() {
         "f64" => snacc_print_f64(args.next().expect("missing value").parse().expect("invalid f64")),
         "i64" => snacc_print_i64(args.next().expect("missing value").parse().expect("invalid i64")),
         "bool" => snacc_print_bool(args.next().expect("missing value").parse().expect("invalid u8")),
-        "nil" => snacc_print_nil(),
         "u8" => snacc_print_u8(args.next().expect("missing value").parse().expect("invalid u8")),
         "u16" => snacc_print_u16(args.next().expect("missing value").parse().expect("invalid u16")),
         "u32" => snacc_print_u32(args.next().expect("missing value").parse().expect("invalid u32")),
@@ -128,11 +127,6 @@ fn snacc_print_bool_treats_any_nonzero_byte_as_true() {
 }
 
 #[test]
-fn snacc_print_nil_always_prints_nil() {
-    assert_eq!(probe_stdout(&["nil"]), "nil\n");
-}
-
-#[test]
 fn snacc_print_u8_uses_default_u8_display() {
     assert_eq!(probe_stdout(&["u8", "0"]), "0\n");
     assert_eq!(probe_stdout(&["u8", "255"]), "255\n");
@@ -171,14 +165,13 @@ fn snacc_print_f32_uses_default_f32_display() {
 // ---------------------------------------------------------------------
 
 /// Stands in for the object file the LLVM backend emits: undefined
-/// references to all nine print symbols, called from one exported entry
+/// references to all eight print symbols, called from one exported entry
 /// point that a host can invoke without knowing anything else about it.
 const FAKE_OBJECT_SOURCE: &str = r#"
 unsafe extern "C" {
     fn snacc_print_f64(value: f64);
     fn snacc_print_i64(value: i64);
     fn snacc_print_bool(value: u8);
-    fn snacc_print_nil();
     fn snacc_print_u8(value: u8);
     fn snacc_print_u16(value: u16);
     fn snacc_print_u32(value: u32);
@@ -192,7 +185,6 @@ pub extern "C" fn probe_entry() {
         snacc_print_f64(1.5);
         snacc_print_i64(-42);
         snacc_print_bool(1);
-        snacc_print_nil();
         snacc_print_u8(255);
         snacc_print_u16(65535);
         snacc_print_u32(4294967295);
@@ -220,7 +212,7 @@ fn main() {
 /// Proves the actual property `force_link` exists to guarantee: a host that
 /// touches `snacc-runtime` only by calling `force_link()` still lets an
 /// externally linked native object resolve, call, and correctly observe all
-/// nine `snacc_print_*` symbols across a real link -- not just that
+/// eight `snacc_print_*` symbols across a real link -- not just that
 /// `force_link()` runs without panicking.
 ///
 /// This builds `snacc-runtime` as a standalone `.rlib` (the same separately
@@ -228,7 +220,7 @@ fn main() {
 /// it with the fake object above via `--extern` and `-C link-arg=...` (the
 /// same mechanism `crates/snacc-driver::build` and `apps/cargo-snacc` use),
 /// and asserts both that the link succeeds and that the resulting binary
-/// prints exactly what the four symbols should produce. A successful link
+/// prints exactly what the eight symbols should produce. A successful link
 /// plus correct output is strictly more informative than finding the
 /// symbol names in a `dumpbin`/`nm` symbol table: it also proves the
 /// symbols are correctly defined, exported, and callable across the crate
@@ -246,7 +238,7 @@ fn main() {
 /// undefined references are known -- is a property of some linkers (e.g.
 /// classic GNU `ld`), not of MSVC's.
 #[test]
-fn force_link_retains_all_nine_print_symbols_through_a_real_link() {
+fn force_link_retains_all_eight_print_symbols_through_a_real_link() {
     let dir = tempfile::Builder::new()
         .prefix("snacc-runtime-force-link-")
         .tempdir()
@@ -304,6 +296,6 @@ fn force_link_retains_all_nine_print_symbols_through_a_real_link() {
     let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
     assert_eq!(
         stdout,
-        "1.5\n-42\ntrue\nnil\n255\n65535\n4294967295\n18446744073709551615\n2.5\n"
+        "1.5\n-42\ntrue\n255\n65535\n4294967295\n18446744073709551615\n2.5\n"
     );
 }

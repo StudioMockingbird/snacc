@@ -1,0 +1,1 @@
+extern rust "snacc_user_make_nil" fun make(): Nil

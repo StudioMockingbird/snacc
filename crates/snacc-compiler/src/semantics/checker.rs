@@ -1245,6 +1245,13 @@ fn check_stmt<'src>(
 /// types are resolved once during declaration collection.
 fn resolve_type(ctx: &mut Ctx<'_>, ty: &Spanned<TypeRef<'_>>) -> Ty {
     match &ty.0 {
+        // Specification 012 section 10: a local declaration is an ordinary
+        // value-type position, so a standalone `Nil` is rejected here exactly
+        // as it is during declaration collection.
+        TypeRef::Builtin(TypeName::Nil) => {
+            ctx.error(ty.1, types::STANDALONE_NIL.to_string());
+            Ty::Nil
+        }
         TypeRef::Builtin(name) => Ty::from(*name),
         TypeRef::Named(segments) => {
             let (first, first_span) = segments[0];
@@ -2155,6 +2162,15 @@ fn check_expr<'src>(
                     } else {
                         CmpOp::NotEq
                     };
+                    // Specification 012 section 10: `nil == nil` has no union
+                    // operand to take its type from.
+                    if left_ty == Ty::Nil && right_ty == Ty::Nil {
+                        ctx.error(span, types::CONTEXTLESS_NIL.to_string());
+                        return (
+                            TExpr::Cmp(Box::new(left), operation, Box::new(right), Ty::Nil),
+                            Ty::Bool,
+                        );
+                    }
                     // Equality joins the `Int64`/`Dec64` promotion pair; a
                     // contextual `nil` joins one Nil-containing union; every
                     // other type compares only against itself.
@@ -2249,7 +2265,15 @@ fn check_expr<'src>(
             }
         }
         Expr::Print(value) => {
+            let before = ctx.errors.len();
             let (value, ty) = check_expr(ctx, env, value);
+            // Specification 012 section 10 and 12: there is no standalone `Nil`
+            // value and no `snacc_print_nil` import, so `print(nil)` is a
+            // context-free `nil`. Only report when the operand checked cleanly;
+            // `Ty::Nil` is also this checker's error-recovery type.
+            if ty == Ty::Nil && ctx.errors.len() == before {
+                ctx.error(span, types::CONTEXTLESS_NIL.to_string());
+            }
             // Specification 010 section 14: printing a user-defined type is a
             // separate future feature, not a silent no-op.
             if matches!(ty, Ty::User(_)) {
@@ -2369,14 +2393,14 @@ mod tests {
     #[test]
     fn rejects_bridge_symbols_that_are_not_rust_identifiers() {
         assert_error_contains(
-            "extern rust \"snacc_user_bad-name\" fun bad(): Nil\nprint(0)",
+            "extern rust \"snacc_user_bad-name\" fun bad(): Int64\nprint(0)",
             "valid Rust identifiers",
         );
     }
 
     #[test]
     fn accepts_bridge_symbols_with_digits_and_underscores() {
-        assert_checks("extern rust \"snacc_user_v2_ok\" fun ok(): Nil\nprint(0)");
+        assert_checks("extern rust \"snacc_user_v2_ok\" fun ok(): Int64\nprint(0)");
     }
 
     #[test]
@@ -3649,6 +3673,45 @@ mod tests {
             "type Empty is union | Nil end",
             "contains only 'Nil'; 'Nil' requires another member type",
         );
+    }
+
+    /// Specification 012 conformance 16: standalone `Nil` is rejected in every
+    /// type and bridge position.
+    #[test]
+    fn standalone_nil_is_rejected_in_every_type_position() {
+        for source in [
+            "let value: Nil = nil",
+            "fun consume(value: Nil) do print(1) end",
+            "fun produce(): Nil do nil end",
+            "fun update(value: Ref<Nil>) do print(1) end",
+            "type Empty is Nil",
+            "type Holder is struct value: Nil, end",
+            "type Maybe is union | Held is struct value: Nil, end | Nil end",
+            "extern rust \"snacc_user_take\" fun take(value: Nil)\nprint(0)",
+            "extern rust \"snacc_user_make\" fun make(): Nil\nprint(0)",
+            "extern rust \"snacc_user_ref\" fun update(value: Ref<Nil>)\nprint(0)",
+            &format!("{POINT}method Point.at(value: Nil) do print(1) end"),
+            &format!("{POINT}method Point.at(): Nil do nil end"),
+        ] {
+            assert_error_contains(source, "'Nil' is not a standalone type");
+        }
+    }
+
+    /// Specification 012 conformance 17: `nil` needs one expected
+    /// Nil-containing union; `null` is the same literal.
+    #[test]
+    fn contextual_nil_requires_one_nil_containing_union() {
+        assert_checks(
+            "type Maybe is union | Some is struct value: Int64, end | Nil end\n\
+             let missing: Maybe = null\n\
+             fun absent(): Maybe do nil end\n\
+             fun take(value: Maybe): Bool do value == nil end\n\
+             print(take(absent()))",
+        );
+        for source in ["print(nil)", "print(nil == nil)", "print(null)"] {
+            assert_error_contains(source, "'nil' has no type of its own");
+        }
+        assert_error_contains("let value: Int64 = nil", "expected 'Int64', found 'Nil'");
     }
 
     /// Conformance 4 and 17 diagnostics: duplicate fields and members.

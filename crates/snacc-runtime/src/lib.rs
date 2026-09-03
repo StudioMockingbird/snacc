@@ -1,7 +1,7 @@
 //! Stable Rust-side ABI used by generated Snacc objects.
 
 /// Contract version for generated objects, runtime imports, and Rust bridges.
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn snacc_print_f64(value: f64) {
@@ -16,11 +16,6 @@ pub extern "C" fn snacc_print_i64(value: i64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn snacc_print_bool(value: u8) {
     println!("{}", value != 0);
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn snacc_print_nil() {
-    println!("nil");
 }
 
 #[unsafe(no_mangle)]
@@ -55,7 +50,6 @@ pub fn force_link() {
         snacc_print_f64 as *const () as usize,
         snacc_print_i64 as *const () as usize,
         snacc_print_bool as *const () as usize,
-        snacc_print_nil as *const () as usize,
         snacc_print_u8 as *const () as usize,
         snacc_print_u16 as *const () as usize,
         snacc_print_u32 as *const () as usize,

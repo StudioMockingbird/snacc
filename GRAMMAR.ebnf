@@ -111,7 +111,10 @@ digit                = "0" | "1" | "2" | "3" | "4"
    (`Int64(id)`); a type name alone is never a value. The grammar admits a named
    type wherever a `type` appears, including a Rust bridge signature; that a
    user-defined type may not cross the bridge is a semantic rule, diagnosed by
-   the checker. A `reference-parameter-type` is permitted only as the direct
+   the checker. The grammar likewise admits `Nil` wherever a
+   `builtin-value-type` appears; that `Nil` is spelled as a value type only as
+   a `union-member` or a `type-test` is a semantic rule, also diagnosed by the
+   checker. A `reference-parameter-type` is permitted only as the direct
    declared type of a `parameter`; it is rejected in every other `type`
    position, and `Ref<Ref<T>>` is never permitted. The `<` and `>` around a
    referent are type delimiters, not ordered comparisons. *)
