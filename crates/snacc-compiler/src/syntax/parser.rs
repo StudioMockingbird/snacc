@@ -45,37 +45,71 @@ const REFERENCE_OUTSIDE_A_PARAMETER: &str = "'Ref<T>' is only valid as the direc
 const NESTED_REFERENCE: &str =
     "'Ref<T>' cannot contain another reference; a reference parameter refers to a value type";
 
-/// `value-type = builtin-type | qualified-name` (Specification 010 section 5).
-/// The parser records the written path; resolution decides what it denotes.
-fn value_type_parser<'tokens, 'src: 'tokens, I>()
+/// `primary-value-type = builtin-value-type | qualified-name | "(", sum-type,
+/// ")"` and `sum-type = primary-value-type, { "|", primary-value-type }`
+/// (Specification 018 section 3). A single primary with no `|` collapses to
+/// that primary directly rather than a one-member [`TypeRef::Sum`], so
+/// `TypeRef::Sum` always syntactically holds at least two members; resolution
+/// still re-validates this after flattening, since a parenthesized group can
+/// supply more than one. `Ref<T>` is never a primary: it is not itself a
+/// value-type member (section 3), so it simply cannot appear here, and any
+/// attempt fails to parse rather than being silently accepted.
+fn sum_type_parser<'tokens, 'src: 'tokens, I>()
 -> impl Parser<'tokens, I, Spanned<TypeRef<'src>>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
 {
-    builtin_type_parser()
-        .map(TypeRef::Builtin)
-        .or(name_parser()
-            .separated_by(just(Token::Ctrl('.')))
-            .at_least(1)
-            .collect::<Vec<_>>()
-            .map(TypeRef::Named))
-        .map_with(|ty, e| (ty, e.span()))
-        .labelled("type")
-        .boxed()
+    recursive(|sum_type| {
+        let primary = builtin_type_parser()
+            .map(TypeRef::Builtin)
+            .or(name_parser()
+                .separated_by(just(Token::Ctrl('.')))
+                .at_least(1)
+                .collect::<Vec<_>>()
+                .map(TypeRef::Named))
+            .map_with(|ty, e| (ty, e.span()))
+            .or(sum_type
+                .clone()
+                .delimited_by(just(Token::Ctrl('(')), just(Token::Ctrl(')'))))
+            .labelled("type")
+            .boxed();
+
+        primary
+            .clone()
+            .then(
+                just(Token::Ctrl('|'))
+                    .ignore_then(primary)
+                    .repeated()
+                    .collect::<Vec<_>>(),
+            )
+            .map_with(|(first, rest), e| {
+                if rest.is_empty() {
+                    first
+                } else {
+                    let mut members = vec![first];
+                    members.extend(rest);
+                    (TypeRef::Sum(members), e.span())
+                }
+            })
+            .boxed()
+    })
 }
 
-/// `"Ref", "<", value-type, ">"`, wrapped so the referent's span is preserved
+/// `"Ref", "<", sum-type, ">"`, wrapped so the referent's span is preserved
 /// and a nested reference is reported as such instead of as a missing type.
+/// Specification 018 section 3 widens the referent from a single value type
+/// to a full sum type, so `Ref<Byte | Nil>` parses the same way `Ref<Byte>`
+/// always has.
 fn reference_type_parser<'tokens, 'src: 'tokens, I>()
 -> impl Parser<'tokens, I, Spanned<TypeRef<'src>>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
 {
-    let nested = bracketed_reference(value_type_parser()).validate(|ty, e, emitter| {
+    let nested = bracketed_reference(sum_type_parser()).validate(|ty, e, emitter| {
         emitter.emit(Rich::custom(e.span(), NESTED_REFERENCE.to_string()));
         ty
     });
-    bracketed_reference(nested.or(value_type_parser())).boxed()
+    bracketed_reference(nested.or(sum_type_parser())).boxed()
 }
 
 fn bracketed_reference<'tokens, 'src: 'tokens, I, P>(
@@ -108,7 +142,7 @@ where
             ));
             ty
         })
-        .or(value_type_parser())
+        .or(sum_type_parser())
         .boxed()
 }
 
@@ -124,7 +158,7 @@ where
 {
     reference_type_parser()
         .map(|ty| (ParamMode::Reference, ty))
-        .or(value_type_parser().map(|ty| (ParamMode::Value, ty)))
+        .or(sum_type_parser().map(|ty| (ParamMode::Value, ty)))
         .boxed()
 }
 
@@ -292,11 +326,22 @@ fn condition_parser<'tokens, 'src: 'tokens, I>()
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
 {
-    // `Nil` is a reserved type name rather than an identifier, so a member path
-    // accepts it as its own segment spelling.
+    // Every built-in type name is a reserved word rather than an identifier,
+    // so a member path accepts each one as its own segment spelling.
+    // Specification 018 section 3 extends the tested member to any direct
+    // sum member, including a built-in scalar (`is UInt8(byte)`), not only
+    // `Nil` as before.
     let segment = select! {
         Token::Ident(name) => name,
         Token::TyNil => "Nil",
+        Token::TyDec64 => "Dec64",
+        Token::TyInt64 => "Int64",
+        Token::TyBool => "Bool",
+        Token::TyUInt8 => "UInt8",
+        Token::TyUInt16 => "UInt16",
+        Token::TyUInt32 => "UInt32",
+        Token::TyUInt64 => "UInt64",
+        Token::TyFloat32 => "Float32",
     }
     .map_with(|name, e| (name, e.span()));
 
@@ -1186,5 +1231,136 @@ mod tests {
         // unchanged, including the two-character forms.
         let program = parse("print(a < b) print(a > b) print(a <= b) print(a >= b)");
         assert_eq!(program.body.elements.len(), 4);
+    }
+
+    // Specification 018 sections 3 and 6: `|` forms an inline sum type in
+    // every value-type position, and a type test may name any direct member.
+
+    fn sum_member_names(ty: &Spanned<TypeRef<'_>>) -> Vec<String> {
+        match &ty.0 {
+            TypeRef::Sum(members) => members.iter().map(|(m, _)| m.to_string()).collect(),
+            other => panic!("expected an inline sum type, got {other:?}"),
+        }
+    }
+
+    fn let_ty<'src>(program: &Program<'src>, index: usize) -> Spanned<TypeRef<'src>> {
+        let BlockElement::Let { ty, .. } = &program.body.elements[index].0 else {
+            panic!("expected a variable declaration");
+        };
+        (ty.0.clone(), ty.1)
+    }
+
+    #[test]
+    fn parses_an_inline_sum_type_in_every_value_type_position() {
+        for source in [
+            "type Point is struct x: Dec64, end\nfun read(): UInt8 | Nil do nil end",
+            "type Point is struct x: Dec64, end\nfun take(value: UInt8 | Nil) do print(1) end",
+            "type Point is struct x: Dec64, end\nlet result: UInt8 | Nil = nil",
+            "type Point is struct x: Dec64, end\ntype Holder is struct value: UInt8 | Nil, end",
+            "type Point is struct x: Dec64, end\n\
+             extern rust \"snacc_user_maybe\" fun maybe(): UInt8 | Nil",
+            "type Point is struct x: Dec64, end\n\
+             method Point.length(): UInt8 | Nil do nil end",
+        ] {
+            assert_parses(source);
+        }
+    }
+
+    #[test]
+    fn a_sum_type_records_every_member_in_source_order() {
+        let program = parse("let result: UInt8 | Bool | Nil = nil");
+        let ty = let_ty(&program, 0);
+        assert_eq!(sum_member_names(&ty), vec!["UInt8", "Bool", "Nil"]);
+    }
+
+    #[test]
+    fn a_single_member_never_wraps_in_a_sum_node() {
+        // A sum-type production with no `|` collapses to its one primary, and
+        // a fully parenthesized single member is exactly ordinary grouping,
+        // not a one-member sum.
+        let program = parse("let value: (UInt8) = 1u8");
+        let ty = let_ty(&program, 0);
+        assert_eq!(builtin(&ty), TypeName::UInt8);
+    }
+
+    #[test]
+    fn parses_parenthesized_grouping_with_a_nested_sum_member() {
+        // Flattening `(A | B) | C` into one three-member set is a resolution
+        // concern; the parser only needs to record the grouped sum as one
+        // member of the outer sum, in source order.
+        let program = parse("let value: (UInt8 | Bool) | Nil = nil");
+        let ty = let_ty(&program, 0);
+        let TypeRef::Sum(members) = &ty.0 else {
+            panic!("expected an inline sum type");
+        };
+        assert_eq!(members.len(), 2);
+        assert_eq!(sum_member_names(&members[0]), vec!["UInt8", "Bool"]);
+        assert_eq!(members[1].0.to_string(), "Nil");
+    }
+
+    #[test]
+    fn whitespace_around_the_sum_operator_has_no_significance() {
+        let tight = parse("let value: UInt8|Bool|Nil = nil");
+        let spaced = parse("let value: UInt8 | Bool | Nil = nil");
+        assert_eq!(
+            sum_member_names(&let_ty(&tight, 0)),
+            sum_member_names(&let_ty(&spaced, 0))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_sum_separators() {
+        for source in [
+            "let value: | UInt8 = 1u8",
+            "let value: UInt8 | = 1u8",
+            "let value: UInt8 || Bool = nil",
+            "let value: () = 1u8",
+        ] {
+            assert_rejects(source);
+        }
+    }
+
+    #[test]
+    fn rejects_a_reference_as_a_sum_member() {
+        for source in [
+            "let value: Ref<UInt8> | Nil = nil",
+            "fun f(value: UInt8 | Ref<Nil>) do print(1) end",
+        ] {
+            assert_rejects(source);
+        }
+    }
+
+    #[test]
+    fn a_reference_referent_may_be_a_sum_type() {
+        assert_parses("fun replace(value: Ref<UInt8 | Nil>) do value = nil end");
+    }
+
+    #[test]
+    fn the_sum_operator_never_parses_as_an_expression_operator() {
+        // `|` is recognized only while parsing a type; it adds no value-level
+        // operator and does not conflict with expression parsing.
+        assert_rejects("print(1 | 2)");
+        assert_rejects("let x: Int64 = 1 | 2");
+    }
+
+    #[test]
+    fn parses_a_type_test_naming_a_builtin_direct_member() {
+        let program = parse(
+            "fun show(value: UInt8 | Nil) do \
+             if value is UInt8(byte) then print(1) elseif value is Nil then print(2) end end",
+        );
+        let BlockElement::If(form) = &program.funcs["show"].body.elements[0].0 else {
+            panic!("expected an if form");
+        };
+        let Condition::TypeTest(first) = &form.arms[0].0 else {
+            panic!("expected a type test");
+        };
+        assert_eq!(first.member[0].0, "UInt8");
+        assert_eq!(first.binding.map(|(name, _)| name), Some("byte"));
+        let Condition::TypeTest(second) = &form.arms[1].0 else {
+            panic!("expected a type test");
+        };
+        assert_eq!(second.member[0].0, "Nil");
+        assert!(second.binding.is_none());
     }
 }

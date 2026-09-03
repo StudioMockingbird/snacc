@@ -33,14 +33,20 @@ impl std::fmt::Display for TypeName {
     }
 }
 
-/// A written type: either a built-in name or a qualified path naming a
-/// user-defined type (`Point`, `Shape.Circle`). Specification 010 section 5
-/// replaces the built-in-only type position with this path form; resolution,
-/// not the parser, decides what a path denotes.
+/// A written type: a built-in name, a qualified path naming a user-defined
+/// type (`Point`, `Shape.Circle`), or an inline sum of two or more primary
+/// member types (`Byte | Nil`, Specification 018 section 3). Resolution, not
+/// the parser, decides what a path denotes, flattens nested sums, and
+/// enforces member-set rules; the parser only records what was written, in
+/// source order. A parenthesized sum member (`(A | B) | C`) is not a
+/// distinct syntax node: the grouped sum-type is parsed recursively and
+/// simply appears as one member's [`TypeRef::Sum`] here, so flattening is a
+/// resolution concern, never a parser one.
 #[derive(Clone, Debug)]
 pub enum TypeRef<'src> {
     Builtin(TypeName),
     Named(Vec<Spanned<&'src str>>),
+    Sum(Vec<Spanned<Self>>),
 }
 
 impl std::fmt::Display for TypeRef<'_> {
@@ -54,6 +60,14 @@ impl std::fmt::Display for TypeRef<'_> {
                     .collect::<Vec<_>>()
                     .join(".");
                 f.write_str(&path)
+            }
+            Self::Sum(members) => {
+                let joined = members
+                    .iter()
+                    .map(|(member, _)| member.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                f.write_str(&joined)
             }
         }
     }

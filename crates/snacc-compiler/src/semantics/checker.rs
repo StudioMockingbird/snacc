@@ -1,4 +1,4 @@
-use crate::semantics::types::{self, FuncSig, MethodId, MethodSig, TypeDef, TypeId, Types};
+use crate::semantics::types::{self, FuncSig, MethodId, MethodSig, SumId, TypeDef, TypeId, Types};
 use crate::syntax::ast::{
     Arg, BinaryOp, Block, BlockElement, Condition, Expr, IfForm, NumLiteral, Param, ParamMode,
     PlacePath, PlaceRootName, Program as AstProgram, Span, Spanned, TypeName, TypeRef, TypeTest,
@@ -9,7 +9,12 @@ use std::collections::HashMap;
 /// Every checked type. User-defined types have exactly one variant here --
 /// their category (represented, struct, union, union member) lives in the type
 /// table, never in this enum (Specification 010 section 19 phase 3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// `Sum` is an inline sum's normalized member set (Specification 018 section
+/// 4); like `User`, its members live in the type table (`Types::sum_members`),
+/// never here. `Ord` gives every sum's member set one canonical sorted order,
+/// so `Byte | Nil` and `Nil | Byte` intern to the same id regardless of
+/// source order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Ty {
     Dec64,
     Int64,
@@ -21,6 +26,7 @@ pub enum Ty {
     UInt64,
     Float32,
     User(TypeId),
+    Sum(SumId),
 }
 
 impl From<TypeName> for Ty {
@@ -55,6 +61,7 @@ impl std::fmt::Display for Ty {
             Self::UInt64 => write!(f, "UInt64"),
             Self::Float32 => write!(f, "Float32"),
             Self::User(id) => write!(f, "<user type #{}>", id.0),
+            Self::Sum(id) => write!(f, "<sum #{}>", id.0),
         }
     }
 }
@@ -186,6 +193,17 @@ pub enum TExpr {
         into_union: TypeId,
         value: Box<TExpr>,
     },
+    /// Injects a direct member value into an inline sum (Specification 018
+    /// section 5). Unlike [`Self::Inject`], `member` names the exact member
+    /// type directly (a scalar, `Ty::User`, or nothing else, never another
+    /// sum) rather than a `TypeId`, since a sum member need not be a
+    /// user-defined type at all. Deterministic tag assignment is lowering's
+    /// job, not the checker's, so no tag is recorded here.
+    InjectSum {
+        sum: SumId,
+        member: Ty,
+        value: Box<TExpr>,
+    },
     Arith(Box<TExpr>, ArithOp, Box<TExpr>, Ty),
     Cmp(Box<TExpr>, CmpOp, Box<TExpr>, Ty),
     /// A call to a declaration that has a result.
@@ -199,8 +217,9 @@ pub enum TExpr {
     Cast(Box<TExpr>, Ty),
 }
 
-/// A proven type test. `tag` is the member's deterministic union tag, so
-/// lowering compares stored tags without consulting the type table.
+/// A proven type test against a named union. `tag` is the member's
+/// deterministic union tag, so lowering compares stored tags without
+/// consulting the type table.
 pub struct TTypeTest {
     pub place: Place,
     pub member: TypeId,
@@ -209,10 +228,26 @@ pub struct TTypeTest {
     pub binding: Option<(String, Ty)>,
 }
 
-/// An `if`/`elseif` condition: an ordinary `Bool` value or a type test.
+/// A proven type test against one direct member of an inline sum
+/// (Specification 018 section 6). Kept separate from [`TTypeTest`] rather
+/// than folded into it because a sum member need not be a `TypeId` at all
+/// (it may be a bare scalar), and because deterministic tag assignment is
+/// lowering's job (Task B), not the checker's, so no tag is recorded here.
+pub struct TSumTypeTest {
+    pub place: Place,
+    pub sum: SumId,
+    pub member: Ty,
+    /// The name and exact member type bound on the successful edge. `Nil`
+    /// carries no value and is never bound.
+    pub binding: Option<(String, Ty)>,
+}
+
+/// An `if`/`elseif` condition: an ordinary `Bool` value or a type test
+/// against a named union or an inline sum.
 pub enum TCondition {
     Expr(TExpr),
     Test(TTypeTest),
+    SumTest(TSumTypeTest),
 }
 
 pub struct TValueIf {
@@ -670,9 +705,21 @@ fn operand_numeric(left: Ty, right: Ty) -> Option<Ty> {
         .or_else(|| (left == right && exact_match_numeric(left)).then_some(left))
 }
 
+/// The one existing implicit scalar conversion (Specification 009 section
+/// 4.4), reused unchanged as an inline sum's tier-2 injection rule
+/// (Specification 018 section 5, "existing implicit conversions"). Named-union
+/// member injection is deliberately excluded here: section 5 states a named
+/// union's own member injects into an inline sum only once an exact expected
+/// union type has already produced a union value, never directly.
+fn implicit_conversion_target(from: Ty, to: Ty) -> bool {
+    from == Ty::Int64 && to == Ty::Dec64
+}
+
 /// Assignability. Beyond `Int64` to `Dec64`, Specification 010 section 13 adds
 /// exactly one implicit conversion: direct union-member injection, including
-/// the contextual `nil` spelling of a union's `Nil` member.
+/// the contextual `nil` spelling of a union's `Nil` member. Specification 018
+/// section 5 adds inline-sum injection: an exact direct member match wins;
+/// otherwise exactly one existing implicit conversion must accept the value.
 fn coerce(ctx: &mut Ctx<'_>, value: TExpr, from: Ty, to: Ty, span: Span) -> TExpr {
     if from == to {
         return value;
@@ -703,6 +750,51 @@ fn coerce(ctx: &mut Ctx<'_>, value: TExpr, from: Ty, to: Ty, span: Span) -> TExp
                     fields: Vec::new(),
                 }),
             };
+        }
+    }
+    if let Ty::Sum(sum) = to {
+        let members = ctx.types.sum_members(sum).to_vec();
+        // Tier 1: an exact direct member match, including a literal `Nil`
+        // member selected by the contextual `nil`/`null` literal, which
+        // duplicate rejection already guarantees is unique when present.
+        if members.contains(&from) {
+            return TExpr::InjectSum {
+                sum,
+                member: from,
+                value: Box::new(value),
+            };
+        }
+        // Tier 2: exactly one existing implicit conversion must accept the
+        // value; more than one is an ambiguity, and a sum can hold at most
+        // one member of any given type, so today's single scalar conversion
+        // rule can never itself produce more than one candidate.
+        let candidates: Vec<Ty> = members
+            .iter()
+            .copied()
+            .filter(|member| implicit_conversion_target(from, *member))
+            .collect();
+        match candidates.as_slice() {
+            [one] => {
+                let converted = coerce(ctx, value, from, *one, span);
+                return TExpr::InjectSum {
+                    sum,
+                    member: *one,
+                    value: Box::new(converted),
+                };
+            }
+            [] => {}
+            _ => {
+                let found = ctx.name(from);
+                let target = ctx.name(to);
+                ctx.error(
+                    span,
+                    format!(
+                        "'{found}' could convert into more than one member of '{target}'; \
+                         add an explicit conversion to pick one"
+                    ),
+                );
+                return value;
+            }
         }
     }
     ctx.mismatch(span, to, from);
@@ -945,6 +1037,9 @@ fn check_statement_block<'src>(
 
 /// Checks one arm's condition, leaving any type-test binding visible in `env`
 /// for the arm body only. The caller restores `env` after the body.
+/// Specification 018 section 6 extends the tested place from a named union to
+/// an inline sum, so the place is resolved once here and then dispatched to
+/// whichever member-lookup rules its type requires.
 fn check_arm_condition<'src>(
     ctx: &mut Ctx<'src>,
     env: &mut Env<'src>,
@@ -958,21 +1053,60 @@ fn check_arm_condition<'src>(
             }
             TCondition::Expr(value)
         }
-        Condition::TypeTest(test) => match check_type_test(ctx, env, test) {
-            Some(checked) => {
-                if let (Some((name, _)), Some((_, ty))) = (test.binding, &checked.binding) {
-                    env.push(Binding {
-                        name,
-                        ty: *ty,
-                        // Specification 012 section 7: a type-test binding is an
-                        // immutable root.
-                        mutable: false,
-                    });
+        Condition::TypeTest(test) => {
+            let Some(resolved) = resolve_place(ctx, env, &test.place) else {
+                return TCondition::Expr(TExpr::Bool(false));
+            };
+            let place = resolved.place;
+            match place.ty {
+                Ty::User(id) if ctx.types.union_members(id).is_some() => {
+                    match check_type_test(ctx, test, place, id) {
+                        Some(checked) => {
+                            bind_type_test(env, test.binding, &checked.binding);
+                            TCondition::Test(checked)
+                        }
+                        None => TCondition::Expr(TExpr::Bool(false)),
+                    }
                 }
-                TCondition::Test(checked)
+                Ty::Sum(sum) => match check_sum_type_test(ctx, test, place, sum) {
+                    Some(checked) => {
+                        bind_type_test(env, test.binding, &checked.binding);
+                        TCondition::SumTest(checked)
+                    }
+                    None => TCondition::Expr(TExpr::Bool(false)),
+                },
+                other => {
+                    let name = ctx.name(other);
+                    ctx.error(
+                        test.place.span,
+                        format!(
+                            "the left side of 'is' must have a union type or an inline sum \
+                             type, but '{}' has type '{name}'",
+                            test.place
+                        ),
+                    );
+                    TCondition::Expr(TExpr::Bool(false))
+                }
             }
-            None => TCondition::Expr(TExpr::Bool(false)),
-        },
+        }
+    }
+}
+
+/// Pushes a proven type-test binding into scope for the arm body, if the
+/// syntactic test carried one.
+fn bind_type_test<'src>(
+    env: &mut Env<'src>,
+    written: Option<Spanned<&'src str>>,
+    checked: &Option<(String, Ty)>,
+) {
+    if let (Some((name, _)), Some((_, ty))) = (written, checked) {
+        env.push(Binding {
+            name,
+            ty: *ty,
+            // Specification 012 section 7: a type-test binding is an
+            // immutable root.
+            mutable: false,
+        });
     }
 }
 
@@ -988,36 +1122,48 @@ fn check_condition<'src>(
     value
 }
 
-/// What an `if`/`elseif` chain proves about union coverage.
+/// What an `if`/`elseif` chain proves about member coverage.
 struct ChainFact {
     /// Every arm is a type test over one syntactic place, and every direct
-    /// member of that place's union is tested exactly once.
+    /// member of that place's union or inline sum is tested exactly once.
     exhaustive: bool,
     /// The qualified names of members a same-place chain fails to handle.
     missing: Vec<String>,
 }
 
-/// Specification 010 section 12.4. Proves -- never guesses -- whether a chain
-/// covers every member, and reports unreachable duplicate branches.
+/// A named-union member is itself a user-defined type, so wrapping its
+/// `TypeId` as `Ty::User` lets a union test and a sum test share one
+/// "which member did this arm test" representation below.
+fn tested_member(condition: &TCondition) -> Option<(&Place, Ty)> {
+    match condition {
+        TCondition::Test(test) => Some((&test.place, Ty::User(test.member))),
+        TCondition::SumTest(test) => Some((&test.place, test.member)),
+        TCondition::Expr(_) => None,
+    }
+}
+
+/// Specification 010 section 12.4, extended by Specification 018 section 6 to
+/// an inline sum. Proves -- never guesses -- whether a chain covers every
+/// member, and reports unreachable duplicate branches.
 fn analyze_chain(ctx: &mut Ctx<'_>, arms: &[(TCondition, TBlock)], spans: &[Span]) -> ChainFact {
     let mut subject: Option<Place> = None;
-    let mut tested: Vec<TypeId> = Vec::new();
+    let mut tested: Vec<Ty> = Vec::new();
     let mut chain = true;
     for ((condition, _), span) in arms.iter().zip(spans) {
-        let TCondition::Test(test) = condition else {
+        let Some((place, member)) = tested_member(condition) else {
             chain = false;
             break;
         };
         match &subject {
-            None => subject = Some(test.place.clone()),
-            Some(first) if *first == test.place => {}
+            None => subject = Some(place.clone()),
+            Some(first) if first == place => {}
             Some(_) => {
                 chain = false;
                 break;
             }
         }
-        if tested.contains(&test.member) {
-            let name = ctx.types.def(test.member).name().to_string();
+        if tested.contains(&member) {
+            let name = ctx.name(member);
             ctx.error(
                 *span,
                 format!(
@@ -1026,14 +1172,20 @@ fn analyze_chain(ctx: &mut Ctx<'_>, arms: &[(TCondition, TBlock)], spans: &[Span
                 ),
             );
         } else {
-            tested.push(test.member);
+            tested.push(member);
         }
     }
     let covered = chain
         .then(|| subject.as_ref())
         .flatten()
         .and_then(|place| match place.ty {
-            Ty::User(id) => ctx.types.union_members(id).map(<[TypeId]>::to_vec),
+            Ty::User(id) => ctx.types.union_members(id).map(|members| {
+                members
+                    .iter()
+                    .map(|member| Ty::User(*member))
+                    .collect::<Vec<Ty>>()
+            }),
+            Ty::Sum(id) => Some(ctx.types.sum_members(id).to_vec()),
             _ => None,
         });
     let Some(members) = covered else {
@@ -1045,7 +1197,7 @@ fn analyze_chain(ctx: &mut Ctx<'_>, arms: &[(TCondition, TBlock)], spans: &[Span
     let missing: Vec<String> = members
         .iter()
         .filter(|member| !tested.contains(member))
-        .map(|member| ctx.types.def(*member).name().to_string())
+        .map(|member| ctx.name(*member))
         .collect();
     ChainFact {
         exhaustive: missing.is_empty() && !members.is_empty(),
@@ -1075,7 +1227,7 @@ fn check_value_if<'src>(
             if fact.exhaustive {
                 ctx.error(
                     form.span,
-                    "this type-test chain already covers every union member, so the \
+                    "this type-test chain already covers every direct member, so the \
                      'else' branch is unreachable"
                         .into(),
                 );
@@ -1200,7 +1352,7 @@ fn check_stmt<'src>(
             if fact.exhaustive && form.else_branch.is_some() {
                 ctx.error(
                     form.span,
-                    "this type-test chain already covers every union member, so the \
+                    "this type-test chain already covers every direct member, so the \
                      'else' branch is unreachable"
                         .into(),
                 );
@@ -1280,7 +1432,85 @@ fn resolve_type(ctx: &mut Ctx<'_>, ty: &Spanned<TypeRef<'_>>) -> Ty {
                 }
             }
         }
+        TypeRef::Sum(members) => resolve_sum(ctx, members, ty.1),
     }
+}
+
+/// Every built-in type keyword's segment spelling, as accepted by a type
+/// test naming a direct sum member (Specification 018 section 6). Shares no
+/// code with `resolve_type`'s `TypeRef::Builtin` arm because a type test
+/// receives a bare name string from the parser, not a `TypeName`.
+fn builtin_type_name(name: &str) -> Option<TypeName> {
+    Some(match name {
+        "Dec64" => TypeName::Dec64,
+        "Int64" => TypeName::Int64,
+        "Bool" => TypeName::Bool,
+        "Nil" => TypeName::Nil,
+        "UInt8" => TypeName::UInt8,
+        "UInt16" => TypeName::UInt16,
+        "UInt32" => TypeName::UInt32,
+        "UInt64" => TypeName::UInt64,
+        "Float32" => TypeName::Float32,
+        _ => return None,
+    })
+}
+
+/// Specification 018 section 4: resolves every syntactic member, expanding a
+/// nested sum (from a parenthesized group) into its own already-flattened
+/// members, then applies the member-set rules shared with declaration
+/// collection (`resolve_sum` in `types.rs`). A member that itself reports an
+/// error is dropped rather than kept as `resolve_type`'s `Ty::Nil` filler, so
+/// a genuinely unrelated failure never masquerades as a repeated or lone
+/// `Nil` member.
+fn resolve_sum(ctx: &mut Ctx<'_>, members: &[Spanned<TypeRef<'_>>], span: Span) -> Ty {
+    let mut raw: Vec<(Option<Ty>, Span)> = Vec::new();
+    for member in members {
+        // `resolve_type`'s `TypeRef::Builtin(TypeName::Nil)` arm always
+        // rejects a standalone `Nil` because that arm is normally reached
+        // only by one; `Nil` as a sum member is the valid, expected spelling
+        // this specification adds, so it bypasses that rejection here.
+        if let TypeRef::Builtin(TypeName::Nil) = &member.0 {
+            raw.push((Some(Ty::Nil), member.1));
+            continue;
+        }
+        let before = ctx.errors.len();
+        let resolved = resolve_type(ctx, member);
+        if ctx.errors.len() != before {
+            raw.push((None, member.1));
+            continue;
+        }
+        match resolved {
+            Ty::Sum(id) => {
+                for flattened in ctx.types.sum_members(id).to_vec() {
+                    raw.push((Some(flattened), member.1));
+                }
+            }
+            other => raw.push((Some(other), member.1)),
+        }
+    }
+    let outcome = types::dedupe_sum(&raw);
+    if outcome.any_unresolved {
+        return Ty::Nil;
+    }
+    for (ty, dup_span) in &outcome.duplicates {
+        let name = ctx.name(*ty);
+        ctx.error(
+            *dup_span,
+            format!("'{name}' is repeated in this sum type; each member must be distinct"),
+        );
+    }
+    if outcome.distinct.len() < 2 {
+        let msg = if outcome.distinct == [Ty::Nil] {
+            types::NIL_NEEDS_A_SUM_SIBLING
+        } else {
+            types::SUM_TOO_FEW_MEMBERS
+        };
+        ctx.error(span, msg.to_string());
+        return Ty::Nil;
+    }
+    let mut distinct = outcome.distinct;
+    distinct.sort();
+    Ty::Sum(ctx.types.intern_sum(distinct))
 }
 
 /// What a checked call turned out to be.
@@ -1881,30 +2111,16 @@ fn check_construct<'src>(
 }
 
 /// Specification 010 section 12: the subject is a place with a union type and
-/// the tested type is one direct member of that union.
+/// the tested type is one direct member of that union. The caller
+/// (`check_arm_condition`) has already resolved `place` and confirmed `union`
+/// names a union.
 fn check_type_test<'src>(
     ctx: &mut Ctx<'src>,
-    env: &mut Env<'src>,
     test: &TypeTest<'src>,
+    place: Place,
+    union: TypeId,
 ) -> Option<TTypeTest> {
-    let resolved = resolve_place(ctx, env, &test.place)?;
-    let place = resolved.place;
     let subject_name = ctx.name(place.ty);
-    let union = match place.ty {
-        Ty::User(id) if ctx.types.union_members(id).is_some() => id,
-        _ => {
-            ctx.error(
-                test.place.span,
-                format!(
-                    "the left side of 'is' must have a union type, but '{}' has type \
-                     '{subject_name}'",
-                    test.place
-                ),
-            );
-            return None;
-        }
-    };
-
     let member = match test.member.as_slice() {
         [(name, _)] => match ctx.types.member(union, name) {
             Some(id) => id,
@@ -1976,6 +2192,69 @@ fn check_type_test<'src>(
         place,
         member,
         tag,
+        binding,
+    })
+}
+
+/// Specification 018 section 6: the tested member is one direct member of an
+/// inline sum, named by exactly one segment -- a built-in keyword or a
+/// top-level type name. A test target is never a two-segment path: an inline
+/// sum's members are never namespaced, and testing a member inside a
+/// named-union member requires a second test after binding that union. The
+/// caller (`check_arm_condition`) has already resolved `place`.
+fn check_sum_type_test<'src>(
+    ctx: &mut Ctx<'src>,
+    test: &TypeTest<'src>,
+    place: Place,
+    sum: SumId,
+) -> Option<TSumTypeTest> {
+    let subject_name = ctx.name(place.ty);
+    let [(name, name_span)] = test.member.as_slice() else {
+        ctx.error(
+            test.member_span,
+            "a type test on an inline sum names exactly one direct member; testing a \
+             member inside a named-union member requires a second test after binding \
+             that union"
+                .into(),
+        );
+        return None;
+    };
+    let member = match builtin_type_name(name) {
+        Some(builtin) => Ty::from(builtin),
+        None => match ctx.types.top_level(name) {
+            Some(id) => Ty::User(id),
+            None => {
+                ctx.error(*name_span, format!("Unknown type '{name}'"));
+                return None;
+            }
+        },
+    };
+    if !ctx.types.sum_members(sum).contains(&member) {
+        ctx.error(
+            *name_span,
+            format!("'{name}' is not a direct member of '{subject_name}'"),
+        );
+        return None;
+    }
+    let binding = match test.binding {
+        Some((name, name_span)) if member == Ty::Nil => {
+            let _ = name;
+            ctx.error(
+                name_span,
+                "'Nil' carries no value, so it cannot be bound by a type test".into(),
+            );
+            None
+        }
+        Some((name, name_span)) => {
+            declare(ctx, name, name_span, "Binding");
+            Some((name.to_string(), member))
+        }
+        None => None,
+    };
+    Some(TSumTypeTest {
+        place,
+        sum,
+        member,
         binding,
     })
 }
@@ -2275,27 +2554,48 @@ fn check_expr<'src>(
                 ctx.error(span, types::CONTEXTLESS_NIL.to_string());
             }
             // Specification 010 section 14: printing a user-defined type is a
-            // separate future feature, not a silent no-op.
-            if matches!(ty, Ty::User(_)) {
-                let name = ctx.name(ty);
-                ctx.error(
-                    span,
-                    format!(
-                        "'print' does not support the user-defined type '{name}'; print a \
-                         scalar field or unwrap a represented scalar"
-                    ),
-                );
+            // separate future feature, not a silent no-op. Specification 018
+            // section 8 extends the same restriction to a whole inline sum:
+            // a program decomposes it with `is` before printing a member.
+            match ty {
+                Ty::User(_) => {
+                    let name = ctx.name(ty);
+                    ctx.error(
+                        span,
+                        format!(
+                            "'print' does not support the user-defined type '{name}'; print a \
+                             scalar field or unwrap a represented scalar"
+                        ),
+                    );
+                }
+                Ty::Sum(_) => {
+                    let name = ctx.name(ty);
+                    ctx.error(
+                        span,
+                        format!(
+                            "'print' does not support the inline sum type '{name}'; decompose \
+                             it with 'is' and print the bound member"
+                        ),
+                    );
+                }
+                _ => {}
             }
             (TExpr::Print(Box::new(value), ty), ty)
         }
     }
 }
 
-/// The union type a `value == nil` comparison takes, when exactly one operand
-/// is `nil` and the other is a union that directly contains `Nil`.
+/// The aggregate type -- a named union or an inline sum -- a `value == nil`
+/// comparison takes, when exactly one operand is `nil` and the other directly
+/// contains `Nil`.
 fn nil_union(ctx: &Ctx<'_>, left: Ty, right: Ty) -> Option<Ty> {
-    let pair = |union: Ty, other: Ty| match (union, other) {
-        (Ty::User(id), Ty::Nil) => ctx.types.member(id, "Nil").map(|_| union),
+    let pair = |aggregate: Ty, other: Ty| match (aggregate, other) {
+        (Ty::User(id), Ty::Nil) => ctx.types.member(id, "Nil").map(|_| aggregate),
+        (Ty::Sum(id), Ty::Nil) => ctx
+            .types
+            .sum_members(id)
+            .contains(&Ty::Nil)
+            .then_some(aggregate),
         _ => None,
     };
     pair(left, right).or_else(|| pair(right, left))
@@ -3392,7 +3692,7 @@ mod tests {
             .iter()
             .map(|(condition, _)| match condition {
                 TCondition::Test(test) => test.tag,
-                TCondition::Expr(_) => panic!("expected a type test"),
+                TCondition::Expr(_) | TCondition::SumTest(_) => panic!("expected a union test"),
             })
             .collect();
         assert_eq!(tags, vec![0, 1]);
@@ -4199,6 +4499,342 @@ mod tests {
                  print(0)"
             ),
             "only the ABI's permitted types may cross a Rust bridge",
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Specification 018: inline sum types.
+    // ---------------------------------------------------------------------
+
+    /// Conformance 2-3: normalized member order and grouping never affect
+    /// identity, so a differently written but member-set-identical sum is
+    /// exactly assignable.
+    #[test]
+    fn sum_identity_ignores_member_order() {
+        assert_checks("let a: UInt8 | Nil = nil\nlet b: Nil | UInt8 = a\nprint(0)");
+    }
+
+    #[test]
+    fn sum_identity_ignores_parenthesized_grouping() {
+        assert_checks("let a: Bool | Nil | UInt8 = nil\nlet b: (UInt8 | Bool) | Nil = a\nprint(0)");
+    }
+
+    /// Conformance 3: duplicates and fewer than two members are rejected.
+    #[test]
+    fn rejects_fewer_than_two_distinct_sum_members() {
+        assert_error_contains(
+            "let x: UInt8 | UInt8 = 1u8",
+            "at least two distinct member types",
+        );
+    }
+
+    #[test]
+    fn rejects_a_repeated_member_after_flattening() {
+        assert_error_contains(
+            "let x: (UInt8 | Bool) | UInt8 = 1u8",
+            "is repeated in this sum type",
+        );
+    }
+
+    #[test]
+    fn rejects_a_lone_nil_member() {
+        assert_error_contains(
+            "let x: Nil | Nil = nil",
+            "valid in a sum type only alongside",
+        );
+    }
+
+    /// Specification 018 section 4: an unresolved member is reported once,
+    /// through the same "Unknown type" diagnostic every other position uses.
+    #[test]
+    fn an_unresolved_sum_member_is_reported_once() {
+        assert_error_contains("let x: Foo | Nil = nil", "Unknown type 'Foo'");
+    }
+
+    /// Conformance 5: an inline sum has no callable type name, so it cannot be
+    /// a represented type's immediate representation.
+    #[test]
+    fn an_inline_sum_cannot_be_a_represented_types_target() {
+        assert_error_contains(
+            "type MaybeByte is UInt8 | Nil",
+            "cannot be a represented type's immediate representation",
+        );
+    }
+
+    /// Specification 018 section 3: a reference is not a value-type member,
+    /// so it fails to parse as one -- the parser establishes this, and the
+    /// checker never sees a `Ref<T>` sum member.
+    #[test]
+    fn a_reference_cannot_be_a_sum_member() {
+        assert_rejected_by_parser("let value: Ref<UInt8> | Nil = nil");
+    }
+
+    /// Specification 018 section 8: a self-referential inline sum field has
+    /// no more indirection than a plain self-referential field, so it is
+    /// still an infinite value layout.
+    #[test]
+    fn a_self_referential_inline_sum_field_is_an_infinite_layout() {
+        assert_error_contains(
+            "type Node is struct next: Node | Nil, end",
+            "has an infinite value layout",
+        );
+    }
+
+    /// Conformance 8: a named union is one opaque direct member; its own
+    /// members do not flatten into the inline sum.
+    #[test]
+    fn a_named_union_is_one_opaque_member_of_an_inline_sum() {
+        assert_checks(&format!(
+            "{SHAPE}fun classify(value: Shape | Nil): Int64 do \
+             if value is Shape(shape) then \
+                 if shape is Shape.Circle(circle) then circle.radius \
+                 elseif shape is Shape.Rectangle(rectangle) then rectangle.length end \
+             elseif value is Nil then 0 end end\n\
+             print(classify(nil))"
+        ));
+    }
+
+    #[test]
+    fn a_sum_type_test_cannot_name_a_member_inside_a_named_union_member() {
+        assert_error_contains(
+            &format!(
+                "{SHAPE}fun f(value: Shape | Nil): Int64 do \
+                 if value is Shape.Circle(circle) then circle.radius \
+                 elseif value is Nil then 0 end end"
+            ),
+            "a type test on an inline sum names exactly one direct member",
+        );
+    }
+
+    /// Conformance 4: a direct value and a contextual `nil` both inject.
+    #[test]
+    fn direct_values_and_contextual_nil_inject_into_an_expected_sum() {
+        let program = assert_checks(
+            "let present: UInt8 | Nil = 1u8\nlet absent: UInt8 | Nil = nil\nprint(0)",
+        );
+        let TStmt::Let { value, .. } = &program.body.statements[0] else {
+            panic!("expected a declaration");
+        };
+        assert!(matches!(
+            value,
+            TExpr::InjectSum {
+                member: Ty::UInt8,
+                ..
+            }
+        ));
+        let TStmt::Let { value, .. } = &program.body.statements[1] else {
+            panic!("expected a declaration");
+        };
+        assert!(matches!(
+            value,
+            TExpr::InjectSum {
+                member: Ty::Nil,
+                ..
+            }
+        ));
+    }
+
+    /// Specification 018 section 5: an exact direct member match wins over an
+    /// available widening conversion.
+    #[test]
+    fn an_exact_member_match_wins_over_widening() {
+        let program = assert_checks("let x: Dec64 | Int64 = 1\nprint(0)");
+        let TStmt::Let { value, .. } = &program.body.statements[0] else {
+            panic!("expected a declaration");
+        };
+        assert!(matches!(
+            value,
+            TExpr::InjectSum {
+                member: Ty::Int64,
+                ..
+            }
+        ));
+    }
+
+    /// With no exact `Int64` member, the value still widens through the one
+    /// existing implicit conversion.
+    #[test]
+    fn an_int64_value_widens_into_the_sums_dec64_member() {
+        let program = assert_checks("let x: Dec64 | Nil = 1\nprint(0)");
+        let TStmt::Let { value, .. } = &program.body.statements[0] else {
+            panic!("expected a declaration");
+        };
+        let TExpr::InjectSum { member, value, .. } = value else {
+            panic!("expected a sum injection");
+        };
+        assert_eq!(*member, Ty::Dec64);
+        assert!(matches!(**value, TExpr::Cast(_, Ty::Dec64)));
+    }
+
+    #[test]
+    fn rejects_a_value_with_no_matching_sum_member() {
+        assert_error_contains("let x: Bool | UInt8 = 1.5", "found 'Dec64'");
+    }
+
+    /// Section 5: a named union's own member does not directly inject into an
+    /// inline sum; only an already-`Shape`-typed value does.
+    #[test]
+    fn a_named_unions_member_value_does_not_directly_inject_into_an_inline_sum() {
+        assert_error_contains(
+            &format!("{SHAPE}let combined: Shape | Nil = Shape.Circle(radius: 1)"),
+            "found 'Shape.Circle'",
+        );
+        assert_checks(&format!(
+            "{SHAPE}let shape: Shape = Shape.Circle(radius: 1)\n\
+             let combined: Shape | Nil = shape\nprint(0)"
+        ));
+    }
+
+    /// Conformance 6: sum-to-sum assignment requires identical normalized
+    /// member sets; there is no subset-to-superset conversion.
+    #[test]
+    fn sum_to_sum_assignment_requires_identical_member_sets() {
+        assert_checks("let a: UInt8 | Nil = nil\nlet b: UInt8 | Nil = a\nprint(0)");
+        assert_error_contains(
+            "let narrow: UInt8 | Nil = nil\nlet wide: Bool | Nil | UInt8 = narrow",
+            "expected 'Bool | Nil | UInt8', found 'Nil | UInt8'",
+        );
+    }
+
+    /// Conformance 7: type tests bind the exact tested member and support an
+    /// exhaustive chain with no `else`.
+    #[test]
+    fn is_tests_bind_the_exact_member_and_support_exhaustive_chains() {
+        let program = assert_checks(
+            "fun describe(value: UInt8 | Nil): UInt8 do \
+             if value is UInt8(byte) then byte elseif value is Nil then 0u8 end end\n\
+             print(describe(nil))",
+        );
+        let result = program.funcs["describe"]
+            .body
+            .result
+            .as_ref()
+            .expect("describe produces a value");
+        let TExpr::If(form) = result else {
+            panic!("expected a value-form if");
+        };
+        assert!(form.exhaustive);
+        assert!(form.else_branch.is_none());
+        let TCondition::SumTest(first) = &form.arms[0].0 else {
+            panic!("expected a sum type test");
+        };
+        assert_eq!(first.member, Ty::UInt8);
+        assert_eq!(first.binding.as_ref().map(|(_, ty)| *ty), Some(Ty::UInt8));
+    }
+
+    #[test]
+    fn a_non_exhaustive_sum_chain_without_an_else_is_rejected() {
+        assert_error_contains(
+            "fun describe(value: UInt8 | Nil): UInt8 do \
+             if value is UInt8(byte) then byte end end",
+            "does not handle Nil",
+        );
+    }
+
+    #[test]
+    fn a_duplicate_sum_branch_is_rejected() {
+        assert_error_contains(
+            "fun describe(value: UInt8 | Nil): UInt8 do \
+             if value is UInt8(byte) then byte \
+             elseif value is UInt8(other) then other \
+             elseif value is Nil then 0u8 end end",
+            "'UInt8' is already handled by an earlier branch",
+        );
+    }
+
+    #[test]
+    fn an_exhaustive_sum_chain_rejects_a_redundant_else() {
+        assert_error_contains(
+            "fun describe(value: UInt8 | Nil): UInt8 do \
+             if value is UInt8(byte) then byte \
+             elseif value is Nil then 0u8 \
+             else 1u8 end end",
+            "already covers every direct member",
+        );
+    }
+
+    #[test]
+    fn a_sum_type_test_cannot_name_a_nonmember() {
+        assert_error_contains(
+            "fun f(value: UInt8 | Nil): Int64 do \
+             if value is Bool(b) then 1 elseif value is Nil then 0 end end",
+            "'Bool' is not a direct member of",
+        );
+    }
+
+    #[test]
+    fn nil_cannot_be_bound_in_a_sum_type_test() {
+        assert_error_contains(
+            "fun f(value: UInt8 | Nil): UInt8 do \
+             if value is UInt8(byte) then byte elseif value is Nil(x) then 0u8 end end",
+            "'Nil' carries no value, so it cannot be bound by a type test",
+        );
+    }
+
+    /// Section 7: an explicit expected sum injects different branch values
+    /// without synthesizing a new type.
+    #[test]
+    fn an_expected_sum_permits_different_branch_types_without_synthesis() {
+        assert_checks(
+            "fun maybe_byte(found: Bool): UInt8 | Nil do \
+             if found then 1u8 else nil end end\n\
+             print(0)",
+        );
+    }
+
+    /// Conformance 9: equality follows every member; unsupported operations on
+    /// the whole sum decompose first.
+    #[test]
+    fn sums_support_equality_when_every_member_does() {
+        assert_checks(
+            "let a: UInt8 | Nil = nil\nlet b: UInt8 | Nil = 1u8\nprint(a == b)\nprint(a != b)",
+        );
+    }
+
+    #[test]
+    fn a_sum_value_compares_against_contextual_nil() {
+        assert_checks("let a: UInt8 | Nil = 1u8\nprint(a == nil)");
+    }
+
+    #[test]
+    fn unsupported_operations_on_a_whole_sum_are_rejected() {
+        let base = "let a: UInt8 | Nil = nil\nlet b: UInt8 | Nil = nil\n";
+        assert_error_contains(
+            &format!("{base}print(a < b)"),
+            "operands must be two numbers of the same type",
+        );
+        assert_error_contains(
+            &format!("{base}print(a + b)"),
+            "operands must be two numbers of the same type",
+        );
+        assert_error_contains(
+            &format!("{base}print(a.value)"),
+            "is not a struct, so it has no field",
+        );
+        assert_error_contains(
+            &format!("{base}print(a)"),
+            "'print' does not support the inline sum type",
+        );
+    }
+
+    /// Conformance 11: an inline sum cannot cross a Rust bridge, even when
+    /// every member individually could.
+    #[test]
+    fn an_inline_sum_cannot_cross_a_rust_bridge() {
+        assert_error_contains(
+            "extern rust \"snacc_user_maybe\" fun maybe(): UInt8 | Nil\nprint(0)",
+            "no inline sum may cross a Rust bridge",
+        );
+    }
+
+    /// A struct field may hold an inline sum, and construction injects into it
+    /// exactly like any other expected-sum position.
+    #[test]
+    fn a_struct_field_may_be_an_inline_sum() {
+        assert_checks(
+            "type CacheEntry is struct value: UInt8 | Nil, end\n\
+             let empty: CacheEntry = CacheEntry(value: nil)\n\
+             let full: CacheEntry = CacheEntry(value: 1u8)\nprint(0)",
         );
     }
 }

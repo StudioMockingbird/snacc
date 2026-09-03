@@ -51,6 +51,10 @@ fn scalar_ty(context: &Context, ty: Ty) -> BasicTypeEnum<'_> {
         Ty::Bool | Ty::Nil | Ty::UInt8 => context.i8_type().into(),
         // Every caller routes `Ty::User` through the layout table first.
         Ty::User(_) => unreachable!("a user-defined type resolves through the layout table"),
+        // Specification 018 (Task B) has not yet given inline sums a lowering
+        // strategy; front-end checking (Task A) never emits one into a
+        // program this backend runs on.
+        Ty::Sum(_) => unreachable!("inline sum lowering is not implemented yet"),
     }
 }
 
@@ -185,7 +189,8 @@ fn is_float(ty: Ty) -> bool {
         | Ty::UInt64
         | Ty::Bool
         | Ty::Nil
-        | Ty::User(_) => false,
+        | Ty::User(_)
+        | Ty::Sum(_) => false,
     }
 }
 
@@ -194,7 +199,9 @@ fn is_float(ty: Ty) -> bool {
 fn is_unsigned(ty: Ty) -> bool {
     match ty {
         Ty::UInt8 | Ty::UInt16 | Ty::UInt32 | Ty::UInt64 => true,
-        Ty::Int64 | Ty::Dec64 | Ty::Float32 | Ty::Bool | Ty::Nil | Ty::User(_) => false,
+        Ty::Int64 | Ty::Dec64 | Ty::Float32 | Ty::Bool | Ty::Nil | Ty::User(_) | Ty::Sum(_) => {
+            false
+        }
     }
 }
 
@@ -217,6 +224,7 @@ fn print_import<'ctx>(
         // so neither reaches lowering.
         Ty::User(_) => return Err(internal("a user-defined type reached 'print' lowering")),
         Ty::Nil => return Err(internal("a standalone 'Nil' reached 'print' lowering")),
+        Ty::Sum(_) => return Err(internal("an inline sum type reached 'print' lowering")),
     };
     Ok((symbol, vec![scalar_ty(context, ty).into()]))
 }
@@ -914,6 +922,10 @@ impl<'ctx> Codegen<'ctx, '_> {
                     .map_err(|error| error.to_string())?;
                 Ok((compared, test.binding.is_some().then_some(test)))
             }
+            // Specification 018 (Task B) has not yet lowered an inline sum
+            // type test; Task A's checker never emits one into a program
+            // this backend runs on.
+            TCondition::SumTest(_) => Err(internal("inline sum type tests are not lowered yet")),
         }
     }
 
@@ -1425,6 +1437,10 @@ impl<'ctx> Codegen<'ctx, '_> {
                     .map_err(|error| error.to_string())?;
                 Ok(injected.into_struct_value().into())
             }
+            // Specification 018 (Task B) has not yet given inline sum
+            // injection a lowering strategy; Task A's checker never emits
+            // one into a program this backend runs on.
+            TExpr::InjectSum { .. } => Err(internal("inline sum injection is not lowered yet")),
             TExpr::Arith(left, op, right, ty) => {
                 let ty = *ty;
                 let left = self.expr(env, loops, left)?;

@@ -882,6 +882,13 @@ fn rust_abi_type(ty: Ty) -> &'static str {
             "internal error: a user-defined type or standalone 'Nil' reached bridge \
              rendering; declaration collection rejects both"
         ),
+        // Specification 018 section 10: declaration collection rejects every
+        // inline sum at a Rust bridge parameter or result, so none reaches
+        // assertion rendering either.
+        Ty::Sum(_) => unreachable!(
+            "internal error: an inline sum type reached bridge rendering; declaration \
+             collection rejects it"
+        ),
     }
 }
 
