@@ -106,7 +106,7 @@ pub enum CmpOp {
 /// The root of a checked place. Local names are unique for a whole function or
 /// method (Specification 012 section 5.2), so a name is the binding identity;
 /// no separate ID table is needed to tell two roots apart.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PlaceRoot {
     Local(String),
     /// The implicit method receiver.
@@ -133,6 +133,25 @@ pub struct Place {
     pub path: Vec<usize>,
     /// The type reached after applying `path`.
     pub ty: Ty,
+}
+
+/// Specification 016 section 12 (phase 3 step 1): the explicit mode a checked
+/// place use occupies. Borrowing and mutation already have their own distinct
+/// checked shapes -- a reference argument is [`TArg::Reference`], an
+/// assignment target is `TStmt::Assign`'s `place`, and a receiver place is
+/// [`TReceiver::Place`] -- so only the copy/consume distinction is ambiguous
+/// enough to need a tag on [`TExpr::Place`] itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UseMode {
+    /// An ordinary read: an operand, a receiver, a print argument, or any
+    /// position other than the five consuming contexts below.
+    Copy,
+    /// Specification 016 section 6.1: initialization, assignment's right
+    /// operand, a by-value argument, a function/method result, or an
+    /// aggregate constructor argument. A move-only place used this way
+    /// transfers its complete value and cannot be used again (section 6.2);
+    /// a copyable place used this way remains an ordinary copy.
+    Consume,
 }
 
 /// One resolved parameter. The passing mode travels with the value type, so no
@@ -173,8 +192,11 @@ pub enum TExpr {
     Num(NumLiteral),
     Bool(bool),
     Nil,
-    /// Reads a place.
-    Place(Place),
+    /// Reads a place. Specification 016 section 12 (phase 3 step 1): the
+    /// [`UseMode`] records whether this occurrence sits in a consuming
+    /// context, set by `mark_consumed` after `check_expr` produces this node
+    /// and before any coercion wraps it.
+    Place(Place, UseMode),
     /// Reads one field of a value that has no addressable storage.
     FieldRead {
         base: Box<TExpr>,
@@ -395,6 +417,17 @@ struct Ctx<'src> {
     direct_writes: Vec<bool>,
     effect_edges: Vec<(MethodId, MethodId)>,
     receiver_calls: Vec<ReceiverCall>,
+    /// Specification 016 section 6.2: every whole move-only root that is
+    /// currently moved, for the function or method body being checked, keyed
+    /// by root and recording the consuming operation's span. A root absent
+    /// here is available -- true for every non-move-only root, so this stays
+    /// empty for a program that never uses `Box<T>` -- so no entry is made
+    /// until something actually moves. Reset per function/method by
+    /// `begin_region`, snapshotted and restored across sibling `if`/`elseif`/
+    /// `else` arms, and merged back by unioning every reachable arm's exit
+    /// (available only when available on every one, Specification 016
+    /// section 6.2).
+    move_state: HashMap<PlaceRoot, Span>,
     errors: Vec<Error>,
     unknown: Option<&'static str>,
 }
@@ -473,6 +506,7 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
         direct_writes: vec![false; method_count],
         effect_edges: Vec::new(),
         receiver_calls: Vec::new(),
+        move_state: HashMap::new(),
         errors,
         unknown: None,
     };
@@ -572,6 +606,7 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
     // namespace; Snacc creates no implicit global state.
     ctx.declared.clear();
     ctx.loops.clear();
+    ctx.move_state.clear();
     let mut env = Env::new();
     let body = check_statement_block(&mut ctx, &mut env, &program.body);
 
@@ -630,6 +665,7 @@ fn begin_region<'src>(
 ) -> Vec<TParam> {
     ctx.declared.clear();
     ctx.loops.clear();
+    ctx.move_state.clear();
     ctx.self_ty = self_ty;
     for (arg, param) in args.iter().zip(params) {
         declare(ctx, arg.name, arg.span, "Parameter");
@@ -993,6 +1029,65 @@ fn resolve_place<'src>(
     })
 }
 
+/// Specification 016 section 6.1: tags a checked value with its [`UseMode`]
+/// when it occupies one of the five consuming contexts (initialization,
+/// assignment's right operand, a by-value argument, a function/method
+/// result, or an aggregate constructor argument), and -- for a whole
+/// move-only root -- runs the section 6.2 availability check this represents.
+/// Every call site applies this before `coerce`, so a value later wrapped by
+/// an implicit union or sum injection still carries the tag and, when
+/// applicable, has already been checked. A value that is not a bare place
+/// read (a call result, a fresh `box(...)`, a nested `if`, ...) has no root
+/// to transfer and passes through unchanged.
+fn mark_consumed(ctx: &mut Ctx<'_>, expr: TExpr, span: Span) -> TExpr {
+    let TExpr::Place(place, _) = expr else {
+        return expr;
+    };
+    // Specification 016 section 6.4 rejects moving a move-only value out of a
+    // field, union payload, or automatic box dereference; that check belongs
+    // to the next phase of this analysis; so only a bare root -- an empty
+    // path -- is checked for availability here.
+    if place.path.is_empty() {
+        check_move(ctx, &place, span);
+    }
+    TExpr::Place(place, UseMode::Consume)
+}
+
+/// Specification 016 section 6.2: a consuming use of a move-only root
+/// requires availability. Reports a use-after-move diagnostic naming the root
+/// if it is already moved; otherwise marks it moved from this point forward.
+/// A no-op for a copyable type, which stays an ordinary copy regardless of
+/// how many times it is used (Specification 016 section 5.3).
+fn check_move(ctx: &mut Ctx<'_>, place: &Place, span: Span) {
+    if !ctx.types.is_move_only(place.ty) {
+        return;
+    }
+    if ctx.move_state.contains_key(&place.root) {
+        ctx.error(
+            span,
+            format!("'{}' is already moved, so this use is invalid", place.root),
+        );
+        return;
+    }
+    ctx.move_state.insert(place.root.clone(), span);
+}
+
+/// Specification 016 section 6.2: a root is available after a merge only when
+/// available on every reachable predecessor, so the merged moved-set is the
+/// union of every predecessor's moved-set -- moved on even one predecessor is
+/// enough to make it unavailable afterward. Keeps whichever span is found
+/// first; which one survives does not matter; only whether the root is moved
+/// at all does.
+fn merge_moves(exits: Vec<HashMap<PlaceRoot, Span>>) -> HashMap<PlaceRoot, Span> {
+    let mut merged = HashMap::new();
+    for exit in exits {
+        for (root, span) in exit {
+            merged.entry(root).or_insert(span);
+        }
+    }
+    merged
+}
+
 /// Checks a block that must supply a value of `expected`. Every element but
 /// the last is a statement; the last shall be a value-producing expression or
 /// a value-form `if`.
@@ -1014,6 +1109,11 @@ fn check_value_block<'src>(
         match &element.0 {
             BlockElement::Expr(expression) => {
                 let (value, ty) = check_expr(ctx, env, expression);
+                // Specification 016 section 6.1: a value block's trailing
+                // expression is always a function/method result, or feeds one
+                // of the other four consuming contexts one level further out
+                // (Specification 016 section 6.2's `if`-arm example).
+                let value = mark_consumed(ctx, value, expression.1);
                 result = Some(coerce(ctx, value, ty, expected, expression.1));
             }
             BlockElement::If(form) => {
@@ -1239,14 +1339,20 @@ fn check_value_if<'src>(
     form: &IfForm<'src>,
     expected: Ty,
 ) -> TExpr {
+    // Specification 016 section 6.2: every arm branches from the same entry
+    // state, exactly as `check_stmt`'s `BlockElement::If` handles it.
+    let entry = ctx.move_state.clone();
     let mut arms = Vec::new();
     let mut spans = Vec::new();
+    let mut exits = Vec::new();
     for (condition, body) in &form.arms {
+        ctx.move_state = entry.clone();
         let scope = env.len();
         let checked = check_arm_condition(ctx, env, condition);
         let body = check_value_block(ctx, env, body, expected);
         env.truncate(scope);
         spans.push(condition.span());
+        exits.push(ctx.move_state.clone());
         arms.push((checked, body));
     }
     let fact = analyze_chain(ctx, &arms, &spans);
@@ -1260,7 +1366,10 @@ fn check_value_if<'src>(
                         .into(),
                 );
             }
-            Some(check_value_block(ctx, env, body, expected))
+            ctx.move_state = entry.clone();
+            let checked = check_value_block(ctx, env, body, expected);
+            exits.push(ctx.move_state.clone());
+            Some(checked)
         }
         None if fact.exhaustive => None,
         None => {
@@ -1278,6 +1387,14 @@ fn check_value_if<'src>(
             None
         }
     };
+    // A value-form `if` requires exhaustive coverage or an `else` (both
+    // already diagnosed above when missing), so a correct program never
+    // reaches a fall-through edge here; the malformed-chain error path still
+    // folds the entry state in too, so it does not silently drop moves.
+    if !fact.exhaustive && else_branch.is_none() {
+        exits.push(entry);
+    }
+    ctx.move_state = merge_moves(exits);
     TExpr::If(Box::new(TValueIf {
         arms,
         else_branch,
@@ -1303,6 +1420,9 @@ fn check_stmt<'src>(
             // The initializer is checked before the name is in scope, so it can
             // never refer to the variable being created.
             let (checked, value_ty) = check_expr(ctx, env, value);
+            // Specification 016 section 6.1: initialization is a consuming
+            // context.
+            let checked = mark_consumed(ctx, checked, value.1);
             let checked = coerce(ctx, checked, value_ty, declared, value.1);
             declare(ctx, name, *name_span, "Variable");
             env.push(Binding {
@@ -1320,6 +1440,9 @@ fn check_stmt<'src>(
         BlockElement::Assign { place, value } => {
             let target = resolve_place(ctx, env, place);
             let (checked, value_ty) = check_expr(ctx, env, value);
+            // Specification 016 section 6.1: an assignment's right operand is
+            // a consuming context.
+            let checked = mark_consumed(ctx, checked, value.1);
             match target {
                 Some(resolved) => {
                     if !resolved.mutable {
@@ -1337,6 +1460,14 @@ fn check_stmt<'src>(
                     {
                         ctx.direct_writes[method.index()] = true;
                     }
+                    // Specification 016 section 6.3's closing sentence:
+                    // assigning the whole root installs a fresh value, so it
+                    // is available again regardless of whether it was moved.
+                    // A field assignment (a non-empty path) reinitializes no
+                    // root and is left untouched.
+                    if resolved.place.path.is_empty() {
+                        ctx.move_state.remove(&resolved.place.root);
+                    }
                     TStmt::Assign {
                         place: resolved.place,
                         value: checked,
@@ -1349,9 +1480,39 @@ fn check_stmt<'src>(
             condition, body, ..
         } => {
             let condition = check_condition(ctx, env, condition);
+            // Specification 016 section 6.2: a `while` body is checked to a
+            // fixed point. The body's own single checked pass (below) already
+            // uses the pre-loop state, exactly as its first real iteration
+            // would; what a naive single pass cannot see is a later
+            // iteration reusing the same move once the first has already
+            // consumed it. Since this checker's control flow never branches
+            // on move-availability, a root's exit state as a function of its
+            // entry state is always one of "unconditionally reinitialized",
+            // "unconditionally moved", or "untouched" -- never a function
+            // that depends on which one held going in -- so comparing this
+            // one real pass's entry and exit finds every root the loop can
+            // legitimately double-move without needing to re-run the body.
+            let pre = ctx.move_state.clone();
             ctx.loops.push(());
             let body = check_statement_block(ctx, env, body);
             ctx.loops.pop();
+            let post = ctx.move_state.clone();
+            for (root, move_span) in &post {
+                if !pre.contains_key(root) {
+                    ctx.error(
+                        *move_span,
+                        format!(
+                            "'{root}' is moved here, but this is inside a 'while' body, so a \
+                             later iteration would find '{root}' already moved"
+                        ),
+                    );
+                }
+            }
+            // The loop may run zero or more times, so the state after it must
+            // hold on both the zero-iteration edge (`pre`) and the edge that
+            // runs the body at least once (`post`); by the reasoning above,
+            // `post` already reflects every later iteration too.
+            ctx.move_state = merge_moves(vec![pre, post]);
             TStmt::While { condition, body }
         }
         BlockElement::Break(span) => {
@@ -1366,14 +1527,21 @@ fn check_stmt<'src>(
             TStmt::Break
         }
         BlockElement::If(form) => {
+            // Specification 016 section 6.2: every arm branches from the same
+            // entry state, so each is checked against a fresh snapshot rather
+            // than the previous arm's leftover moves.
+            let entry = ctx.move_state.clone();
             let mut arms = Vec::new();
             let mut spans = Vec::new();
+            let mut exits = Vec::new();
             for (condition, body) in &form.arms {
+                ctx.move_state = entry.clone();
                 let scope = env.len();
                 let checked = check_arm_condition(ctx, env, condition);
                 let body = check_statement_block(ctx, env, body);
                 env.truncate(scope);
                 spans.push(condition.span());
+                exits.push(ctx.move_state.clone());
                 arms.push((checked, body));
             }
             let fact = analyze_chain(ctx, &arms, &spans);
@@ -1385,10 +1553,21 @@ fn check_stmt<'src>(
                         .into(),
                 );
             }
-            let else_branch = form
-                .else_branch
-                .as_ref()
-                .map(|body| check_statement_block(ctx, env, body));
+            let else_branch = form.else_branch.as_ref().map(|body| {
+                ctx.move_state = entry.clone();
+                let checked = check_statement_block(ctx, env, body);
+                exits.push(ctx.move_state.clone());
+                checked
+            });
+            // An exhaustive type-test chain or an explicit `else` covers every
+            // path, so no execution reaches the statement after the `if`
+            // without entering one of the recorded arms above. Otherwise the
+            // fall-through edge is reachable too, carrying the entry state
+            // forward unchanged (Specification 016 section 6.2's merge rule).
+            if !fact.exhaustive && else_branch.is_none() {
+                exits.push(entry);
+            }
+            ctx.move_state = merge_moves(exits);
             TStmt::If(TStmtIf {
                 arms,
                 else_branch,
@@ -1736,6 +1915,9 @@ fn check_args<'src>(
         match param.mode {
             ParamMode::Value => {
                 let (value, ty) = check_expr(ctx, env, &arg.value);
+                // Specification 016 section 6.1: a by-value argument is a
+                // consuming context.
+                let value = mark_consumed(ctx, value, arg.value.1);
                 checked.push(TArg::Value(coerce(ctx, value, ty, param.ty, arg.value.1)));
             }
             ParamMode::Reference => match check_reference_arg(ctx, env, arg, param, callee) {
@@ -2115,6 +2297,9 @@ fn check_construct<'src>(
         }
         filled[index] = true;
         let expected = fields[index].1;
+        // Specification 016 section 6.1: an aggregate constructor argument is
+        // a consuming context.
+        let value = mark_consumed(ctx, value, arg.value.1);
         let value = coerce(ctx, value, ty, expected, arg.value.1);
         checked.push((index, value));
     }
@@ -2334,12 +2519,15 @@ fn check_expr<'src>(
         }
         Expr::SelfRef => match ctx.self_ty {
             Some(ty) => (
-                TExpr::Place(Place {
-                    root: PlaceRoot::SelfRef,
-                    root_ty: ty,
-                    path: Vec::new(),
-                    ty,
-                }),
+                TExpr::Place(
+                    Place {
+                        root: PlaceRoot::SelfRef,
+                        root_ty: ty,
+                        path: Vec::new(),
+                        ty,
+                    },
+                    UseMode::Copy,
+                ),
                 ty,
             ),
             None => {
@@ -2358,12 +2546,15 @@ fn check_expr<'src>(
             for binding in env.iter().rev() {
                 if binding.name == *name {
                     return (
-                        TExpr::Place(Place {
-                            root: PlaceRoot::Local((*name).to_string()),
-                            root_ty: binding.ty,
-                            path: Vec::new(),
-                            ty: binding.ty,
-                        }),
+                        TExpr::Place(
+                            Place {
+                                root: PlaceRoot::Local((*name).to_string()),
+                                root_ty: binding.ty,
+                                path: Vec::new(),
+                                ty: binding.ty,
+                            },
+                            UseMode::Copy,
+                        ),
                         binding.ty,
                     );
                 }
@@ -2387,7 +2578,7 @@ fn check_expr<'src>(
             match as_place(ctx, env, expression) {
                 PlaceOutcome::Resolved(resolved) => {
                     let ty = resolved.place.ty;
-                    (TExpr::Place(resolved.place), ty)
+                    (TExpr::Place(resolved.place, UseMode::Copy), ty)
                 }
                 PlaceOutcome::Reported => (TExpr::Nil, Ty::Nil),
                 PlaceOutcome::NotAPlace => {
@@ -5050,6 +5241,133 @@ mod tests {
             "type Holder is struct value: Box<Int64>, end\n\
              extern rust \"snacc_user_take\" fun take(value: Holder)",
             "is a user-defined type",
+        );
+    }
+
+    // RFC 016 Task B (first half): consuming-context classification and the
+    // available/moved control-flow analysis (Specification 016 sections 6.1
+    // and 6.2). `Box<Int64>` stands in for every move-only type here since
+    // `Types::is_move_only` already has its own direct unit tests; these
+    // exercise the dataflow pass, not move-only classification itself.
+
+    /// Specification 016 section 6.1's worked example: a move-only value
+    /// moves out of its root on a consuming use, and a later consuming use of
+    /// the same root is rejected.
+    #[test]
+    fn using_a_moved_box_again_is_rejected() {
+        assert_error_contains(
+            "let first: Box<Int64> = box(1)\n\
+             let second: Box<Int64> = first\n\
+             let third: Box<Int64> = first\n\
+             print(0)",
+            "is already moved",
+        );
+    }
+
+    /// Specification 016 section 6.2: a move confined to one non-exhaustive
+    /// `if` arm, with no later use, is fine -- there is nothing after the
+    /// merge to reject.
+    #[test]
+    fn a_move_inside_one_if_arm_with_no_later_use_is_accepted() {
+        assert_checks(
+            "let first: Box<Int64> = box(1)\n\
+             if true then\n\
+             \x20   let second: Box<Int64> = first\n\
+             end\n\
+             print(0)",
+        );
+    }
+
+    /// Specification 016 section 6.2: a root moved on only one arm is not
+    /// available on the un-taken fall-through predecessor, so -- per "available
+    /// only when available on every reachable predecessor" -- it is unavailable
+    /// after the merge and a later use is rejected.
+    #[test]
+    fn a_move_inside_one_if_arm_is_unavailable_after_the_merge() {
+        assert_error_contains(
+            "let first: Box<Int64> = box(1)\n\
+             if true then\n\
+             \x20   let second: Box<Int64> = first\n\
+             end\n\
+             let third: Box<Int64> = first\n\
+             print(0)",
+            "is already moved",
+        );
+    }
+
+    /// Specification 016 section 6.2: a root moved on every arm of an
+    /// exhaustive `if`/`else` is moved on every reachable predecessor, so it
+    /// is definitely gone after the merge.
+    #[test]
+    fn a_move_on_every_if_else_arm_is_unavailable_after_the_merge() {
+        assert_error_contains(
+            "let first: Box<Int64> = box(1)\n\
+             if true then\n\
+             \x20   let second: Box<Int64> = first\n\
+             else\n\
+             \x20   let third: Box<Int64> = first\n\
+             end\n\
+             let fourth: Box<Int64> = first\n\
+             print(0)",
+            "is already moved",
+        );
+    }
+
+    /// Specification 016 section 6.3's closing sentence: assigning a fresh
+    /// value to a moved mutable local reinitializes it, so a later use
+    /// succeeds.
+    #[test]
+    fn reassigning_a_moved_mutable_local_restores_availability() {
+        assert_checks(
+            "let mut first: Box<Int64> = box(1)\n\
+             let second: Box<Int64> = first\n\
+             first = box(2)\n\
+             let third: Box<Int64> = first\n\
+             print(0)",
+        );
+    }
+
+    /// Specification 016 section 6.2: a move inside a `while` body that is
+    /// never reinitialized would already be moved on a later iteration, so it
+    /// is rejected even though the single pass through the body that moves it
+    /// starts from an available root.
+    #[test]
+    fn a_move_inside_a_while_body_that_would_double_move_is_rejected() {
+        assert_error_contains(
+            "let first: Box<Int64> = box(1)\n\
+             while true do\n\
+             \x20   let second: Box<Int64> = first\n\
+             end\n\
+             print(0)",
+            "already moved",
+        );
+    }
+
+    /// Specification 016 section 6.3's closing sentence, inside a loop: a
+    /// `while` body that reinitializes the moved root before the body ends is
+    /// safe to repeat, so no double-move diagnostic fires.
+    #[test]
+    fn a_while_body_that_reinitializes_after_moving_is_accepted() {
+        assert_checks(
+            "let mut first: Box<Int64> = box(1)\n\
+             while true do\n\
+             \x20   let second: Box<Int64> = first\n\
+             \x20   first = box(2)\n\
+             end\n\
+             print(0)",
+        );
+    }
+
+    /// Specification 016 section 5.3: a copyable type is never move-only, so
+    /// this analysis leaves it alone -- reusing the same local repeatedly is
+    /// an ordinary copy, exactly as it was before this task existed.
+    #[test]
+    fn copyable_values_may_be_used_repeatedly_without_move_tracking() {
+        assert_checks(
+            "let first: Int64 = 1\n\
+             let second: Int64 = first\n\
+             let third: Int64 = first\n\
+             print(third)",
         );
     }
 }

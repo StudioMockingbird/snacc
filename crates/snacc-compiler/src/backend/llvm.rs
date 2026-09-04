@@ -1627,8 +1627,11 @@ impl<'ctx> Codegen<'ctx, '_> {
                     .map_err(|e| e.to_string())?
                     .into())
             }
-            TExpr::Cast(_, _) => Err("checker emitted an unsupported cast".into()),
-            TExpr::Place(place) => self.place_value(env, place),
+            TExpr::Cast(_, _) => Err(internal("checker emitted an unsupported cast")),
+            // RFC 016 Task B's `UseMode` records whether this read is a
+            // consuming context for the checker's own move-availability
+            // analysis; lowering reads the place identically either way.
+            TExpr::Place(place, _) => self.place_value(env, place),
             TExpr::FieldRead { base, index, .. } => {
                 let base = self.expr(env, loops, base)?;
                 self.builder
