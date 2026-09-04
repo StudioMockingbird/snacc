@@ -28,6 +28,15 @@ pub enum Token<'src> {
     /// `Ref`, reserved by Specification 011 section 4 for the reference
     /// parameter type. It is never an ordinary identifier.
     Ref,
+    /// `Box`, reserved by Specification 016 section 4.1 for the boxed
+    /// indirection type. Cased distinctly from [`Token::BoxExpr`]'s `box`, the
+    /// same way every other built-in type name is capitalized while ordinary
+    /// keywords are not.
+    Box,
+    /// `box`, reserved by Specification 016 section 4.2 for the allocation
+    /// expression `box(expression)`. Never an ordinary identifier, and never
+    /// confused with [`Token::Box`]: the lexer matches on the exact spelling.
+    BoxExpr,
     TyDec64,
     TyInt64,
     TyBool,
@@ -70,6 +79,8 @@ impl fmt::Display for Token<'_> {
             Token::Method => write!(f, "method"),
             Token::SelfKw => write!(f, "self"),
             Token::Ref => write!(f, "Ref"),
+            Token::Box => write!(f, "Box"),
+            Token::BoxExpr => write!(f, "box"),
             Token::TyDec64 => write!(f, "Dec64"),
             Token::TyInt64 => write!(f, "Int64"),
             Token::TyBool => write!(f, "Bool"),
@@ -213,6 +224,8 @@ pub fn lexer<'src>()
         "method" => Token::Method,
         "self" => Token::SelfKw,
         "Ref" => Token::Ref,
+        "Box" => Token::Box,
+        "box" => Token::BoxExpr,
         "print" => Token::Print,
         "if" => Token::If,
         "then" => Token::Then,
@@ -461,6 +474,42 @@ mod tests {
                 Token::TyInt64,
                 Token::Op(">"),
                 Token::Op(">"),
+            ]
+        );
+    }
+
+    /// Specification 016 section 4.1: `Box` is reserved and the type brackets
+    /// lex one at a time, exactly like `Ref<T>`.
+    #[test]
+    fn box_is_reserved_and_type_brackets_lex_one_at_a_time() {
+        assert_eq!(
+            lex("Box<Box<Int64>>"),
+            vec![
+                Token::Box,
+                Token::Op("<"),
+                Token::Box,
+                Token::Op("<"),
+                Token::TyInt64,
+                Token::Op(">"),
+                Token::Op(">"),
+            ]
+        );
+    }
+
+    /// Specification 016 section 4.2: `box` (the allocation expression) is a
+    /// distinct, separately reserved word from `Box` (the type); the lexer
+    /// tells them apart purely by case, the same way it already tells `Nil`
+    /// (the type) apart from `nil` (the literal).
+    #[test]
+    fn box_expression_keyword_is_reserved_and_distinct_from_the_box_type() {
+        assert_eq!(lex("Box box"), vec![Token::Box, Token::BoxExpr]);
+        assert_eq!(
+            lex("box(1)"),
+            vec![
+                Token::BoxExpr,
+                Token::Ctrl('('),
+                Token::Num(NumLiteral::Int(1)),
+                Token::Ctrl(')'),
             ]
         );
     }

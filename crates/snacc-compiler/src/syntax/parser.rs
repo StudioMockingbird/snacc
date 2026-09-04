@@ -60,6 +60,20 @@ where
     I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
 {
     recursive(|sum_type| {
+        // `"Box", "<", sum-type, ">"` (Specification 016 section 4.1): the
+        // same closed-angle-bracket tokenization `Ref<T>` uses, but recursing
+        // into the whole sum-type production (not a bare primary) so
+        // `Box<Box<T>>` and `Box<A | B>` parse the same way `Ref<Byte | Nil>`
+        // already does. `Ref` is never itself a primary here (see the doc
+        // comment below), so this can never accept `Box<Ref<T>>` -- that
+        // spelling simply fails to parse, exactly like a reference nested
+        // anywhere else a plain value type is expected.
+        let boxed = just(Token::Box)
+            .ignore_then(just(Token::Op("<")))
+            .ignore_then(sum_type.clone())
+            .then_ignore(just(Token::Op(">")))
+            .map_with(|inner, e| (TypeRef::Box(Box::new(inner)), e.span()));
+
         let primary = builtin_type_parser()
             .map(TypeRef::Builtin)
             .or(name_parser()
@@ -68,6 +82,7 @@ where
                 .collect::<Vec<_>>()
                 .map(TypeRef::Named))
             .map_with(|ty, e| (ty, e.span()))
+            .or(boxed)
             .or(sum_type
                 .clone()
                 .delimited_by(just(Token::Ctrl('(')), just(Token::Ctrl(')'))))
@@ -247,6 +262,16 @@ where
                         .delimited_by(just(Token::Ctrl('(')), just(Token::Ctrl(')'))),
                 )
                 .map(|expr| Expr::Print(Box::new(expr))))
+            // `"box", "(", expression, ")"` (Specification 016 section 4.2): a
+            // reserved allocation expression, not a call -- `box` lexes to its
+            // own token, so this can never collide with calling a function or
+            // type constructor named `box`.
+            .or(just(Token::BoxExpr)
+                .ignore_then(
+                    expr.clone()
+                        .delimited_by(just(Token::Ctrl('(')), just(Token::Ctrl(')'))),
+                )
+                .map(|expr| Expr::Box(Box::new(expr))))
             .map_with(|expr, e| (expr, e.span()))
             .or(expr
                 .clone()
@@ -1362,5 +1387,91 @@ mod tests {
         };
         assert_eq!(second.member[0].0, "Nil");
         assert!(second.binding.is_none());
+    }
+
+    // Specification 016 sections 4.1-4.2: `Box<T>` parses as an ordinary
+    // storable value type using `Ref<T>`'s closed-angle-bracket tokenization,
+    // and `box(expression)` parses as a distinct allocation expression.
+
+    #[test]
+    fn box_is_a_reserved_word_and_not_an_identifier() {
+        assert_rejects("let Box: Int64 = 1");
+        assert_rejects("fun Box(value: Int64): Int64 do value end");
+        assert_rejects("type Box is Int64");
+    }
+
+    #[test]
+    fn the_box_expression_keyword_is_reserved_and_not_an_identifier() {
+        assert_rejects("let box: Int64 = 1");
+        assert_rejects("fun box(value: Int64): Int64 do value end");
+    }
+
+    /// Unlike `Ref<T>`, `Box<T>` is an ordinary storable value type: it parses
+    /// everywhere this grammar already accepts a value type, not only at a
+    /// direct parameter.
+    #[test]
+    fn parses_a_box_type_in_every_ordinary_value_type_position() {
+        for source in [
+            "type Point is struct x: Int64, end\nlet held: Box<Point> = box(Point(x: 1))",
+            "type Point is struct x: Int64, end\n\
+             type Holder is struct value: Box<Point>, end",
+            "type Point is struct x: Int64, end\n\
+             fun take(value: Box<Point>): Box<Point> do value end",
+            "type Point is struct x: Int64, end\n\
+             method Point.wrap(): Box<Point> do box(self) end",
+            "type Point is struct x: Int64, end\n\
+             extern rust \"snacc_user_box_edge\" fun edge(value: Box<Point>): Box<Point>",
+            "type Point is struct x: Int64, end\n\
+             type Shape is union | Circle is struct value: Box<Point>, end | Nil end",
+        ] {
+            assert_parses(source);
+        }
+    }
+
+    /// `Box<T>` composes with itself, with an inline sum, and with `Ref<T>`'s
+    /// referent -- `Box<T>` is a value type, so it can fill any of those
+    /// positions the same way a named type can.
+    #[test]
+    fn parses_nested_and_composed_box_types() {
+        for source in [
+            "type Point is struct x: Int64, end\n\
+             let nested: Box<Box<Point>> = box(box(Point(x: 1)))",
+            "type Point is struct x: Int64, end\n\
+             let member: Box<Point> | Bool = true",
+            "type Point is struct x: Int64, end\n\
+             fun grow(value: Ref<Box<Point>>) do print(1) end",
+        ] {
+            assert_parses(source);
+        }
+    }
+
+    /// `Ref<T>` is never a primary in `sum_type_parser` (see its doc comment),
+    /// so it simply cannot appear as a `Box<T>` argument -- this fails to
+    /// parse exactly like a reference nested anywhere else a plain value type
+    /// is expected, with no dedicated diagnostic needed.
+    #[test]
+    fn rejects_a_reference_as_a_box_pointee() {
+        assert_rejects("let value: Box<Ref<Int64>> = box(1)");
+    }
+
+    #[test]
+    fn parses_a_box_allocation_expression_in_every_expression_position() {
+        for source in [
+            "type Point is struct x: Int64, end\nlet held: Box<Point> = box(Point(x: 1))",
+            "type Point is struct x: Int64, end\nprint(box(1) == box(1))",
+            "type Point is struct x: Int64, end\n\
+             fun make(): Box<Point> do box(Point(x: 1)) end",
+        ] {
+            assert_parses(source);
+        }
+    }
+
+    /// Specification 016 section 14's "Use `Box(value)` for allocation"
+    /// rejected alternative: `Box` never lexes as an ordinary identifier, so
+    /// it cannot be used as a call head at all, and `box(expression)` is the
+    /// only allocation spelling.
+    #[test]
+    fn rejects_the_capitalized_box_type_name_used_as_a_call_head() {
+        assert_rejects("print(Box(1))");
     }
 }

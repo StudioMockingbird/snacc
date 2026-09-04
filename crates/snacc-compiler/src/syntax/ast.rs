@@ -47,6 +47,14 @@ pub enum TypeRef<'src> {
     Builtin(TypeName),
     Named(Vec<Spanned<&'src str>>),
     Sum(Vec<Spanned<Self>>),
+    /// `Box<T>` (Specification 016 section 4.1): a closed, single-argument
+    /// built-in parameterized type, parsed with the same closed-angle-bracket
+    /// tokenization already established for `Ref<T>`. Unlike `Ref<T>`, which
+    /// is never a [`TypeRef`] at all (Specification 011 represents it as a
+    /// [`ParamMode`] instead), `Box<T>` is an ordinary storable value type: it
+    /// can appear as a sum member, a nested argument (`Box<Box<T>>`), and
+    /// anywhere else this enum's other variants can.
+    Box(std::boxed::Box<Spanned<Self>>),
 }
 
 impl std::fmt::Display for TypeRef<'_> {
@@ -69,6 +77,7 @@ impl std::fmt::Display for TypeRef<'_> {
                     .join(" | ");
                 f.write_str(&joined)
             }
+            Self::Box(inner) => write!(f, "Box<{}>", inner.0),
         }
     }
 }
@@ -168,6 +177,11 @@ pub enum Expr<'src> {
     Binary(Box<Spanned<Self>>, BinaryOp, Box<Spanned<Self>>),
     Call(Box<Spanned<Self>>, Spanned<Vec<Arg<'src>>>),
     Print(Box<Spanned<Self>>),
+    /// `box(expression)` (Specification 016 section 4.2): a reserved
+    /// allocation expression, not a call. Its operand is evaluated exactly
+    /// once and its checked result is `Box<T>`, where `T` is the operand's
+    /// checked type.
+    Box(Box<Spanned<Self>>),
 }
 
 /// The syntactic root of a place: a named binding or `self`.

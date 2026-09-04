@@ -85,6 +85,54 @@ impl SumTable {
     }
 }
 
+/// A boxed pointee's identity: an index into [`BoxTable`]'s interned pointee
+/// types (Specification 016 section 4.1). Never allocated directly; always
+/// produced by [`BoxTable::intern`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BoxId(pub u32);
+
+impl BoxId {
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Interns each `Box<T>`'s pointee type, mirroring [`SumTable`] above: a
+/// box's whole identity is its one pointee type (Specification 016 section
+/// 4.1), so two occurrences of `Box<Int64>` share one [`Ty::Box`] id and no
+/// separate member-set normalization is needed the way a sum needs.
+#[derive(Default)]
+pub struct BoxTable {
+    pointees: Vec<Ty>,
+    index: HashMap<Ty, BoxId>,
+}
+
+impl BoxTable {
+    /// Interns a pointee type, reusing an existing id for an identical one.
+    pub fn intern(&mut self, pointee: Ty) -> BoxId {
+        if let Some(id) = self.index.get(&pointee) {
+            return *id;
+        }
+        let id = BoxId(self.pointees.len() as u32);
+        self.pointees.push(pointee);
+        self.index.insert(pointee, id);
+        id
+    }
+
+    /// The pointee type a box's members were built from.
+    pub fn pointee(&self, id: BoxId) -> Ty {
+        self.pointees[id.index()]
+    }
+
+    /// Every interned box's pointee type, indexed by `BoxId`. Used once, at
+    /// the end of checking, to hand the backend (RFC 016 Task B/C) a
+    /// lowering-only snapshot of the table alongside the checked `Program`,
+    /// the same way [`SumTable::all`] does for inline sums.
+    pub fn all(&self) -> &[Ty] {
+        &self.pointees
+    }
+}
+
 /// The result of comparing an inline sum's raw (possibly duplicated,
 /// possibly unresolved) syntactic members, shared between declaration
 /// collection and local resolution so both report Specification 018 section 4
@@ -190,9 +238,16 @@ pub struct Types {
     members: HashMap<(TypeId, String), TypeId>,
     /// Memoized `==`/`!=` support, indexed by `TypeId`.
     equality: Vec<bool>,
+    /// Memoized move-only status, indexed by `TypeId` (Specification 016
+    /// section 5.3).
+    move_only: Vec<bool>,
     /// Every inline sum interned so far, continuing the ids `Builder` already
     /// allocated during declaration collection (Specification 018 section 4).
     sums: SumTable,
+    /// Every `Box<T>` pointee interned so far, continuing the ids `Builder`
+    /// already allocated during declaration collection (Specification 016
+    /// section 4.1).
+    boxes: BoxTable,
 }
 
 impl Types {
@@ -254,6 +309,7 @@ impl Types {
                 .map(|member| self.display(*member))
                 .collect::<Vec<_>>()
                 .join(" | "),
+            Ty::Box(id) => format!("Box<{}>", self.display(self.boxes.pointee(id))),
             scalar => scalar.to_string(),
         }
     }
@@ -270,8 +326,31 @@ impl Types {
                 .members(id)
                 .iter()
                 .all(|member| self.supports_equality(*member)),
+            // Specification 016 section 8.3: direct equality involving a box
+            // is unsupported initially, regardless of whether the pointee
+            // itself would support it.
+            Ty::Box(_) => false,
             // Every scalar compares with itself.
             _ => true,
+        }
+    }
+
+    /// Specification 016 section 5.3: `Box<T>` is unconditionally move-only
+    /// regardless of `T`, and a struct or union is move-only when any field
+    /// or member is -- computed once as a structural fixed point over the
+    /// type dependency graph (`move_only_support`), the same way
+    /// `supports_equality` is. Task A only records this property; ownership
+    /// analysis (RFC 016 Task B) is the first consumer.
+    pub fn is_move_only(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::User(id) => self.move_only[id.index()],
+            Ty::Sum(id) => self
+                .sums
+                .members(id)
+                .iter()
+                .any(|member| self.is_move_only(*member)),
+            Ty::Box(_) => true,
+            _ => false,
         }
     }
 
@@ -294,6 +373,24 @@ impl Types {
     /// to build its LLVM layout and deterministic tags.
     pub fn all_sums(&self) -> &[Vec<Ty>] {
         self.sums.all()
+    }
+
+    /// A box's pointee type (Specification 016 section 4.1).
+    pub fn box_pointee(&self, id: BoxId) -> Ty {
+        self.boxes.pointee(id)
+    }
+
+    /// Interns a pointee type discovered during local `let` resolution,
+    /// continuing the same table declaration collection built.
+    pub fn intern_box(&mut self, pointee: Ty) -> BoxId {
+        self.boxes.intern(pointee)
+    }
+
+    /// Every interned box's pointee type, indexed by `BoxId` (RFC 016 Task
+    /// B/C): a lowering-only snapshot handed to the checked `Program` once
+    /// checking finishes, mirroring [`Self::all_sums`].
+    pub fn all_boxes(&self) -> &[Ty] {
+        self.boxes.all()
     }
 }
 
@@ -322,6 +419,9 @@ struct Builder {
     /// Interned inline sums, moved into the finished [`Types`] once collection
     /// ends (Specification 018 section 4).
     sums: SumTable,
+    /// Interned box pointees, moved into the finished [`Types`] once
+    /// collection ends (Specification 016 section 4.1).
+    boxes: BoxTable,
 }
 
 impl Builder {
@@ -426,12 +526,24 @@ fn resolve(
             }
         }
         TypeRef::Sum(members) => resolve_sum(builder, members, ty.1, errors),
+        // Specification 016 section 4.1: the pointee resolves through
+        // ordinary type resolution. `Ref<T>` and a no-result type have no
+        // `TypeRef` spelling that reaches here at all (the parser's
+        // `sum_type_parser` never accepts `Ref`, and a no-result type is only
+        // ever the absence of a `: type` clause), so every pointee that
+        // reaches this arm is already a storable value type; a pointee that
+        // failed to resolve on its own already reported its own error and
+        // falls back to `Ty::Nil` like every other filler here.
+        TypeRef::Box(inner) => {
+            let pointee = resolve(builder, inner, errors).unwrap_or(Ty::Nil);
+            Some(Ty::Box(builder.boxes.intern(pointee)))
+        }
     }
 }
 
 /// The qualified name of any resolved type, for a builder whose declarations
 /// are not yet all resolved (`None` still stands in for one being built).
-fn defs_display(defs: &[Option<TypeDef>], sums: &SumTable, ty: Ty) -> String {
+fn defs_display(defs: &[Option<TypeDef>], sums: &SumTable, boxes: &BoxTable, ty: Ty) -> String {
     match ty {
         Ty::User(id) => defs[id.index()]
             .as_ref()
@@ -440,9 +552,13 @@ fn defs_display(defs: &[Option<TypeDef>], sums: &SumTable, ty: Ty) -> String {
         Ty::Sum(id) => sums
             .members(id)
             .iter()
-            .map(|member| defs_display(defs, sums, *member))
+            .map(|member| defs_display(defs, sums, boxes, *member))
             .collect::<Vec<_>>()
             .join(" | "),
+        Ty::Box(id) => format!(
+            "Box<{}>",
+            defs_display(defs, sums, boxes, boxes.pointee(id))
+        ),
         scalar => scalar.to_string(),
     }
 }
@@ -482,7 +598,7 @@ fn resolve_sum(
         return None;
     }
     for (ty, dup_span) in &outcome.duplicates {
-        let name = defs_display(&builder.defs, &builder.sums, *ty);
+        let name = defs_display(&builder.defs, &builder.sums, &builder.boxes, *ty);
         errors.push(Error {
             span: *dup_span,
             msg: format!("'{name}' is repeated in this sum type; each member must be distinct"),
@@ -507,6 +623,14 @@ fn resolve_sum(
 /// user-defined type (Specification 018 section 8's layout requirement), so a
 /// self-referential inline sum is caught exactly like a self-referential
 /// field of the plain named-union form already is.
+///
+/// Specification 016 section 5.1: a `Box<T>` occurrence is an indirection
+/// edge that this by-value layout graph must not traverse through, so a
+/// `Ty::Box` field or sum member contributes no edge at all -- it falls
+/// through to the wildcard below, deliberately unlike `Ty::User`/`Ty::Sum`.
+/// This is a separate, box-excluding edge function from the complete
+/// semantic dependency graph a box's pointee still needs for resolution and
+/// (eventually) destruction; nothing here collapses the two.
 fn contained(def: &TypeDef, sums: &SumTable) -> Vec<TypeId> {
     let user = |ty: &Ty| -> Vec<TypeId> {
         match ty {
@@ -519,6 +643,8 @@ fn contained(def: &TypeDef, sums: &SumTable) -> Vec<TypeId> {
                     _ => None,
                 })
                 .collect(),
+            // `Ty::Box(_)` terminates the edge (see above); every other
+            // scalar was never a layout edge either.
             _ => Vec::new(),
         }
     };
@@ -634,6 +760,10 @@ fn equality_support(defs: &[TypeDef], sums: &SumTable) -> Vec<bool> {
                 .to_vec()
                 .iter()
                 .all(|member| ty_supports(member, defs, sums, memo)),
+            // Specification 016 section 8.3: a box never supports equality,
+            // so a struct or union containing one does not either, regardless
+            // of the pointee.
+            Ty::Box(_) => false,
             _ => true,
         }
     }
@@ -656,6 +786,60 @@ fn equality_support(defs: &[TypeDef], sums: &SumTable) -> Vec<bool> {
         };
         memo[id.index()] = Some(supported);
         supported
+    }
+
+    (0..defs.len())
+        .map(|index| solve(TypeId(index as u32), defs, sums, &mut memo))
+        .collect()
+}
+
+/// Computes move-only status for every type once, after layout is known
+/// finite -- the same structural fixed point `equality_support` above
+/// computes, with the opposite propagation rule (Specification 016 section
+/// 5.3): a struct is move-only when *any* field is, a union when *any*
+/// member is, and `Box<T>` unconditionally, regardless of `T`. RFC 016 Task A
+/// only computes and records this property; ownership analysis (Task B) is
+/// its first consumer.
+fn move_only_support(defs: &[TypeDef], sums: &SumTable) -> Vec<bool> {
+    let mut memo: Vec<Option<bool>> = vec![None; defs.len()];
+
+    fn ty_move_only(
+        ty: &Ty,
+        defs: &[TypeDef],
+        sums: &SumTable,
+        memo: &mut Vec<Option<bool>>,
+    ) -> bool {
+        match ty {
+            Ty::User(inner) => solve(*inner, defs, sums, memo),
+            Ty::Sum(inner) => sums
+                .members(*inner)
+                .to_vec()
+                .iter()
+                .any(|member| ty_move_only(member, defs, sums, memo)),
+            Ty::Box(_) => true,
+            _ => false,
+        }
+    }
+
+    fn solve(id: TypeId, defs: &[TypeDef], sums: &SumTable, memo: &mut Vec<Option<bool>>) -> bool {
+        if let Some(known) = memo[id.index()] {
+            return known;
+        }
+        // A cyclic layout is rejected before this runs, so this recursion
+        // cannot actually revisit an in-progress id; the guard exists only
+        // for defensive symmetry with `equality_support`'s.
+        memo[id.index()] = Some(false);
+        let move_only = match &defs[id.index()] {
+            TypeDef::Represented { target, .. } => ty_move_only(target, defs, sums, memo),
+            TypeDef::Struct { fields, .. } | TypeDef::UnionMember { fields, .. } => fields
+                .iter()
+                .any(|(_, ty)| ty_move_only(ty, defs, sums, memo)),
+            TypeDef::Union { members, .. } => members
+                .iter()
+                .any(|member| solve(*member, defs, sums, memo)),
+        };
+        memo[id.index()] = Some(move_only);
+        move_only
     }
 
     (0..defs.len())
@@ -687,17 +871,24 @@ fn resolve_params(
 
 /// Specification 010 section 16: no user-defined type crosses the Rust bridge.
 /// Specification 018 section 10 extends this to every inline sum, even one
-/// whose members individually have bridge representations. Rejected here,
-/// during declaration collection, so nothing downstream sees either.
+/// whose members individually have bridge representations. Specification 016
+/// section 10 extends it again to `Box<T>` and every type transitively
+/// containing one: a struct or union field of type `Box<T>` is already
+/// rejected here because the *containing* struct or union is itself a
+/// `Ty::User` and every such type is unconditionally rejected below,
+/// regardless of its fields, so only a `Box<T>` used directly (by value or
+/// as a `Ref<T>` referent) needs its own arm. Rejected here, during
+/// declaration collection, so nothing downstream sees any of the three.
 fn reject_bridge_user_types(
     defs: &[Option<TypeDef>],
     sums: &SumTable,
+    boxes: &BoxTable,
     params: &[TParam],
     result: Option<Ty>,
     declaration: &ExternFunc<'_>,
     errors: &mut Vec<Error>,
 ) {
-    let name = |ty: Ty| defs_display(defs, sums, ty);
+    let name = |ty: Ty| defs_display(defs, sums, boxes, ty);
     let crossing = params.iter().map(|param| param.ty).chain(result);
     for ty in crossing {
         let msg = match ty {
@@ -709,6 +900,11 @@ fn reject_bridge_user_types(
             Ty::Sum(_) => format!(
                 "'{}' is an inline sum type; no inline sum may cross a Rust bridge, even \
                  when every member individually has a bridge representation",
+                name(ty)
+            ),
+            Ty::Box(_) => format!(
+                "'{}' is a box type; 'Box<T>' and every type transitively containing one \
+                 are rejected in 'extern rust' parameters and results",
                 name(ty)
             ),
             _ => continue,
@@ -746,6 +942,7 @@ pub fn collect(program: &AstProgram<'_>, errors: &mut Vec<Error>) -> Collected {
         top_level: HashMap::new(),
         members: HashMap::new(),
         sums: SumTable::default(),
+        boxes: BoxTable::default(),
     };
 
     // Step 1: every top-level type name, in source order.
@@ -893,6 +1090,16 @@ pub fn collect(program: &AstProgram<'_>, errors: &mut Vec<Error>) -> Collected {
     } else {
         vec![false; defs.len()]
     };
+    // Specification 016 section 5.3: computed only once layout is proven
+    // finite, exactly like `equality` above. The default for an already
+    // layout-rejected program is inconsequential (nothing consumes it before
+    // `errors` is reported), so `true` is chosen only for symmetry with
+    // `equality`'s "assume the restrictive answer" default.
+    let move_only = if acyclic {
+        move_only_support(&defs, &builder.sums)
+    } else {
+        vec![true; defs.len()]
+    };
 
     // Step 5: callable signatures, bridge rejection, and call-head conflicts.
     let mut sigs: HashMap<String, FuncSig> = HashMap::new();
@@ -919,6 +1126,7 @@ pub fn collect(program: &AstProgram<'_>, errors: &mut Vec<Error>) -> Collected {
         reject_bridge_user_types(
             &builder.defs,
             &builder.sums,
+            &builder.boxes,
             &params,
             result,
             function,
@@ -981,7 +1189,9 @@ pub fn collect(program: &AstProgram<'_>, errors: &mut Vec<Error>) -> Collected {
             top_level: builder.top_level,
             members: builder.members,
             equality,
+            move_only,
             sums: builder.sums,
+            boxes: builder.boxes,
         },
         methods,
         method_index,
@@ -1053,5 +1263,125 @@ fn method_receiver(
             });
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Collects declarations for `source`, asserting there were no
+    /// declaration-collection errors -- these tests are about the resulting
+    /// [`Types`] table, not about rejecting malformed input.
+    fn collected(source: &str) -> Collected {
+        let program =
+            crate::parse(source).unwrap_or_else(|d| panic!("{source} should parse: {d:?}"));
+        let mut errors = Vec::new();
+        let collected = collect(&program, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "expected no declaration errors for {source}, got: {errors:?}"
+        );
+        collected
+    }
+
+    // Specification 016 section 4.1: `Box<T>`'s identity is exactly its
+    // pointee type, interned the same way `SumTable` interns member sets.
+
+    #[test]
+    fn box_pointees_intern_to_the_same_id_for_the_same_pointee_type() {
+        let collected = collected(
+            "type A is struct value: Box<Int64>, end\n\
+             type B is struct value: Box<Int64>, end",
+        );
+        let types = &collected.types;
+        let a = types.top_level("A").expect("A exists");
+        let b = types.top_level("B").expect("B exists");
+        let a_ty = types.def(a).fields().expect("A is a struct")[0].1;
+        let b_ty = types.def(b).fields().expect("B is a struct")[0].1;
+        assert_eq!(
+            a_ty, b_ty,
+            "two 'Box<Int64>' fields must intern to the same 'Ty::Box' id"
+        );
+        let Ty::Box(id) = a_ty else {
+            panic!("expected a Box field, got {a_ty:?}")
+        };
+        assert_eq!(types.box_pointee(id), Ty::Int64);
+    }
+
+    // Specification 016 section 5.1: a box occurrence terminates the by-value
+    // layout graph, so a recursive type crossing a box edge has a finite
+    // layout while an unbroken direct cycle still does not.
+
+    #[test]
+    fn a_box_edge_breaks_an_otherwise_infinite_value_layout() {
+        let program = crate::parse("type Node is struct next: Node, end")
+            .expect("a self-referential field parses");
+        let mut errors = Vec::new();
+        collect(&program, &mut errors);
+        assert!(
+            !errors.is_empty(),
+            "an unbroken direct value-layout cycle must still be rejected"
+        );
+
+        // The identical shape, broken by one Box edge, has a finite layout.
+        collected("type Node is struct next: Box<Node>, end");
+    }
+
+    // Specification 016 section 5.3: `Box<T>` is unconditionally move-only,
+    // and a struct or union propagates move-only status from any field or
+    // member, transitively through further nesting -- the same structural
+    // fixed point `supports_equality` already computes for equality.
+
+    #[test]
+    fn a_box_is_always_move_only_regardless_of_a_copyable_pointee() {
+        let collected = collected("type Holder is struct value: Box<Int64>, end");
+        let types = &collected.types;
+        let holder = types.top_level("Holder").expect("Holder exists");
+        let box_ty = types.def(holder).fields().expect("Holder is a struct")[0].1;
+        assert!(
+            types.is_move_only(box_ty),
+            "'Box<Int64>' must be move-only even though 'Int64' is copyable"
+        );
+    }
+
+    #[test]
+    fn move_only_is_structural_and_transitive() {
+        let collected = collected(
+            "type Leaf is struct value: Int64, end\n\
+             type Boxy is struct payload: Box<Leaf>, end\n\
+             type Wrapper is struct inner: Boxy, end\n\
+             type Choice is union\n\
+             \x20   | A is struct value: Box<Leaf>, end\n\
+             \x20   | B is struct value: Int64, end\n\
+             end",
+        );
+        let types = &collected.types;
+        let leaf = Ty::User(types.top_level("Leaf").expect("Leaf exists"));
+        let boxy = Ty::User(types.top_level("Boxy").expect("Boxy exists"));
+        let wrapper = Ty::User(types.top_level("Wrapper").expect("Wrapper exists"));
+        let choice = types.top_level("Choice").expect("Choice exists");
+        let b_member = Ty::User(types.member(choice, "B").expect("Choice.B exists"));
+
+        assert!(
+            !types.is_move_only(leaf),
+            "a plain 'Int64' field is copyable"
+        );
+        assert!(
+            types.is_move_only(boxy),
+            "a direct 'Box<T>' field makes its struct move-only"
+        );
+        assert!(
+            types.is_move_only(wrapper),
+            "move-only propagates transitively through further struct nesting"
+        );
+        assert!(
+            types.is_move_only(Ty::User(choice)),
+            "a union is move-only when any member's payload is"
+        );
+        assert!(
+            !types.is_move_only(b_member),
+            "one move-only member does not make every member move-only"
+        );
     }
 }

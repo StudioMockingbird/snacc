@@ -889,6 +889,14 @@ fn rust_abi_type(ty: Ty) -> &'static str {
             "internal error: an inline sum type reached bridge rendering; declaration \
              collection rejects it"
         ),
+        // Specification 016 section 10: declaration collection rejects
+        // 'Box<T>' and every type transitively containing one at every
+        // 'extern rust' parameter and result, so none reaches assertion
+        // rendering either.
+        Ty::Box(_) => unreachable!(
+            "internal error: a box type reached bridge rendering; declaration collection \
+             rejects it"
+        ),
     }
 }
 

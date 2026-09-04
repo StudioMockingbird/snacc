@@ -28,7 +28,7 @@ type Figure is union
     | Segment is struct
         length: Int64,
       end
-    | Box is struct
+    | Rect is struct
         width: Int64,
         height: Int64,
       end
@@ -54,7 +54,7 @@ method Vec2.clear() do
     self = Vec2(x: 0.0, y: 0.0)
 end
 
-method Figure.Box.area(): Int64 do
+method Figure.Rect.area(): Int64 do
     self.width * self.height
 end
 
@@ -65,14 +65,14 @@ fun figure_area(figure: Figure): Int64 do
         0
     elseif figure is Figure.Segment(segment) then
         segment.length
-    elseif figure is Figure.Box(shape) then
+    elseif figure is Figure.Rect(shape) then
         shape.area()
     end
 end
 
 // The no-binding form is an ordinary Bool condition for every member tag.
 fun figure_is_box(figure: Figure): Bool do
-    if figure is Figure.Box then
+    if figure is Figure.Rect then
         true
     else
         false
@@ -124,9 +124,9 @@ print(outer_nest == other_nest)
 let dot: Figure = Figure.Dot()
 let dot_again: Figure = Figure.Dot()
 let segment: Figure = Figure.Segment(length: 7)
-let boxed: Figure = Figure.Box(width: 3, height: 4)
-let boxed_again: Figure = Figure.Box(width: 3, height: 4)
-let boxed_other: Figure = Figure.Box(width: 3, height: 5)
+let boxed: Figure = Figure.Rect(width: 3, height: 4)
+let boxed_again: Figure = Figure.Rect(width: 3, height: 4)
+let boxed_other: Figure = Figure.Rect(width: 3, height: 5)
 print(dot == dot_again)
 print(dot == segment)
 print(segment == boxed)

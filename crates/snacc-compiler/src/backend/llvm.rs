@@ -53,6 +53,11 @@ fn scalar_ty(context: &Context, ty: Ty) -> BasicTypeEnum<'_> {
         // tables first (see `llvm_ty`).
         Ty::User(_) => unreachable!("a user-defined type resolves through the layout table"),
         Ty::Sum(_) => unreachable!("an inline sum resolves through the sum layout table"),
+        // RFC 016 (Task B/C) has not yet given `Box<T>` a lowering strategy
+        // (its private-ABI pointer representation is phase 5 work).
+        Ty::Box(_) => {
+            unreachable!("RFC 016 (Task B/C) has not yet given 'Box<T>' a lowering strategy")
+        }
     }
 }
 
@@ -254,7 +259,8 @@ fn is_float(ty: Ty) -> bool {
         | Ty::Bool
         | Ty::Nil
         | Ty::User(_)
-        | Ty::Sum(_) => false,
+        | Ty::Sum(_)
+        | Ty::Box(_) => false,
     }
 }
 
@@ -263,9 +269,14 @@ fn is_float(ty: Ty) -> bool {
 fn is_unsigned(ty: Ty) -> bool {
     match ty {
         Ty::UInt8 | Ty::UInt16 | Ty::UInt32 | Ty::UInt64 => true,
-        Ty::Int64 | Ty::Dec64 | Ty::Float32 | Ty::Bool | Ty::Nil | Ty::User(_) | Ty::Sum(_) => {
-            false
-        }
+        Ty::Int64
+        | Ty::Dec64
+        | Ty::Float32
+        | Ty::Bool
+        | Ty::Nil
+        | Ty::User(_)
+        | Ty::Sum(_)
+        | Ty::Box(_) => false,
     }
 }
 
@@ -289,6 +300,9 @@ fn print_import<'ctx>(
         Ty::User(_) => return Err(internal("a user-defined type reached 'print' lowering")),
         Ty::Nil => return Err(internal("a standalone 'Nil' reached 'print' lowering")),
         Ty::Sum(_) => return Err(internal("an inline sum type reached 'print' lowering")),
+        // Specification 016 section 8.3 rejects direct printing of a box in
+        // the checker, so this never reaches lowering.
+        Ty::Box(_) => return Err(internal("a box type reached 'print' lowering")),
     };
     Ok((symbol, vec![scalar_ty(context, ty).into()]))
 }
@@ -1820,6 +1834,17 @@ impl<'ctx> Codegen<'ctx, '_> {
                 self.invoke(function, &[value.into()])?;
                 Ok(value)
             }
+            // RFC 016 (Task B/C) has not yet given `box(expression)` a
+            // lowering strategy: allocation, single-evaluation cleanup
+            // registration, and the private Snacc ABI's pointer
+            // representation are all still unimplemented. The checker
+            // already accepts `box(...)` (Task A), so a program reaching
+            // this arm is possible; the backend does not silently miscompile
+            // it.
+            TExpr::Box(..) => Err(internal(
+                "'box(expression)' reached lowering, which RFC 016 (Task B/C) has not yet \
+                 implemented",
+            )),
         }
     }
 }

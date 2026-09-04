@@ -1,4 +1,6 @@
-use crate::semantics::types::{self, FuncSig, MethodId, MethodSig, SumId, TypeDef, TypeId, Types};
+use crate::semantics::types::{
+    self, BoxId, FuncSig, MethodId, MethodSig, SumId, TypeDef, TypeId, Types,
+};
 use crate::syntax::ast::{
     Arg, BinaryOp, Block, BlockElement, Condition, Expr, IfForm, NumLiteral, Param, ParamMode,
     PlacePath, PlaceRootName, Program as AstProgram, Span, Spanned, TypeName, TypeRef, TypeTest,
@@ -27,6 +29,10 @@ pub enum Ty {
     Float32,
     User(TypeId),
     Sum(SumId),
+    /// `Box<T>` (Specification 016 section 4.1). The pointee lives in
+    /// `Types`' box table, indexed by `BoxId`, mirroring how a `Sum`'s
+    /// members live in the type table rather than here.
+    Box(BoxId),
 }
 
 impl From<TypeName> for Ty {
@@ -62,6 +68,7 @@ impl std::fmt::Display for Ty {
             Self::Float32 => write!(f, "Float32"),
             Self::User(id) => write!(f, "<user type #{}>", id.0),
             Self::Sum(id) => write!(f, "<sum #{}>", id.0),
+            Self::Box(id) => write!(f, "<box #{}>", id.0),
         }
     }
 }
@@ -215,6 +222,11 @@ pub enum TExpr {
     If(Box<TValueIf>),
     Print(Box<TExpr>, Ty),
     Cast(Box<TExpr>, Ty),
+    /// `box(expression)` (Specification 016 section 4.2). `ty` is the whole
+    /// allocation's result type `Box<T>`, not the operand's type `T` --
+    /// unlike `Print`'s trailing `Ty`, which names the operand. RFC 016 Task
+    /// B/C gives this a lowering strategy; the checker only produces it.
+    Box(Box<TExpr>, Ty),
 }
 
 /// A proven type test against a named union. `tag` is the member's
@@ -343,6 +355,10 @@ pub struct Program {
     /// deterministic tag from its position here, the same way a named
     /// union's tag is its member's declaration position.
     pub sums: Vec<Vec<Ty>>,
+    /// Every interned `Box<T>`'s pointee type, indexed by `BoxId`
+    /// (Specification 016 section 4.1). RFC 016 Task B/C's lowering strategy
+    /// is the first consumer; Task A only records it here, mirroring `sums`.
+    pub boxes: Vec<Ty>,
     pub body: TBlock,
 }
 
@@ -584,15 +600,18 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
         return Err(Failure::Unknown(detail));
     }
     if ctx.errors.is_empty() {
-        // Read before `ctx.types.defs` moves out below: `all_sums` borrows
-        // the whole `Types` value, which a partial move would break.
+        // Read before `ctx.types.defs` moves out below: `all_sums`/
+        // `all_boxes` borrow the whole `Types` value, which a partial move
+        // would break.
         let sums = ctx.types.all_sums().to_vec();
+        let boxes = ctx.types.all_boxes().to_vec();
         Ok(Program {
             funcs: typed_funcs,
             externs: typed_externs,
             types: ctx.types.defs,
             methods: typed_methods,
             sums,
+            boxes,
             body,
         })
     } else {
@@ -1442,6 +1461,15 @@ fn resolve_type(ctx: &mut Ctx<'_>, ty: &Spanned<TypeRef<'_>>) -> Ty {
             }
         }
         TypeRef::Sum(members) => resolve_sum(ctx, members, ty.1),
+        // Specification 016 section 4.1: the pointee resolves through
+        // ordinary type resolution, exactly like declaration collection's
+        // `resolve` in `types.rs`. Neither `Ref<T>` nor a no-result type has
+        // a `TypeRef` spelling that reaches here, so every pointee is already
+        // a storable value type.
+        TypeRef::Box(inner) => {
+            let pointee = resolve_type(ctx, inner);
+            Ty::Box(ctx.types.intern_box(pointee))
+        }
     }
 }
 
@@ -2587,9 +2615,29 @@ fn check_expr<'src>(
                         ),
                     );
                 }
+                // Specification 016 section 8.3: direct printing of a box is
+                // unsupported initially.
+                Ty::Box(_) => {
+                    let name = ctx.name(ty);
+                    ctx.error(
+                        span,
+                        format!("'print' does not support the box type '{name}'"),
+                    );
+                }
                 _ => {}
             }
             (TExpr::Print(Box::new(value), ty), ty)
+        }
+        Expr::Box(operand) => {
+            // Specification 016 section 4.2: the operand is an ordinary
+            // expression, evaluated exactly once; its checked type becomes
+            // the pointee `T`. Every checked expression already has a
+            // storable value type (`Ref<T>` and a no-result type are never
+            // an expression's type), so no separate "storable pointee"
+            // validation is needed here.
+            let (value, pointee) = check_expr(ctx, env, operand);
+            let ty = Ty::Box(ctx.types.intern_box(pointee));
+            (TExpr::Box(Box::new(value), ty), ty)
         }
     }
 }
@@ -3613,17 +3661,19 @@ mod tests {
     /// bare `name(...)` never calls a local.
     #[test]
     fn a_binding_wins_a_qualified_call_head_over_a_type_path() {
-        // `Box` is both a union type and a parameter; the parameter wins.
+        // `Case` is both a union type and a parameter; the parameter wins.
+        // (Specification 016 reserves `Box`, so this uses an unreserved name
+        // that still exercises the same type-path-versus-binding shadowing.)
         assert_checks(
-            "type Box is union | Item is struct n: Int64, end end\n\
-             method Box.Item.get(): Int64 do self.n end\n\
-             fun read(Box: Box.Item): Int64 do Box.get() end\n\
-             print(read(Box.Item(n: 1)))",
+            "type Case is union | Item is struct n: Int64, end end\n\
+             method Case.Item.get(): Int64 do self.n end\n\
+             fun read(Case: Case.Item): Int64 do Case.get() end\n\
+             print(read(Case.Item(n: 1)))",
         );
         // Without a binding of that name the same path is a constructor.
         assert_checks(
-            "type Box is union | Item is struct n: Int64, end end\n\
-             let held: Box = Box.Item(n: 1)\nprint(1)",
+            "type Case is union | Item is struct n: Int64, end end\n\
+             let held: Case = Case.Item(n: 1)\nprint(1)",
         );
         assert_error_contains(
             "fun f(value: Int64): Int64 do value(1) end",
@@ -4844,6 +4894,162 @@ mod tests {
             "type CacheEntry is struct value: UInt8 | Nil, end\n\
              let empty: CacheEntry = CacheEntry(value: nil)\n\
              let full: CacheEntry = CacheEntry(value: 1u8)\nprint(0)",
+        );
+    }
+
+    // RFC 016 Task A: `Box<T>` syntax, resolved types, and layout.
+
+    /// Specification 016 sections 4.1 and 12 (phase 1): `Box<T>` resolves as
+    /// an ordinary storable value type in every position a plain value type
+    /// can occupy -- field, parameter, local, and result -- and round-trips
+    /// through the full `check()` pipeline into a resolved `Ty::Box`.
+    #[test]
+    fn a_box_type_resolves_as_a_field_parameter_local_and_result_type() {
+        let program = assert_checks(
+            "type Point is struct x: Int64, end\n\
+             type Holder is struct value: Box<Point>, end\n\
+             fun make(value: Box<Point>): Box<Point> do let local: Box<Point> = value local end\n\
+             print(0)",
+        );
+        let holder = program
+            .types
+            .iter()
+            .find(|def| def.name() == "Holder")
+            .expect("Holder exists");
+        assert!(
+            matches!(holder.fields().unwrap()[0].1, Ty::Box(_)),
+            "Holder.value should resolve to a 'Ty::Box'"
+        );
+        let make = &program.funcs["make"];
+        assert!(
+            matches!(make.params[0].ty, Ty::Box(_)),
+            "make's parameter should resolve to a 'Ty::Box'"
+        );
+        assert!(
+            matches!(make.result, Some(Ty::Box(_))),
+            "make's result should resolve to a 'Ty::Box'"
+        );
+    }
+
+    /// Specification 016 section 11: the wrong number of `Box` type
+    /// arguments is diagnosed. `Box<T>` accepts exactly one type argument
+    /// (section 4.1), so zero or more than one both fail to parse, the same
+    /// way a malformed `Ref<T>` would.
+    #[test]
+    fn rejects_the_wrong_number_of_box_type_arguments() {
+        assert_rejected_by_parser("let value: Box = box(1)");
+        assert_rejected_by_parser("let value: Box<> = box(1)");
+        assert_rejected_by_parser("let value: Box<Int64, Bool> = box(1)");
+    }
+
+    /// Specification 016 section 4.1: `Ref<T>` is not storable, so it cannot
+    /// be a box's pointee -- like a reference nested inside a sum member
+    /// (`a_reference_cannot_be_a_sum_member` above), this fails to parse
+    /// rather than reaching resolution.
+    #[test]
+    fn a_reference_cannot_be_a_box_pointee() {
+        assert_rejected_by_parser("let value: Box<Ref<Int64>> = box(1)");
+    }
+
+    /// Specification 016 section 4.1: a no-result type is not storable, so
+    /// it cannot be a box's pointee. There is no `TypeRef` spelling for a
+    /// no-result type, so the only way to attempt boxing one is
+    /// `box(call-to-a-no-result-function())` -- rejected by the pre-existing
+    /// no-result-call-as-value diagnostic (RFC 008 conformance 2) before any
+    /// box-specific checking runs.
+    #[test]
+    fn a_no_result_calls_result_cannot_be_boxed() {
+        assert_error_contains(
+            "fun log(value: Int64) do print(value) end\n\
+             let boxed: Box<Int64> = box(log(1))\nprint(0)",
+            "declares no result, so its call cannot be used as a value",
+        );
+    }
+
+    /// Specification 016 section 4.1: `Box<Box<T>>` is valid.
+    #[test]
+    fn nested_box_is_accepted() {
+        assert_checks("let value: Box<Box<Int64>> = box(box(1))\nprint(0)");
+    }
+
+    /// Specification 016 section 5.1's worked example (also section 3's
+    /// motivation): a recursive union crossing a `Box<T>` edge has a finite
+    /// layout and checks; the identical shape with the edge unbroken is
+    /// still an infinite value layout, exactly as before this RFC (compare
+    /// `recursive_value_layouts_are_rejected` above).
+    #[test]
+    fn a_box_edge_breaks_an_otherwise_infinite_recursive_union_layout() {
+        assert_checks(
+            "type IntLink is union | Empty | Item is struct value: Int64, \
+             next: Box<IntLink>, end end\nprint(0)",
+        );
+        assert_error_contains(
+            "type IntLink is union | Empty | Item is struct value: Int64, \
+             next: IntLink, end end\nprint(0)",
+            "has an infinite value layout",
+        );
+    }
+
+    /// Specification 016 section 5.3: a struct with a `Box<T>` field is
+    /// move-only. `move_only_support`'s own fixed-point computation is
+    /// already unit-tested directly in `types.rs`; this proves the property
+    /// is reachable and correct on a realistic program through the same
+    /// declaration-collection phase `check()` itself starts from (`check`
+    /// calls `types::collect` as its first step).
+    #[test]
+    fn a_box_field_makes_its_struct_move_only_through_the_shared_pipeline() {
+        let source = "type Holder is struct value: Box<Int64>, end\nprint(0)";
+        assert_checks(source);
+        let syntax =
+            crate::parse(source).unwrap_or_else(|d| panic!("{source} should parse: {d:?}"));
+        let mut errors = Vec::new();
+        let collected = types::collect(&syntax, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "unexpected collection errors: {errors:?}"
+        );
+        let holder = collected.types.top_level("Holder").expect("Holder exists");
+        assert!(
+            collected.types.is_move_only(Ty::User(holder)),
+            "a struct with a 'Box<T>' field must be move-only"
+        );
+    }
+
+    /// Specification 016 section 4.1: `Box` is reserved, so it cannot be a
+    /// user-declared type, callable, parameter, or local name -- like `self`
+    /// (`self_is_rejected_outside_a_method` above), this fails to parse
+    /// rather than reaching the checker at all.
+    #[test]
+    fn box_is_reserved_and_cannot_be_a_declared_name() {
+        assert_rejected_by_parser("type Box is Int64");
+        assert_rejected_by_parser("fun Box(): Int64 do 1 end");
+        assert_rejected_by_parser("fun f(Box: Int64): Int64 do 1 end");
+        assert_rejected_by_parser("fun f(): Int64 do let Box: Int64 = 1 1 end");
+    }
+
+    /// Specification 016 section 10: `Box<T>` and every type transitively
+    /// containing one are rejected in `extern rust` parameters and results.
+    /// A direct `Box<T>` parameter or result gets its own diagnostic naming
+    /// the box type; a struct containing a `Box<T>` field is already caught
+    /// by the pre-existing "no user-defined type crosses the bridge" rule
+    /// (`user_defined_types_are_rejected_at_every_bridge_site` above), which
+    /// rejects every `Ty::User` unconditionally regardless of its fields --
+    /// this proves the transitive case is actually enforced, not merely
+    /// claimed by the diagnostic text.
+    #[test]
+    fn box_and_every_type_transitively_containing_one_are_rejected_at_the_bridge() {
+        assert_error_contains(
+            "extern rust \"snacc_user_take\" fun take(value: Box<Int64>)",
+            "is a box type; 'Box<T>' and every type transitively containing one",
+        );
+        assert_error_contains(
+            "extern rust \"snacc_user_make\" fun make(): Box<Int64>",
+            "is a box type; 'Box<T>' and every type transitively containing one",
+        );
+        assert_error_contains(
+            "type Holder is struct value: Box<Int64>, end\n\
+             extern rust \"snacc_user_take\" fun take(value: Holder)",
+            "is a user-defined type",
         );
     }
 }
