@@ -389,6 +389,13 @@ struct Binding<'src> {
     name: &'src str,
     ty: Ty,
     mutable: bool,
+    /// Specification 016 section 7.3: set only for a union- or sum-test
+    /// binding. Such a binding is never an independent owning root -- it is
+    /// always a branch-scoped alias to its tested place's active payload --
+    /// so `mark_consumed` treats a whole-binding consuming use as a subplace
+    /// move (Specification 016 section 6.4) instead of a legitimate whole-
+    /// root move, even though its own path is empty.
+    type_test_alias: bool,
 }
 
 /// One method call awaiting the receiver-write fixed point. Validation cannot
@@ -473,6 +480,10 @@ impl<'src> Ctx<'src> {
         let mut text = place.root.to_string();
         let mut current = place.root_ty;
         for index in &place.path {
+            // Specification 016 section 4.3: a path may cross a box exactly
+            // where the place itself does, so rendering it back needs the
+            // same automatic dereference `walk_fields` used to build it.
+            current = deref_box(&self.types, current);
             let Ty::User(id) = current else { break };
             let Some(fields) = self.types.def(id).fields() else {
                 break;
@@ -678,6 +689,7 @@ fn begin_region<'src>(
             // every read, write, field selection, and receiver use in the body
             // goes through the machinery that already exists for those.
             mutable: param.mode == ParamMode::Reference,
+            type_test_alias: false,
         });
     }
     params.to_vec()
@@ -898,6 +910,18 @@ fn flatten<'a, 'src>(
     (current, fields)
 }
 
+/// Specification 016 section 4.3: field access and method calls automatically
+/// dereference as many box layers as member resolution requires. Peeling
+/// stops at the first non-box type, so a plain struct or union passes through
+/// unchanged and `Box<Box<T>>` peels both layers.
+fn deref_box(types: &Types, ty: Ty) -> Ty {
+    let mut current = ty;
+    while let Ty::Box(id) = current {
+        current = types.box_pointee(id);
+    }
+    current
+}
+
 /// Walks a field path from a root type, reporting the first failure.
 fn walk_fields(
     ctx: &mut Ctx<'_>,
@@ -907,6 +931,9 @@ fn walk_fields(
     let mut path = Vec::new();
     let mut current = root_ty;
     for (name, span) in fields {
+        // Specification 016 section 4.3: cross as many box layers as needed
+        // to reach the struct that actually owns this field.
+        current = deref_box(&ctx.types, current);
         let Ty::User(id) = current else {
             let owner = ctx.name(current);
             ctx.error(
@@ -1039,18 +1066,40 @@ fn resolve_place<'src>(
 /// applicable, has already been checked. A value that is not a bare place
 /// read (a call result, a fresh `box(...)`, a nested `if`, ...) has no root
 /// to transfer and passes through unchanged.
-fn mark_consumed(ctx: &mut Ctx<'_>, expr: TExpr, span: Span) -> TExpr {
+///
+/// Specification 016 section 6.4 rejects moving a move-only value out of a
+/// field, union payload projection, or automatic box dereference -- only a
+/// bare root (an empty path) may be wholly consumed. A union-test binding
+/// (Specification 016 section 7.3) is the one case where an empty path is
+/// still not a legitimate whole root: it is always a branch-scoped alias to
+/// its tested place's payload, so `env` is consulted to reject that case too.
+fn mark_consumed<'src>(ctx: &mut Ctx<'src>, env: &Env<'src>, expr: TExpr, span: Span) -> TExpr {
     let TExpr::Place(place, _) = expr else {
         return expr;
     };
-    // Specification 016 section 6.4 rejects moving a move-only value out of a
-    // field, union payload, or automatic box dereference; that check belongs
-    // to the next phase of this analysis; so only a bare root -- an empty
-    // path -- is checked for availability here.
-    if place.path.is_empty() {
+    let whole_root = place.path.is_empty() && !is_type_test_alias(env, &place.root);
+    if whole_root {
         check_move(ctx, &place, span);
+    } else if ctx.types.is_move_only(place.ty) {
+        let name = ctx.place_name(&place);
+        ctx.error(
+            span,
+            format!("'{name}' cannot be moved out of; only a complete owning root can be moved"),
+        );
     }
     TExpr::Place(place, UseMode::Consume)
+}
+
+/// Whether `root` currently names a union- or sum-test binding rather than an
+/// ordinary local, parameter, or `self` (Specification 016 section 7.3).
+fn is_type_test_alias<'src>(env: &Env<'src>, root: &PlaceRoot) -> bool {
+    let PlaceRoot::Local(name) = root else {
+        return false;
+    };
+    env.iter()
+        .rev()
+        .find(|binding| binding.name == name.as_str())
+        .is_some_and(|binding| binding.type_test_alias)
 }
 
 /// Specification 016 section 6.2: a consuming use of a move-only root
@@ -1113,7 +1162,7 @@ fn check_value_block<'src>(
                 // expression is always a function/method result, or feeds one
                 // of the other four consuming contexts one level further out
                 // (Specification 016 section 6.2's `if`-arm example).
-                let value = mark_consumed(ctx, value, expression.1);
+                let value = mark_consumed(ctx, env, value, expression.1);
                 result = Some(coerce(ctx, value, ty, expected, expression.1));
             }
             BlockElement::If(form) => {
@@ -1185,12 +1234,19 @@ fn check_arm_condition<'src>(
             let Some(resolved) = resolve_place(ctx, env, &test.place) else {
                 return TCondition::Expr(TExpr::Bool(false));
             };
-            let place = resolved.place;
+            let Resolved { mut place, mutable } = resolved;
+            // Specification 016 section 4.3: `tree is Tree.Branch(branch)`
+            // tests the union stored *through* a `Box<Tree>` subject exactly
+            // as it would a bare `Tree`, so the subject is dereferenced
+            // before checking whether it is a union or an inline sum.
+            place.ty = deref_box(&ctx.types, place.ty);
             match place.ty {
                 Ty::User(id) if ctx.types.union_members(id).is_some() => {
                     match check_type_test(ctx, test, place, id) {
                         Some(checked) => {
-                            bind_type_test(env, test.binding, &checked.binding);
+                            // Specification 016 section 7.3: the binding
+                            // shares the tested place's root mutability.
+                            bind_type_test(env, test.binding, &checked.binding, mutable);
                             TCondition::Test(checked)
                         }
                         None => TCondition::Expr(TExpr::Bool(false)),
@@ -1198,7 +1254,7 @@ fn check_arm_condition<'src>(
                 }
                 Ty::Sum(sum) => match check_sum_type_test(ctx, test, place, sum) {
                     Some(checked) => {
-                        bind_type_test(env, test.binding, &checked.binding);
+                        bind_type_test(env, test.binding, &checked.binding, mutable);
                         TCondition::SumTest(checked)
                     }
                     None => TCondition::Expr(TExpr::Bool(false)),
@@ -1221,19 +1277,27 @@ fn check_arm_condition<'src>(
 }
 
 /// Pushes a proven type-test binding into scope for the arm body, if the
-/// syntactic test carried one.
+/// syntactic test carried one. Specification 012 section 7 originally made
+/// every such binding immutable; Specification 016 section 7.3 generalizes
+/// that to "mutable exactly when the tested place's root is," which reduces
+/// to the old rule whenever the tested root itself is immutable.
 fn bind_type_test<'src>(
     env: &mut Env<'src>,
     written: Option<Spanned<&'src str>>,
     checked: &Option<(String, Ty)>,
+    mutable: bool,
 ) {
     if let (Some((name, _)), Some((_, ty))) = (written, checked) {
         env.push(Binding {
             name,
             ty: *ty,
-            // Specification 012 section 7: a type-test binding is an
-            // immutable root.
-            mutable: false,
+            mutable,
+            // Specification 016 section 7.3: the binding is a branch-scoped
+            // alias to the tested place's active payload, never an
+            // independent owning root, so `mark_consumed` must reject
+            // consuming it whole exactly as it already rejects consuming one
+            // of its fields (Specification 016 section 6.4).
+            type_test_alias: true,
         });
     }
 }
@@ -1422,13 +1486,14 @@ fn check_stmt<'src>(
             let (checked, value_ty) = check_expr(ctx, env, value);
             // Specification 016 section 6.1: initialization is a consuming
             // context.
-            let checked = mark_consumed(ctx, checked, value.1);
+            let checked = mark_consumed(ctx, env, checked, value.1);
             let checked = coerce(ctx, checked, value_ty, declared, value.1);
             declare(ctx, name, *name_span, "Variable");
             env.push(Binding {
                 name,
                 ty: declared,
                 mutable: *mutable,
+                type_test_alias: false,
             });
             TStmt::Let {
                 mutable: *mutable,
@@ -1442,7 +1507,7 @@ fn check_stmt<'src>(
             let (checked, value_ty) = check_expr(ctx, env, value);
             // Specification 016 section 6.1: an assignment's right operand is
             // a consuming context.
-            let checked = mark_consumed(ctx, checked, value.1);
+            let checked = mark_consumed(ctx, env, checked, value.1);
             match target {
                 Some(resolved) => {
                     if !resolved.mutable {
@@ -1451,6 +1516,29 @@ fn check_stmt<'src>(
                             format!(
                                 "'{}' is not declared 'mut' and cannot be assigned",
                                 place.root
+                            ),
+                        );
+                    }
+                    // Specification 016 section 6.3: a move whose source
+                    // overlaps its destination is rejected, including
+                    // `value = value` and a projection assigned from its own
+                    // owning root (e.g. `container.field = container`). A
+                    // source with its own non-empty path is handled instead
+                    // by `mark_consumed`'s subplace-move rejection above, so
+                    // only a whole-root source is checked here.
+                    if ctx.types.is_move_only(resolved.place.ty)
+                        && let TExpr::Place(source, UseMode::Consume) = &checked
+                        && source.path.is_empty()
+                        && overlaps(&resolved.place, source)
+                    {
+                        let dest = ctx.place_name(&resolved.place);
+                        let source_name = ctx.place_name(source);
+                        ctx.error(
+                            value.1,
+                            format!(
+                                "'{source_name}' and '{dest}' overlap, so this assignment \
+                                 cannot destroy '{dest}' before '{source_name}' finishes moving \
+                                 into it"
                             ),
                         );
                     }
@@ -1905,6 +1993,7 @@ fn check_args<'src>(
 ) -> Vec<TArg> {
     let mut checked = Vec::with_capacity(args.len());
     let mut references: Vec<(String, Place, Span)> = Vec::new();
+    let mut moves: Vec<(String, Place, Span)> = Vec::new();
     for (index, arg) in args.iter().enumerate() {
         // An argument with no parameter is already reported as an arity error;
         // it is still checked so its own diagnostics are not swallowed.
@@ -1917,7 +2006,17 @@ fn check_args<'src>(
                 let (value, ty) = check_expr(ctx, env, &arg.value);
                 // Specification 016 section 6.1: a by-value argument is a
                 // consuming context.
-                let value = mark_consumed(ctx, value, arg.value.1);
+                let value = mark_consumed(ctx, env, value, arg.value.1);
+                // Specification 016 section 7.2's closing sentence: a
+                // borrowed allocation cannot be simultaneously moved, so a
+                // whole-root move-only argument joins the same overlap
+                // check as a reference argument in this same call.
+                if let TExpr::Place(place, UseMode::Consume) = &value
+                    && place.path.is_empty()
+                    && ctx.types.is_move_only(place.ty)
+                {
+                    moves.push((param.name.clone(), place.clone(), arg.value.1));
+                }
                 checked.push(TArg::Value(coerce(ctx, value, ty, param.ty, arg.value.1)));
             }
             ParamMode::Reference => match check_reference_arg(ctx, env, arg, param, callee) {
@@ -1929,7 +2028,7 @@ fn check_args<'src>(
             },
         }
     }
-    reject_overlap(ctx, &references, receiver);
+    reject_overlap(ctx, &references, &moves, receiver);
     checked
 }
 
@@ -1957,12 +2056,27 @@ fn check_reference_arg<'src>(
                     ),
                 );
             }
-            // Specification 011 sections 6.1 and 9: exactly `T`. Neither the
-            // `Int64`-to-`Dec64` widening nor represented-type equivalence
-            // applies, because the callee addresses the caller's own storage.
-            if resolved.place.ty != param.ty {
+            let mut place = resolved.place;
+            // Specification 016 section 7.2: a `Box<T>` argument place lends
+            // its pointee to a `Ref<T>` parameter automatically. A `Box<T>`
+            // argument binding to a declared `Ref<Box<T>>` parameter instead
+            // is already an exact match below and needs no special case --
+            // the expected parameter type alone disambiguates, with no new
+            // inference. The overlap check afterward still compares this
+            // place's unchanged root and path, so two lends of the same
+            // allocation (as the box or as its pointee) still overlap.
+            if place.ty != param.ty
+                && let Ty::Box(id) = place.ty
+                && ctx.types.box_pointee(id) == param.ty
+            {
+                place.ty = param.ty;
+            } else if place.ty != param.ty {
+                // Specification 011 sections 6.1 and 9: exactly `T`. Neither
+                // the `Int64`-to-`Dec64` widening nor represented-type
+                // equivalence applies, because the callee addresses the
+                // caller's own storage.
                 let expected = ctx.name(param.ty);
-                let found = ctx.name(resolved.place.ty);
+                let found = ctx.name(place.ty);
                 let name = &param.name;
                 ctx.error(
                     span,
@@ -1976,12 +2090,12 @@ fn check_reference_arg<'src>(
             // it, exactly as an assignment to that place would, so it feeds the
             // same receiver-write fixed point (Specification 010 section 19
             // phase 4). Without this a caller could pass an immutable receiver.
-            if resolved.place.root == PlaceRoot::SelfRef
+            if place.root == PlaceRoot::SelfRef
                 && let Some(method) = ctx.current_method
             {
                 ctx.direct_writes[method.index()] = true;
             }
-            Some(resolved.place)
+            Some(place)
         }
         PlaceOutcome::Reported => None,
         PlaceOutcome::NotAPlace => {
@@ -2021,9 +2135,15 @@ fn overlaps(left: &Place, right: &Place) -> bool {
 /// Specification 011 section 6.4: every pair of reference arguments, and each
 /// reference argument against an addressable method receiver. A temporary
 /// receiver has independent storage and cannot overlap a caller place.
+/// Specification 016 section 7.2's closing sentence extends this through
+/// boxes: `moves` is every whole-root move-only by-value argument in the same
+/// call (Specification 016 Task B's `check_args` collects it alongside
+/// `references`), and none of them may overlap a reference argument either --
+/// a borrowed allocation cannot also be moved out from under the call.
 fn reject_overlap(
     ctx: &mut Ctx<'_>,
     references: &[(String, Place, Span)],
+    moves: &[(String, Place, Span)],
     receiver: Option<&Place>,
 ) {
     for (index, (name, place, span)) in references.iter().enumerate() {
@@ -2053,6 +2173,20 @@ fn reject_overlap(
                 );
             }
         }
+        for (moved_name, moved_place, _) in moves {
+            if overlaps(place, moved_place) {
+                let argument = ctx.place_name(place);
+                let moved = ctx.place_name(moved_place);
+                ctx.error(
+                    *span,
+                    format!(
+                        "reference argument '{argument}' for parameter '{name}' overlaps the \
+                         moved argument '{moved}' for parameter '{moved_name}', so it cannot \
+                         be borrowed in the same call that moves it"
+                    ),
+                );
+            }
+        }
     }
 }
 
@@ -2070,6 +2204,12 @@ fn check_method_call<'src>(
     name_span: Span,
     args: &[Arg<'src>],
 ) -> Option<CheckedCall> {
+    // Specification 016 section 4.3: a method call on a box automatically
+    // dereferences to the pointee before resolution, exactly like field
+    // access. `receiver_ty` itself is left as the caller's static type;
+    // `TReceiver::Place`'s place is unaffected, so lowering (Task C) still
+    // knows the receiver storage is boxed.
+    let receiver_ty = deref_box(&ctx.types, receiver_ty);
     let Ty::User(id) = receiver_ty else {
         let owner = ctx.name(receiver_ty);
         ctx.error(name_span, format!("'{owner}' has no method '{name}'"));
@@ -2299,7 +2439,7 @@ fn check_construct<'src>(
         let expected = fields[index].1;
         // Specification 016 section 6.1: an aggregate constructor argument is
         // a consuming context.
-        let value = mark_consumed(ctx, value, arg.value.1);
+        let value = mark_consumed(ctx, env, value, arg.value.1);
         let value = coerce(ctx, value, ty, expected, arg.value.1);
         checked.push((index, value));
     }
@@ -2602,6 +2742,10 @@ fn check_expr<'src>(
                     if ctx.errors.len() != before {
                         return (TExpr::Nil, Ty::Nil);
                     }
+                    // Specification 016 section 4.3: automatic dereference
+                    // applies here too, since a fresh `box(...)` value (not a
+                    // place) can still be the base of a field chain.
+                    let base_ty = deref_box(&ctx.types, base_ty);
                     let Ty::User(id) = base_ty else {
                         let owner = ctx.name(base_ty);
                         ctx.error(
@@ -2827,6 +2971,13 @@ fn check_expr<'src>(
             // an expression's type), so no separate "storable pointee"
             // validation is needed here.
             let (value, pointee) = check_expr(ctx, env, operand);
+            // Specification 016 section 6.1: allocating a box transfers its
+            // operand's complete value into the new allocation exactly like
+            // an aggregate constructor argument does, so a move-only operand
+            // is a consuming use here too -- otherwise the same already-boxed
+            // place could be boxed again, producing two owners of one
+            // allocation.
+            let value = mark_consumed(ctx, env, value, operand.1);
             let ty = Ty::Box(ctx.types.intern_box(pointee));
             (TExpr::Box(Box::new(value), ty), ty)
         }
@@ -5368,6 +5519,287 @@ mod tests {
              let second: Int64 = first\n\
              let third: Int64 = first\n\
              print(third)",
+        );
+    }
+
+    // RFC 016 Task B (second half): subplace-move rejection, overlapping
+    // source/destination, union-test-binding aliasing through boxes, and
+    // `Ref<T>` lending from `Box<T>` (Specification 016 sections 6.3, 6.4,
+    // 7.2, and 7.3).
+
+    const NODE: &str = "type Node is struct value: Int64, end\n";
+    // `box(...)`'s operand is checked with no expected type (Specification
+    // 016 section 4.2's evaluation rule takes whatever the operand
+    // synthesizes), so `box(Tree.Branch(...))` directly would allocate a
+    // `Box<Tree.Branch>`, not the intended `Box<Tree>` -- injecting a member
+    // into its union already works before a box ever gets involved, so
+    // `leaf` binds the plain `Tree` value (letting that existing injection
+    // run) and boxes the already-widened result.
+    const TREE: &str = "type Tree is union\n\
+         | Empty\n\
+         | Branch is struct value: Int64, left: Box<Tree>, right: Box<Tree>, end\n\
+         end\n\
+         fun leaf(): Box<Tree> do let payload: Tree = Tree.Empty() box(payload) end\n";
+
+    /// Specification 016 section 6.4: a move-only struct field cannot be
+    /// moved out of; only the complete root may be consumed.
+    #[test]
+    fn moving_a_move_only_struct_field_out_is_rejected() {
+        assert_error_contains(
+            "type Holder is struct value: Box<Int64>, end\n\
+             let holder: Holder = Holder(value: box(1))\n\
+             let taken: Box<Int64> = holder.value\n\
+             print(0)",
+            "cannot be moved out of",
+        );
+    }
+
+    /// Specification 016 section 6.4, composed with section 4.3's automatic
+    /// box dereference (Task B's item 6 verification): a move-only field
+    /// reached only by crossing a box is still a subplace, not a root.
+    #[test]
+    fn moving_a_move_only_field_through_an_automatic_box_dereference_is_rejected() {
+        assert_error_contains(
+            "type Holder is struct value: Box<Int64>, end\n\
+             let boxed: Box<Holder> = box(Holder(value: box(1)))\n\
+             let taken: Box<Int64> = boxed.value\n\
+             print(0)",
+            "cannot be moved out of",
+        );
+    }
+
+    /// Specification 016 section 7.3: a union-test binding is a branch-scoped
+    /// alias to its tested place's active payload, never an independent
+    /// owning root, so consuming it whole is a subplace move exactly like
+    /// consuming one of its fields (below) already was.
+    #[test]
+    fn moving_a_union_test_binding_whole_is_rejected() {
+        assert_error_contains(
+            &format!(
+                "{TREE}let payload: Tree = Tree.Branch(value: 1, left: leaf(), right: leaf())\n\
+                 let tree: Box<Tree> = box(payload)\n\
+                 if tree is Tree.Branch(branch) then\n\
+                 let taken: Tree.Branch = branch\n\
+                 end\n\
+                 print(0)"
+            ),
+            "cannot be moved out of",
+        );
+    }
+
+    /// Specification 016 section 7.3: a move-only field of a union-test
+    /// binding is a subplace of the tested root, so moving it out is
+    /// rejected the same way a field of an ordinary place is (Specification
+    /// 016 section 6.4). This is the field-level counterpart to
+    /// `moving_a_union_test_binding_whole_is_rejected` above.
+    #[test]
+    fn moving_a_field_out_of_a_box_wrapped_union_binding_is_rejected() {
+        assert_error_contains(
+            &format!(
+                "{TREE}let payload: Tree = Tree.Branch(value: 1, left: leaf(), right: leaf())\n\
+                 let mut tree: Box<Tree> = box(payload)\n\
+                 if tree is Tree.Branch(branch) then\n\
+                 let taken: Box<Tree> = branch.left\n\
+                 end\n\
+                 print(0)"
+            ),
+            "cannot be moved out of",
+        );
+    }
+
+    /// Specification 016 section 6.4: rejecting a move out of a subplace
+    /// does not prevent reading a sibling copyable field, borrowing or
+    /// mutating the move-only subplace itself, or any of that through an
+    /// automatic box dereference.
+    #[test]
+    fn reading_borrowing_and_mutating_a_move_only_subplace_is_still_accepted() {
+        assert_checks(
+            "type Holder is struct tag: Int64, value: Box<Int64>, end\n\
+             fun touch(value: Ref<Box<Int64>>) do print(1) end\n\
+             let mut holder: Holder = Holder(tag: 1, value: box(2))\n\
+             print(holder.tag)\n\
+             touch(holder.value)\n\
+             holder.value = box(3)\n\
+             let mut boxed: Box<Holder> = box(Holder(tag: 1, value: box(2)))\n\
+             print(boxed.tag)\n\
+             touch(boxed.value)\n\
+             boxed.value = box(4)\n\
+             print(0)",
+        );
+    }
+
+    /// Specification 016 section 6.3: `value = value` is a move whose source
+    /// overlaps its destination -- the source is available (this is its
+    /// first use), so nothing else would reject it.
+    #[test]
+    fn assigning_a_move_only_place_to_itself_is_rejected() {
+        assert_error_contains(
+            "let mut first: Box<Int64> = box(1)\n\
+             first = first\n\
+             print(0)",
+            "overlap",
+        );
+    }
+
+    /// Specification 016 section 6.3: a destination that is a projection of
+    /// its own source overlaps it too, not just an identical place. (The
+    /// source here also fails the assignment's ordinary type check, since a
+    /// field can never share its containing struct's exact type without
+    /// going through a box and this RFC gives boxing its own consuming node
+    /// rather than a bare place -- but the overlap diagnostic is independent
+    /// of that and still fires.)
+    #[test]
+    fn assigning_a_container_from_its_own_projection_is_rejected() {
+        assert_error_contains(
+            "type Wrapper is struct inner: Box<Int64>, other: Box<Int64>, end\n\
+             let mut w: Wrapper = Wrapper(inner: box(1), other: box(2))\n\
+             w.inner = w\n\
+             print(0)",
+            "overlap",
+        );
+    }
+
+    /// Specification 016 section 6.3: two different roots never overlap, so
+    /// an ordinary reassignment between them is unaffected by the new checks.
+    #[test]
+    fn a_non_overlapping_move_only_reassignment_is_still_accepted() {
+        assert_checks(
+            "let mut a: Box<Int64> = box(1)\n\
+             let b: Box<Int64> = box(2)\n\
+             a = b\n\
+             print(0)",
+        );
+    }
+
+    /// Specification 016 section 7.3's worked example: testing a
+    /// `Box<Tree>`-typed union member binds a branch-scoped alias whose
+    /// fields may be read, mutated (the tested root is `mut`), and lent to a
+    /// `Ref<T>` parameter -- `branch.left`/`branch.right` are `Box<Tree>`
+    /// fields passed to a plain `Ref<Tree>` parameter, exercising Specification
+    /// 016 section 7.2's automatic pointee lending through the alias.
+    #[test]
+    fn a_box_wrapped_union_binding_permits_read_borrow_and_mutation_through_a_mutable_root() {
+        assert_checks(&format!(
+            "{TREE}fun touch(node: Ref<Tree>) do print(1) end\n\
+             let payload: Tree = Tree.Branch(value: 1, left: leaf(), right: leaf())\n\
+             let mut tree: Box<Tree> = box(payload)\n\
+             if tree is Tree.Branch(branch) then\n\
+             print(branch.value)\n\
+             touch(branch.left)\n\
+             touch(branch.right)\n\
+             branch.value = 2\n\
+             end\n\
+             print(0)"
+        ));
+    }
+
+    /// Specification 016 section 7.3: the binding is mutable only when the
+    /// tested place's root is. This is the same rule
+    /// `a_type_test_binding_is_an_immutable_root` already covers for an
+    /// unboxed union; this proves it still holds through a `Box<T>` subject.
+    #[test]
+    fn a_box_wrapped_union_binding_is_immutable_when_its_root_is_immutable() {
+        assert_error_contains(
+            &format!(
+                "{TREE}let payload: Tree = Tree.Branch(value: 1, left: leaf(), right: leaf())\n\
+                 let tree: Box<Tree> = box(payload)\n\
+                 if tree is Tree.Branch(branch) then\n\
+                 branch.value = 2\n\
+                 end\n\
+                 print(0)"
+            ),
+            "'branch' is not declared 'mut' and cannot be assigned",
+        );
+    }
+
+    /// Specification 016 section 7.2's worked example: a `Box<T>` argument
+    /// place automatically lends its pointee to a `Ref<T>` parameter, and the
+    /// call may both read and mutate through the lent reference without
+    /// consuming the box -- `node` is still usable afterward.
+    #[test]
+    fn a_box_argument_automatically_lends_its_pointee_to_a_ref_parameter() {
+        let program = assert_checks(&format!(
+            "{NODE}fun increment(node: Ref<Node>) do node.value = node.value + 1 end\n\
+             let mut node: Box<Node> = box(Node(value: 10))\n\
+             increment(node)\n\
+             print(node.value)"
+        ));
+        let args = top_level_args(&program);
+        let TArg::Reference(place) = &args[0] else {
+            panic!("a boxed argument lent to 'Ref<T>' should stay a reference argument");
+        };
+        assert_eq!(place.root, PlaceRoot::Local("node".into()));
+        assert!(place.path.is_empty());
+        // The lent place's type is the pointee, matching the parameter's
+        // referent type exactly, not the argument's own `Box<Node>` type.
+        assert_eq!(place.ty, program.funcs["increment"].params[0].ty);
+    }
+
+    /// Specification 016 section 7.2: a `Box<T>` argument may instead bind to
+    /// a declared `Ref<Box<T>>` parameter, borrowing the box itself rather
+    /// than lending its pointee -- the declared parameter type disambiguates
+    /// with no new inference, and this is just an exact-type match, so it
+    /// needs no special-casing beyond what already exists.
+    #[test]
+    fn a_box_argument_binds_to_a_declared_ref_of_box_parameter_instead_of_lending_its_pointee() {
+        let program = assert_checks(&format!(
+            "{NODE}fun replace(node: Ref<Box<Node>>) do node = box(Node(value: 0)) end\n\
+             let mut node: Box<Node> = box(Node(value: 10))\n\
+             replace(node)\n\
+             print(node.value)"
+        ));
+        let args = top_level_args(&program);
+        let TArg::Reference(place) = &args[0] else {
+            panic!("a 'Ref<Box<T>>' parameter should still receive a reference argument");
+        };
+        assert!(matches!(place.ty, Ty::Box(_)));
+        assert_eq!(place.ty, program.funcs["replace"].params[0].ty);
+    }
+
+    /// Specification 016 section 7.2: "mutation requires a mutable
+    /// originating root" applies to a lent pointee exactly as it already
+    /// does to an ordinary `Ref<T>` argument.
+    #[test]
+    fn lending_a_box_argument_still_requires_its_root_to_be_declared_mut() {
+        assert_error_contains(
+            &format!(
+                "{NODE}fun increment(node: Ref<Node>) do node.value = node.value + 1 end\n\
+                 let node: Box<Node> = box(Node(value: 10))\n\
+                 increment(node)\n\
+                 print(0)"
+            ),
+            "'node' is not declared 'mut', so it cannot be passed to the reference parameter",
+        );
+    }
+
+    /// Specification 011 section 6.4, extended through boxes: lending the
+    /// same box's pointee to two parameters in the same call still overlaps,
+    /// exactly like passing the same plain place twice already did.
+    #[test]
+    fn passing_the_same_boxed_pointee_twice_in_one_call_is_rejected_as_overlapping() {
+        assert_error_contains(
+            &format!(
+                "{NODE}fun swap_values(a: Ref<Node>, b: Ref<Node>) do print(1) end\n\
+                 let mut node: Box<Node> = box(Node(value: 10))\n\
+                 swap_values(node, node)\n\
+                 print(0)"
+            ),
+            "reference arguments 'node' and 'node' overlap",
+        );
+    }
+
+    /// Specification 016 section 7.2's closing sentence: a borrowed
+    /// allocation cannot also be moved out from under the same call.
+    #[test]
+    fn moving_a_boxed_argument_while_borrowing_its_pointee_in_the_same_call_is_rejected() {
+        assert_error_contains(
+            &format!(
+                "{NODE}fun consume_and_peek(taken: Box<Node>, peek: Ref<Node>) do print(1) end\n\
+                 let mut node: Box<Node> = box(Node(value: 10))\n\
+                 consume_and_peek(node, node)\n\
+                 print(0)"
+            ),
+            "overlaps the moved argument",
         );
     }
 }
