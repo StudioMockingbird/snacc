@@ -1,6 +1,6 @@
 # Specification 009: Fixed-Width Unsigned Integers and `Float32`
 
-Status: Proposed
+Status: Closed
 
 Document kind: Language semantics (ISO/IEC-style specification)
 
@@ -25,7 +25,7 @@ and phase boundaries are fixed in section 8.
 
 ## 2. Normative reference
 
-[The Snacc language contract](../../LANGUAGE.md) is normative. This document
+[The Snacc language contract](../../../LANGUAGE.md) is normative. This document
 defines the change to that contract. If implementation and the updated contract
 disagree, the implementation is nonconforming.
 

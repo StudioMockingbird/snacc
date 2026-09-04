@@ -1,8 +1,29 @@
-# snacc
+# SNACC — Super Nibbly and Comfy Compiler
 
 Snacc is a statically typed AOT language inspired by C, Luau, and Crystal. Its
 Rust compiler uses Chumsky for the frontend and Inkwell with LLVM 22 for native
 code generation; the influences are not compatibility targets.
+
+## Language Goals & Philosophy
+
+1. Snacc should be cohesive, coherent, consistent, uniform, and intuitive overall.
+2. There should be only one obvious way to do things.
+3. The language surface must remain small and clean.
+4. Prioritize simplicity, elegance, expressiveness, and composability.
+5. Snacc aims to be a "better C." Users should be able to do everything with
+   Snacc that they can do with C, but with modern sensibilities.
+6. Snacc should be statically typed.
+7. The compiler should be incremental: recompile only the module that changed.
+8. Compilation should be fast.
+9. Concurrency and multithreading should be straightforward.
+10. Keep ceremony low by minimizing boilerplate and syntactic noise.
+11. Promote readability over compactness and complicated instructions.
+12. Aim for no or low runtime overhead.
+13. The language should have no undefined behavior.
+14. "If it compiles, it runs."
+15. "If it compiles, it has no memory errors." The compiler should catch every
+    memory error that local analysis can detect without adding a language
+    concept or disproportionate checker complexity.
 
 ## Architecture
 
@@ -100,4 +121,4 @@ beside the operation it protects.
 - Active specifications cite `LANGUAGE.md`, not archived specifications, for
   authoritative language rules.
 - A specification is implementation-ready only when it has no open design
-  questions and contains a detailed implementation plan.
+  questions and contains a section for detailed implementation plan.

@@ -1,6 +1,3 @@
-(* This file is a convenience copy of the grammar in LANGUAGE.md.
-   LANGUAGE.md is the normative language contract. *)
-
 program              = { top-level-declaration | block-element } ;
 
 top-level-declaration
@@ -35,7 +32,10 @@ reference-parameter-type
 sum-type             = primary-value-type, { "|", primary-value-type } ;
 primary-value-type   = builtin-value-type
                      | qualified-name
+                     | parameterized-value-type
                      | "(", sum-type, ")" ;
+parameterized-value-type
+                     = "Box", "<", sum-type, ">" ;
 unsigned-type        = "UInt8" | "UInt16" | "UInt32" | "UInt64" ;
 builtin-value-type   = "Int64" | "Dec64" | "Bool" | "Nil"
                      | unsigned-type
@@ -79,8 +79,10 @@ atom                 = literal
                      | "self"
                      | builtin-value-type
                      | list-literal
+                     | box-expression
                      | print-expression
                      | "(", expression, ")" ;
+box-expression       = "box", "(", expression, ")" ;
 print-expression     = "print", "(", expression, ")" ;
 list-literal         = "[", [ expression, { ",", expression }, [ "," ] ], "]" ;
 literal              = float32-literal | unsigned-literal | decimal-literal

@@ -6,16 +6,19 @@ Document kind: Language semantics (ISO/IEC-style specification)
 
 ## 1. Proposal state
 
-This implementation-ready specification defines immutable owned UTF-8 strings,
-byte and Unicode scalar types, zero-copy borrowed views, inline sum results,
-concatenation, interpolation, and raw string literals.
+This implementation-ready specification defines immutable owned UTF-8 strings, byte and Unicode
+scalar types, zero-copy borrowed views, inline sum results, concatenation,
+interpolation, and raw string literals.
 
 `LANGUAGE.md` remains authoritative. Until this specification is accepted,
 implemented, and incorporated there, the syntax and semantics below are not
 part of Snacc.
 
-This specification contains no open design questions. Section 16 fixes the
-implementation order and phase boundaries.
+Section 16 fixes the implementation order and phase boundaries.
+
+Section 20.1 records the associated-function decision shared with the I/O and
+error specifications. The remaining implementation choices in this document
+are fixed by the rules and phases below.
 
 ## 2. Scope
 
@@ -47,10 +50,12 @@ strings, or string-bearing Rust bridge signatures.
 ## 3. Dependencies and terminology
 
 This specification assumes the ownership and cleanup analysis established by
-[RFC 016](016-box-indirection-and-recursive-data.md). `String` is a move-only
+[RFC 016](archive/016-box-indirection-and-recursive-data.md). `String` is a move-only
 owned value, while views are non-owning borrows. It also assumes the inline sum
-types established by [Specification 018](018-inline-sum-types.md), which must be
+types established by [Specification 018](archive/018-inline-sum-types.md), which must be
 implemented before the fallible operations in this specification.
+The canonical `Float64` spelling used by concatenation and printing follows
+[Specification 020](020-literal-cleanup-and-numeric-radices.md).
 
 The spelling `Byte` replaces `UInt8` as the sole source name for an unsigned
 8-bit integer. There is no `UInt8` alias or compatibility spelling. This is the
@@ -131,9 +136,11 @@ display cell.
 UTF-8. Every `String` contains valid UTF-8. It is length-delimited, is not
 implicitly NUL-terminated, and may contain the zero scalar.
 
-The representation is private. The baseline representation may be an owned
-byte allocation plus byte length. Capacity, static literal storage, and inline
-short storage are implementation details that programs cannot observe.
+The representation is private. The baseline representation is one uniform
+heap-backed descriptor containing an owned byte allocation, byte length, and
+capacity. Capacity, static literal storage, and inline short storage are
+implementation details that programs cannot observe; the first implementation
+does not require short-string storage.
 
 ### 6.2 Immutability
 
@@ -160,7 +167,7 @@ under RFC 016's whole-value move rules.
 ~~~snacc
 let first: String = "hello"
 let second: String = first
-let byte_count: Int64 = first.bytes().count()
+let byte_count: Int64 = first.bytes().length()
 ~~~
 
 The final statement is a use-after-move error.
@@ -201,6 +208,10 @@ A double-quoted literal produces a `String`:
 ~~~snacc
 let message: String = "Hello, 🍪"
 ~~~
+
+This section replaces the current contract's statement that string escape forms
+are merely reserved syntax: the forms listed below are now implemented syntax
+once this specification lands.
 
 Supported escapes are `\0`, `\n`, `\r`, `\t`, `\\`, `\"`, `\{`, `\}`, and
 `\u{H...}`, where `H...` contains one through six hexadecimal digits and must
@@ -261,10 +272,10 @@ encoding:
 ~~~snacc
 let text: String = "café"
 let bytes: View<Byte> = text.bytes()
-print(bytes.count())
+print(bytes.length())
 ~~~
 
-`bytes.count()` is the UTF-8 byte count and is O(1). For this example it is 5.
+`bytes.length()` is the UTF-8 byte count and is O(1). For this example it is 5.
 
 `bytes.at(index)` returns `Byte | Nil`. It is O(1), uses a zero-based `Int64`
 index, and returns `nil` for a negative or out-of-range index.
@@ -281,10 +292,10 @@ string's UTF-8 storage lazily:
 ~~~snacc
 let text: String = "café"
 let scalars: View<Unicode> = text.unicode()
-print(scalars.count())
+print(scalars.length())
 ~~~
 
-`scalars.count()` returns 4 and is O(n) in the byte length.
+`scalars.length()` returns 4 and is O(n) in the byte length.
 
 `scalars.scalar_at(index)` returns `Unicode | Nil`. It uses a zero-based
 `Int64` scalar index, returns `nil` for a negative or out-of-range index, and
@@ -307,7 +318,8 @@ borrowed types.
 They may appear as temporary expressions, local bindings, and function or
 method parameters. They may not be boxed, returned from user declarations,
 placed in static storage, stored inside a non-borrowed value, or sent to another
-thread. A borrowed type cannot cross a Rust bridge in this version.
+thread. A borrowed type cannot cross a Rust bridge in RFC 017's first version;
+Specification 019 later defines the permitted `View<T>` bridge exception.
 
 A struct, named union, or inline sum containing a view is therefore permitted,
 but the complete aggregate inherits the view's source identity and restrictions.
@@ -324,7 +336,7 @@ that interval, the source string cannot be moved, reassigned, or destroyed:
 ~~~snacc
 let mut text: String = "hello"
 let bytes: View<Byte> = text.bytes()
-print(bytes.count())
+print(bytes.length())
 text = "goodbye"
 ~~~
 
@@ -334,7 +346,7 @@ This is valid because the view's last use precedes the assignment.
 let mut text: String = "hello"
 let bytes: View<Byte> = text.bytes()
 text = "goodbye"
-print(bytes.count())
+print(bytes.length())
 ~~~
 
 This is rejected because replacement would invalidate a live view. Branch and
@@ -359,7 +371,7 @@ for that call. The expected type makes the interpretation unambiguous:
 
 ~~~snacc
 fun checksum(bytes: View<Byte>): Int64 do
-    bytes.count()
+    bytes.length()
 end
 
 let text: String = "hello"
@@ -419,7 +431,7 @@ their textual contents in order, and leaves both operands available. It never
 modifies the receiver.
 
 The accepted part types are `String`, `View<Unicode>`, `Unicode`, `Byte`,
-`Int64`, `UInt16`, `UInt32`, `UInt64`, `Float32`, `Dec64`, and `Bool`. Numeric
+`Int64`, `UInt16`, `UInt32`, `UInt64`, `Float32`, `Float64`, and `Bool`. Numeric
 and Boolean formatting is exactly the scalar formatting used by `print`.
 `Byte` is formatted as its decimal value, not inserted as an unchecked UTF-8
 byte. `View<Byte>`, unions, and user-defined types are rejected.
@@ -559,11 +571,11 @@ Specification 018. No `Option<T>` or operation-specific wrapper type is added:
 
 | Operation | Result |
 | --- | --- |
-| `View<Byte>.at` | `Byte | Nil` |
-| `View<Byte>.slice` | `View<Byte> | Nil` |
-| `View<Unicode>.scalar_at` | `Unicode | Nil` |
-| `View<Unicode>.slice` | `View<Unicode> | Nil` |
-| `String.from_utf8` | `String | Nil` |
+| `View<Byte>.at` | `Byte \| Nil` |
+| `View<Byte>.slice` | `View<Byte> \| Nil` |
+| `View<Unicode>.scalar_at` | `Unicode \| Nil` |
+| `View<Unicode>.slice` | `View<Unicode> \| Nil` |
+| `String.from_utf8` | `String \| Nil` |
 
 A direct value injects as its exact sum member, while `nil` selects `Nil`.
 Callers decompose the result with `is`:
@@ -593,6 +605,10 @@ all restrictions in section 9.4. `String | Nil` is move-only because its
    second suffix or accept unsuffixed literals contextually.
 3. Add distinct tokens or structured token contents for Unicode scalar,
    interpreted string, raw string, literal segment, and interpolation boundary.
+    Parse an interpreted literal into one ordered segment node containing literal
+    byte segments and interpolation-expression syntax nodes; type-check those
+    expressions in the normal checker phase, and do not retain source text for a
+    later reparse.
 4. Decode escapes and validate Unicode scalars once in the lexer while
    preserving exact source spans for malformed contents.
 5. Implement raw delimiters with 0 through 255 matching `#` characters,
@@ -600,7 +616,10 @@ all restrictions in section 9.4. `String | Nil` is move-only because its
 6. Parse interpolation expressions with balanced nested syntax and produce one
    source-spanned interpolation expression rather than reparsing literal text
    in a later phase.
-7. Add syntax tests for every delimiter, escape, malformed scalar, malformed
+7. Add the `static Type.name(...) do ... end` declaration form for associated
+   functions, reserving `static` and preserving `method` for receiver-bearing
+   declarations.
+8. Add syntax tests for every delimiter, escape, malformed scalar, malformed
    UTF-8 input, multiline raw literal, and interpolation nesting case.
 
 ### Phase 2: semantic types and operations
@@ -614,6 +633,8 @@ all restrictions in section 9.4. `String | Nil` is move-only because its
    ownership properties.
 4. Add checked built-in operations for `clone`, `bytes`, `unicode`, `count`,
    `at`, `scalar_at`, `slice`, `from_unicode`, `from_utf8`, and `concat`.
+   Resolve `from_unicode` and `from_utf8` through the `static` associated-function
+   path, which is also available to user-defined types.
 5. Assign the exact inline sum from section 15 to every fallible built-in and
    inject its direct success member or contextual `nil` through ordinary sum
    checking.
@@ -674,12 +695,15 @@ all restrictions in section 9.4. `String | Nil` is move-only because its
 1. Add the runtime imports required for length-delimited UTF-8 printing,
    allocation support not already supplied by RFC 016, and fatal string
    failures.
-2. Advance the compiler/runtime ABI from RFC 016's implemented ABI successor
-   to the next version and reject incompatible runtimes and cached artifacts.
+2. If the uniform `String` descriptor changes the physical compiler/runtime
+   bridge, assign the explicit ABI successor under the shared ABI policy and
+   reject incompatible runtimes and cached artifacts. Source-only changes do
+   not bump the ABI.
 3. Keep `Byte`'s native representation and bridge mapping equal to the former
    `UInt8` mapping while updating generated source assertions and diagnostics.
-4. Reject `String` and both view types in Rust bridge signatures in the first
-   version.
+4. Reject `String` and both view types in RFC 017's first-version Rust bridge
+   signatures; Specification 019's later generalized view bridge is handled by
+   its own bridge phase.
 5. Update examples, the conformance runner, formatter-facing syntax data, and
    syntax highlighting where present. Do not expand the temporary workbench
    beyond what is required to keep it functional.
@@ -729,7 +753,8 @@ Implementation is complete only when:
    and allocate the final string once;
 13. embedded zero bytes do not truncate string operations or output;
 14. no core stack-string or short-string source type is introduced;
-15. strings and views cannot cross the first-version Rust bridge;
+15. strings and views cannot cross RFC 017's first-version Rust bridge (subject
+    to Specification 019's later `View<T>` bridge exception);
 16. all invalid dynamic conditions terminate or return the specified union
     result and never cause undefined behavior;
 17. `LANGUAGE.md`, both grammar copies, parser, checker, lowering, runtime, and
@@ -750,8 +775,48 @@ Implementation is complete only when:
 - Rust bridge adapters for `&str`, `String`, and `&[u8]`;
 - returning or storing views through explicit lifetime relationships.
 
-## 20. References
+## 20. Findings from Specification 023
+
+Specification 023 builds its whole surface on `String` and `View<Byte>` and
+surfaced three items that belong here. The first is a gap in this
+specification's own text, not in the dependent one.
+
+**20.1 Associated functions are part of the language. (decided)** Calls such
+as `String.from_utf8(view)`, `String.from_unicode(view)`, `File.open(path)`,
+and `TcpListener.bind(address)` use real type-namespaced associated functions.
+Their declaration form is `static` followed by a qualified type and function
+name:
+
+~~~snacc
+static String.from_utf8(view: View<Byte>): String | Nil do
+    ...
+end
+~~~
+
+A `static` function has no implicit `self`; a `method` continues to require one
+receiver and its existing `self` binding. The resolver accepts `static`
+functions on user-defined and predeclared types while preserving the existing
+distinction between constructors, methods, and top-level functions.
+
+**20.2 The runtime must construct a `String` across the private ABI.**
+Specification 023's `read_text` and Specification 024's `Error` fields use owned strings
+produced by `snacc-runtime`, so the runtime allocates through Snacc's allocator
+and writes this specification's uniform descriptor representation. Section 6.1
+keeps that representation private to one compiler build, which stays true --
+the runtime is inside that build -- but it means the runtime versions together
+with the string implementation and that any representation change is a runtime
+change too.
+
+**20.3 Operating-system paths are not `String`.** Specification 023 section
+15.24 accepts `String` paths and records the consequence: Windows paths are
+UTF-16 with unpaired surrogates permitted and Unix paths are arbitrary bytes,
+so a `String`'s UTF-8 invariant makes some real files unnameable. If the answer
+is a `Path` type or a byte-oriented path form, it is a string-family decision
+and belongs with this specification's successor rather than with I/O.
+
+## 21. References
 
 - [`LANGUAGE.md`](../../LANGUAGE.md)
-- [RFC 016: Box Indirection and Recursive Data Structures](016-box-indirection-and-recursive-data.md)
-- [Specification 018: Inline Sum Types](018-inline-sum-types.md)
+- [RFC 016: Box Indirection and Recursive Data Structures](archive/016-box-indirection-and-recursive-data.md)
+- [Specification 018: Inline Sum Types](archive/018-inline-sum-types.md)
+- [Specification 020: Literal Cleanup and Numeric Radices](020-literal-cleanup-and-numeric-radices.md)

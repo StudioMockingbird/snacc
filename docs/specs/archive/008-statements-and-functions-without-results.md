@@ -1,6 +1,6 @@
 # RFC 008: Statements, Functions Without Results, and `break`
 
-Status: Proposed
+Status: Closed
 
 Document kind: Feature specification (Rust-style RFC)
 
@@ -441,7 +441,7 @@ case. A later loop-expression feature can be designed independently.
 
 ## References
 
-- [Language contract](../../LANGUAGE.md)
+- [Language contract](../../../LANGUAGE.md)
 - [Specification 010](010-nominal-types-structs-unions-and-methods.md)
 - [Specification 012](012-variable-declarations-assignments-and-member-mutability.md)
-- [Archived bridge signature RFC](archive/007-bridge-signature-verification.md)
+- [Archived bridge signature RFC](007-bridge-signature-verification.md)

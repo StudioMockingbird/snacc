@@ -1,6 +1,6 @@
 # Specification 010: Nominal Types, Structs, Unions, and Methods
 
-Status: Proposed
+Status: Closed
 
 Document kind: Language semantics (ISO/IEC-style specification)
 
@@ -25,7 +25,7 @@ and phase boundaries are fixed in section 19.
 
 ## 2. Normative reference and dependency
 
-[The Snacc language contract](../../LANGUAGE.md) is normative. This document
+[The Snacc language contract](../../../LANGUAGE.md) is normative. This document
 defines the change to that contract. If the implementation and the updated
 contract disagree, the implementation is nonconforming.
 

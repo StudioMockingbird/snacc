@@ -1,0 +1,14 @@
+// RFC 016 conformance: allocation, automatic field access, mutation through
+// a mutable box root, and whole-value replacement.
+type Node is struct
+    value: Int64,
+end
+
+let mut node: Box<Node> = box(Node(value: 1))
+print(node.value)
+node.value = 2
+print(node.value)
+
+let replacement: Box<Node> = box(Node(value: 3))
+node = replacement
+print(node.value)

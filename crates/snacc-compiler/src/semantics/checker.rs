@@ -177,7 +177,14 @@ pub enum TArg {
 /// backend gives compiler-owned storage (Specification 010 section 15.3).
 pub enum TReceiver {
     Place(Place),
-    Value(TExpr),
+    /// A receiver with no addressable place of its own (a temporary, such as
+    /// a fresh `box(...)` or a call result). `Ty` is the value's own checked
+    /// static type, un-dereferenced -- exactly what `Place::ty` already
+    /// carries for the `Place` variant, so lowering (Specification 016
+    /// section 4.3) can peel the same number of `Box<T>` layers regardless
+    /// of which variant a call reached, even though a box's own LLVM value
+    /// never reveals its pointee type on its own.
+    Value(TExpr, Ty),
 }
 
 pub struct TMethodCall {
@@ -197,9 +204,17 @@ pub enum TExpr {
     /// context, set by `mark_consumed` after `check_expr` produces this node
     /// and before any coercion wraps it.
     Place(Place, UseMode),
-    /// Reads one field of a value that has no addressable storage.
+    /// Reads one field of a value that has no addressable storage. `base_ty`
+    /// is `base`'s own checked type, not yet automatically dereferenced --
+    /// unlike `Print`'s trailing `Ty`, `base_ty` here exists so lowering
+    /// (Specification 016 section 4.3) knows how many `Box<T>` layers, if
+    /// any, to peel before reading `base`'s field, since a fresh `box(...)`
+    /// value (not a place) can be the base of a field chain and the backend
+    /// cannot recover that from `base`'s own lowered LLVM value (every box,
+    /// regardless of pointee, lowers to the same opaque pointer type).
     FieldRead {
         base: Box<TExpr>,
+        base_ty: Ty,
         index: usize,
         ty: Ty,
     },
@@ -307,6 +322,14 @@ pub enum TStmt {
     Assign {
         place: Place,
         value: TExpr,
+        /// Specification 016 section 6.3: an assignment to a move-only place
+        /// that currently holds a live value must destroy that old value
+        /// before the new one is installed. False for a copyable
+        /// destination (nothing to destroy) and for a whole-root
+        /// destination that is currently moved (reinitializing a moved
+        /// mutable local, section 6.3's closing sentence, installs a value
+        /// where none was live).
+        drop_before: bool,
     },
     While {
         condition: TExpr,
@@ -337,6 +360,14 @@ pub struct TStmtIf {
 pub struct TBlock {
     pub statements: Vec<TStmt>,
     pub result: Option<TExpr>,
+    /// Specification 016 section 8.1's checked cleanup plan: every local
+    /// declared directly in this block that is still available (not moved)
+    /// when its scope ends normally, in reverse declaration order (the last
+    /// local bound is the first destroyed). Always whole roots (`path` is
+    /// always empty); a copyable local never appears here, and a union- or
+    /// sum-test alias never does either, since it never owns anything
+    /// (Specification 016 section 6.4).
+    pub drops: Vec<Place>,
 }
 
 pub struct TFunc {
@@ -344,6 +375,12 @@ pub struct TFunc {
     /// `None` is a function without a result; it lowers to LLVM `void`.
     pub result: Option<Ty>,
     pub body: TBlock,
+    /// Specification 016 section 8.1: by-value parameters still available
+    /// (not moved into a result or elsewhere) when the body finishes
+    /// normally, in reverse parameter order, destroyed just before the
+    /// function returns -- after the body's own locals (`body.drops`),
+    /// since parameters were bound before any of them.
+    pub param_drops: Vec<Place>,
 }
 
 pub struct TMethod {
@@ -355,6 +392,10 @@ pub struct TMethod {
     /// no source-level method category and is not part of the signature.
     pub writes_receiver: bool,
     pub body: TBlock,
+    /// Same meaning as [`TFunc::param_drops`]. `self` is never included: a
+    /// receiver is always borrowed (Specification 010 section 15.3), never
+    /// owned by the method body.
+    pub param_drops: Vec<Place>,
 }
 
 pub struct TExtern {
@@ -550,12 +591,19 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
             Some(expected) => check_value_block(&mut ctx, &mut env, &function.body, expected),
             None => check_statement_block(&mut ctx, &mut env, &function.body),
         };
+        // Specification 016 section 8.1: computed after the body, from the
+        // move state at the exact point it finished, exactly like a block's
+        // own `drops` -- `env` still holds only the parameters here, since
+        // `check_value_block`/`check_statement_block` always restore `env`
+        // to its entry state before returning.
+        let param_drops = compute_drops(&ctx, &env, 0);
         typed_funcs.insert(
             name.to_string(),
             TFunc {
                 params,
                 result,
                 body,
+                param_drops,
             },
         );
     }
@@ -583,6 +631,11 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
             Some(expected) => check_value_block(&mut ctx, &mut env, &declaration.body, expected),
             None => check_statement_block(&mut ctx, &mut env, &declaration.body),
         };
+        // Specification 016 section 8.1: same reasoning as a function's
+        // `param_drops` above; `self` is never included since `env` never
+        // held a binding for it (a receiver is reached through
+        // `ctx.self_ty`/`PlaceRoot::SelfRef`, never through `env`).
+        let param_drops = compute_drops(&ctx, &env, 0);
         ctx.current_method = None;
         ctx.self_ty = None;
         typed_methods.push(TMethod {
@@ -592,6 +645,7 @@ pub fn check<'src>(program: &AstProgram<'src>) -> Result<Program, Failure> {
             result,
             writes_receiver: false,
             body,
+            param_drops,
         });
     }
 
@@ -1137,6 +1191,37 @@ fn merge_moves(exits: Vec<HashMap<PlaceRoot, Span>>) -> HashMap<PlaceRoot, Span>
     merged
 }
 
+/// Specification 016 section 8.1's checked cleanup plan: every binding in
+/// `env[scope..]` (a block's own locally declared bindings, or -- called
+/// with `scope: 0` once a function/method body finishes -- its parameters)
+/// that is move-only and still available (absent from `ctx.move_state`) at
+/// this exact point, in reverse declaration order so the last one bound is
+/// the first destroyed (spec: "locals drop in reverse successful-
+/// initialization order"). A union-/sum-test alias is excluded even though
+/// its own path is empty: it is never an independent owning root
+/// (`type_test_alias`'s own doc comment), so it is never a legitimate drop
+/// target any more than it is a legitimate whole-root move.
+fn compute_drops(ctx: &Ctx<'_>, env: &Env<'_>, scope: usize) -> Vec<Place> {
+    let mut drops: Vec<Place> = env[scope..]
+        .iter()
+        .filter(|binding| {
+            !binding.type_test_alias
+                && ctx.types.is_move_only(binding.ty)
+                && !ctx
+                    .move_state
+                    .contains_key(&PlaceRoot::Local(binding.name.to_string()))
+        })
+        .map(|binding| Place {
+            root: PlaceRoot::Local(binding.name.to_string()),
+            root_ty: binding.ty,
+            path: Vec::new(),
+            ty: binding.ty,
+        })
+        .collect();
+    drops.reverse();
+    drops
+}
+
 /// Checks a block that must supply a value of `expected`. Every element but
 /// the last is a statement; the last shall be a value-producing expression or
 /// a value-form `if`.
@@ -1188,8 +1273,13 @@ fn check_value_block<'src>(
             format!("this block must end in an expression of type '{name}', but it is empty"),
         );
     }
+    let drops = compute_drops(ctx, env, scope);
     env.truncate(scope);
-    TBlock { statements, result }
+    TBlock {
+        statements,
+        result,
+        drops,
+    }
 }
 
 /// Checks a block with no required final value. Every element is a statement;
@@ -1205,10 +1295,12 @@ fn check_statement_block<'src>(
         .iter()
         .map(|element| check_stmt(ctx, env, element))
         .collect();
+    let drops = compute_drops(ctx, env, scope);
     env.truncate(scope);
     TBlock {
         statements,
         result: None,
+        drops,
     }
 }
 
@@ -1548,6 +1640,20 @@ fn check_stmt<'src>(
                     {
                         ctx.direct_writes[method.index()] = true;
                     }
+                    // Specification 016 section 6.3: the old destination is
+                    // destroyed before the new value is installed, unless
+                    // there is nothing live there to destroy -- either the
+                    // destination is copyable, or it is a whole root that is
+                    // currently moved (reinitializing a moved mutable local,
+                    // the closing sentence below, installs a value where
+                    // none was live). A field destination (non-empty path)
+                    // always has a live value: the checker requires every
+                    // field of a constructed aggregate to be initialized, so
+                    // there is no partially-built aggregate a field
+                    // assignment could be reaching into.
+                    let drop_before = ctx.types.is_move_only(resolved.place.ty)
+                        && !(resolved.place.path.is_empty()
+                            && ctx.move_state.contains_key(&resolved.place.root));
                     // Specification 016 section 6.3's closing sentence:
                     // assigning the whole root installs a fresh value, so it
                     // is available again regardless of whether it was moved.
@@ -1559,6 +1665,7 @@ fn check_stmt<'src>(
                     TStmt::Assign {
                         place: resolved.place,
                         value: checked,
+                        drop_before,
                     }
                 }
                 None => TStmt::Expr(checked),
@@ -1915,7 +2022,7 @@ fn check_call<'src>(
                         ctx,
                         env,
                         span,
-                        TReceiver::Value(value),
+                        TReceiver::Value(value, ty),
                         ty,
                         false,
                         false,
@@ -2243,7 +2350,7 @@ fn check_method_call<'src>(
     // overlap checking for the complete call, whether or not the method writes.
     let receiver_place = match &receiver {
         TReceiver::Place(place) => Some(place.clone()),
-        TReceiver::Value(_) => None,
+        TReceiver::Value(..) => None,
     };
     let qualified = ctx.method_name(method);
     let values = check_args(
@@ -2738,14 +2845,18 @@ fn check_expr<'src>(
                         return (TExpr::Nil, Ty::Nil);
                     }
                     let before = ctx.errors.len();
-                    let (value, base_ty) = check_expr(ctx, env, base);
+                    let (value, raw_base_ty) = check_expr(ctx, env, base);
                     if ctx.errors.len() != before {
                         return (TExpr::Nil, Ty::Nil);
                     }
                     // Specification 016 section 4.3: automatic dereference
                     // applies here too, since a fresh `box(...)` value (not a
                     // place) can still be the base of a field chain.
-                    let base_ty = deref_box(&ctx.types, base_ty);
+                    // `raw_base_ty` (un-dereferenced) is kept for the checked
+                    // node itself, so lowering knows how many box layers to
+                    // peel; `base_ty` (dereferenced) is used only to resolve
+                    // the field here.
+                    let base_ty = deref_box(&ctx.types, raw_base_ty);
                     let Ty::User(id) = base_ty else {
                         let owner = ctx.name(base_ty);
                         ctx.error(
@@ -2771,6 +2882,7 @@ fn check_expr<'src>(
                     (
                         TExpr::FieldRead {
                             base: Box::new(value),
+                            base_ty: raw_base_ty,
                             index,
                             ty,
                         },

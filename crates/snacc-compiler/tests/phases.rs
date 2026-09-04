@@ -31,6 +31,35 @@ fn terminated_blocks_never_receive_a_second_terminator() {
     }
 }
 
+/// RFC 016 phase 5: a box is lowered as one non-null pointer, allocation uses
+/// the pointee size and alignment, and the checked cleanup plan emits the
+/// matching deallocation on scope exit.
+#[test]
+fn boxes_lower_through_the_runtime_allocator_and_cleanup() {
+    let ir = emit_llvm_ir(
+        "type Node is struct value: Int64, end\n\
+         let node: Box<Node> = box(Node(value: 7))\n\
+         print(node.value)\n",
+    )
+    .unwrap_or_else(|error| panic!("LLVM emission failed: {error:?}"));
+    assert!(
+        ir.contains("declare ptr @snacc_alloc"),
+        "missing allocator import:\n{ir}"
+    );
+    assert!(
+        ir.contains("declare void @snacc_dealloc"),
+        "missing deallocator import:\n{ir}"
+    );
+    assert!(
+        ir.contains("call ptr @snacc_alloc"),
+        "box was not allocated:\n{ir}"
+    );
+    assert!(
+        ir.contains("call void @snacc_dealloc"),
+        "box cleanup was not emitted:\n{ir}"
+    );
+}
+
 /// Specification 009 phase 3: every new scalar lowers through its own LLVM
 /// type. `module.verify()` inside `emit_object` rejects a mismatched width,
 /// predicate class, or print signature, so this covers every lowering path the

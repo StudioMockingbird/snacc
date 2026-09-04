@@ -1,6 +1,6 @@
 # Specification 011: Call-Scoped Reference Parameters
 
-Status: Proposed
+Status: Closed
 
 Document kind: Language semantics (ISO/IEC-style specification)
 
@@ -23,7 +23,7 @@ and phase boundaries are fixed in section 15.
 
 ## 2. Normative references and dependencies
 
-[The Snacc language contract](../../LANGUAGE.md) is normative. This document
+[The Snacc language contract](../../../LANGUAGE.md) is normative. This document
 defines the change to that contract. If the implementation and the updated
 contract disagree, the implementation is nonconforming.
 

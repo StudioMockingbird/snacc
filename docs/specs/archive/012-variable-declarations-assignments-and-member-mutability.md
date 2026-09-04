@@ -1,6 +1,6 @@
 # Specification 012: Variable Declarations and Assignments
 
-Status: Proposed
+Status: Closed
 
 Document kind: Language semantics (ISO/IEC-style specification)
 
@@ -31,7 +31,7 @@ and phase boundaries are fixed in section 15.
 
 ## 2. Normative references and dependencies
 
-[The Snacc language contract](../../LANGUAGE.md) is normative. This document
+[The Snacc language contract](../../../LANGUAGE.md) is normative. This document
 defines a change to that contract.
 
 [RFC 008](008-statements-and-functions-without-results.md) establishes

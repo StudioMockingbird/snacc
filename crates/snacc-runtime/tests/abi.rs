@@ -18,8 +18,56 @@ use std::{
 use tempfile::TempDir;
 
 #[test]
-fn runtime_implements_abi_version_six() {
-    assert_eq!(snacc_runtime::ABI_VERSION, 6);
+fn runtime_implements_abi_version_seven() {
+    assert_eq!(snacc_runtime::ABI_VERSION, 7);
+}
+
+// ---------------------------------------------------------------------
+// snacc_alloc / snacc_dealloc (Specification 016 section 8.2)
+// ---------------------------------------------------------------------
+
+#[test]
+fn snacc_alloc_returns_aligned_writable_storage_that_dealloc_accepts_back() {
+    let ptr = snacc_runtime::snacc_alloc(64, 16);
+    assert!(!ptr.is_null(), "snacc_alloc must never return null");
+    assert_eq!(
+        ptr as usize % 16,
+        0,
+        "snacc_alloc must honor the requested alignment"
+    );
+    // Safety: `ptr` was just returned by `snacc_alloc(64, 16)`, so it is
+    // valid, writable storage for at least 64 bytes.
+    unsafe {
+        ptr.cast::<u64>().write(0xDEAD_BEEF_u64);
+        assert_eq!(ptr.cast::<u64>().read(), 0xDEAD_BEEF_u64);
+    }
+    snacc_runtime::snacc_dealloc(ptr, 64, 16);
+}
+
+/// Specification 016 section 8.2's closing paragraph: boxing a zero-sized
+/// value is valid, and the runtime may use a fixed non-null sentinel rather
+/// than a real allocation for it.
+#[test]
+fn snacc_alloc_of_a_zero_sized_pointee_is_non_null_and_never_reaches_the_allocator() {
+    let first = snacc_runtime::snacc_alloc(0, 8);
+    let second = snacc_runtime::snacc_alloc(0, 8);
+    assert!(
+        !first.is_null(),
+        "a zero-sized allocation must still be non-null"
+    );
+    assert_eq!(
+        first as usize % 8,
+        0,
+        "the sentinel must honor alignment too"
+    );
+    assert_eq!(
+        first, second,
+        "every zero-sized allocation of the same alignment shares the fixed sentinel"
+    );
+    // Must not abort/panic/double-free: the zero-size path never touches the
+    // global allocator, so passing it back is always safe.
+    snacc_runtime::snacc_dealloc(first, 0, 8);
+    snacc_runtime::snacc_dealloc(second, 0, 8);
 }
 
 fn run(command: &mut Command, what: &str) -> Output {
@@ -165,8 +213,9 @@ fn snacc_print_f32_uses_default_f32_display() {
 // ---------------------------------------------------------------------
 
 /// Stands in for the object file the LLVM backend emits: undefined
-/// references to all eight print symbols, called from one exported entry
-/// point that a host can invoke without knowing anything else about it.
+/// references to all eight print symbols plus the allocator pair, called
+/// from one exported entry point that a host can invoke without knowing
+/// anything else about it.
 const FAKE_OBJECT_SOURCE: &str = r#"
 unsafe extern "C" {
     fn snacc_print_f64(value: f64);
@@ -177,6 +226,8 @@ unsafe extern "C" {
     fn snacc_print_u32(value: u32);
     fn snacc_print_u64(value: u64);
     fn snacc_print_f32(value: f32);
+    fn snacc_alloc(size: usize, align: usize) -> *mut u8;
+    fn snacc_dealloc(ptr: *mut u8, size: usize, align: usize);
 }
 
 #[unsafe(no_mangle)]
@@ -190,6 +241,10 @@ pub extern "C" fn probe_entry() {
         snacc_print_u32(4294967295);
         snacc_print_u64(18446744073709551615);
         snacc_print_f32(2.5);
+        let ptr = snacc_alloc(8, 8);
+        (ptr as *mut i64).write(99);
+        snacc_print_i64((ptr as *mut i64).read());
+        snacc_dealloc(ptr, 8, 8);
     }
 }
 "#;
@@ -212,19 +267,20 @@ fn main() {
 /// Proves the actual property `force_link` exists to guarantee: a host that
 /// touches `snacc-runtime` only by calling `force_link()` still lets an
 /// externally linked native object resolve, call, and correctly observe all
-/// eight `snacc_print_*` symbols across a real link -- not just that
-/// `force_link()` runs without panicking.
+/// eight `snacc_print_*` symbols plus the RFC 016 allocator pair across a
+/// real link -- not just that `force_link()` runs without panicking.
 ///
 /// This builds `snacc-runtime` as a standalone `.rlib` (the same separately
 /// compiled shape Cargo-hosted apps depend on, not source-embedded), links
 /// it with the fake object above via `--extern` and `-C link-arg=...` (the
 /// same mechanism `crates/snacc-driver::build` and `apps/cargo-snacc` use),
 /// and asserts both that the link succeeds and that the resulting binary
-/// prints exactly what the eight symbols should produce. A successful link
-/// plus correct output is strictly more informative than finding the
-/// symbol names in a `dumpbin`/`nm` symbol table: it also proves the
-/// symbols are correctly defined, exported, and callable across the crate
-/// boundary, not merely present as leftover names.
+/// prints exactly what the print symbols, plus one allocate/write/read/
+/// deallocate round trip, should produce. A successful link plus correct
+/// output is strictly more informative than finding the symbol names in a
+/// `dumpbin`/`nm` symbol table: it also proves the symbols are correctly
+/// defined, exported, and callable across the crate boundary, not merely
+/// present as leftover names.
 ///
 /// Caveat found while building this test: on the current toolchain
 /// (rustc 1.98, x86_64-pc-windows-msvc, linking via MSVC `link.exe`), the
@@ -238,7 +294,7 @@ fn main() {
 /// undefined references are known -- is a property of some linkers (e.g.
 /// classic GNU `ld`), not of MSVC's.
 #[test]
-fn force_link_retains_all_eight_print_symbols_through_a_real_link() {
+fn force_link_retains_all_print_and_allocator_symbols_through_a_real_link() {
     let dir = tempfile::Builder::new()
         .prefix("snacc-runtime-force-link-")
         .tempdir()
@@ -296,6 +352,6 @@ fn force_link_retains_all_eight_print_symbols_through_a_real_link() {
     let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
     assert_eq!(
         stdout,
-        "1.5\n-42\ntrue\n255\n65535\n4294967295\n18446744073709551615\n2.5\n"
+        "1.5\n-42\ntrue\n255\n65535\n4294967295\n18446744073709551615\n2.5\n99\n"
     );
 }

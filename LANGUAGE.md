@@ -37,7 +37,10 @@ reference-parameter-type
 sum-type             = primary-value-type, { "|", primary-value-type } ;
 primary-value-type   = builtin-value-type
                      | qualified-name
+                     | parameterized-value-type
                      | "(", sum-type, ")" ;
+parameterized-value-type
+                     = "Box", "<", sum-type, ">" ;
 unsigned-type        = "UInt8" | "UInt16" | "UInt32" | "UInt64" ;
 builtin-value-type   = "Int64" | "Dec64" | "Bool" | "Nil"
                      | unsigned-type
@@ -81,8 +84,10 @@ atom                 = literal
                      | "self"
                      | builtin-value-type
                      | list-literal
+                     | box-expression
                      | print-expression
                      | "(", expression, ")" ;
+box-expression       = "box", "(", expression, ")" ;
 print-expression     = "print", "(", expression, ")" ;
 list-literal         = "[", [ expression, { ",", expression }, [ "," ] ], "]" ;
 literal              = float32-literal | unsigned-literal | decimal-literal
@@ -205,8 +210,10 @@ range; infinity and NaN have no literal spelling.
 All five of these types are scalar copy types: copying, binding, passing, and
 returning a value duplicates its bits and transfers no resource ownership.
 
-String and list forms are reserved syntax. A conforming compiler must diagnose
-either form as unsupported before native-code generation.
+String escape forms remain reserved syntax. A conforming compiler must diagnose
+them as unsupported before native-code generation. `Box<T>` and `box(value)`
+are implemented closed built-ins; they are not general user-defined generic
+syntax.
 
 Every parameter, function result, method result, field, and local binding has
 an explicit type. There are exactly two implicit conversions: `Int64` to
@@ -230,14 +237,44 @@ not a union's `Nil` member.
 One declaration family, `type Name is ...`, introduces nominal represented
 types, structs, and unions. Every user-defined type has nominal identity and a
 finite, compiler-known value layout. A represented type, struct field, or union
-member must not contain itself directly or through a cycle; recursive types
-require an indirection facility that does not exist yet and are rejected before
-lowering. There is no enum, class, inheritance, pointer, or separate `match`
-construct.
+member must not contain itself directly or through a cycle. `Box<T>` is the
+first explicit indirection facility: it stores one uniquely owned heap
+allocation containing a `T`, so recursive layouts may cross a box edge. There
+is no general pointer, nullable box, enum, class, inheritance, or separate
+`match` construct.
 
 `print` does not accept a represented, struct, member, or union value. A
 program prints their scalar fields or explicitly unwraps a represented scalar.
 No user-defined type has an implicit zero value.
+
+### Box indirection
+
+`Box<T>` is a closed built-in value type with exactly one storable value type
+argument. It owns one non-null, uniquely owned heap allocation containing a
+`T`; `Box<Box<T>>` is valid, while `Box<Ref<T>>` and no-result values are not.
+The type has pointer-sized, pointer-aligned storage independent of `T` and is
+move-only even when `T` is copyable. A struct, union, or inline sum containing
+a box is move-only transitively.
+
+`box(expression)` evaluates its operand once, allocates storage sized and
+aligned for the checked operand type, stores the value, and produces
+`Box<T>`. Allocation failure terminates through the runtime fatal path; a box
+is never represented by `nil`. Field access and method calls automatically
+dereference box layers needed to resolve the selected member, but do not copy or
+consume the box.
+
+Using a box or a value transitively containing one in a consuming context
+(initialization, assignment source, by-value argument, return, or aggregate
+construction) transfers ownership and makes the source unavailable. A
+move-only field or automatic dereference cannot be moved out as a subplace.
+An available move-only destination is destroyed before replacement, and all
+remaining owners are destroyed exactly once on normal scope exit. Root
+mutability controls both box replacement and mutation through its pointee.
+
+`Box<T>` and types containing one cannot cross an `extern rust` bridge. Boxes
+do not support direct equality or printing, shared ownership, cloning, raw
+pointers, or implicit nullable behavior. Use `Box<T> | Nil` when absence is
+needed.
 
 ### Represented types
 
@@ -705,8 +742,9 @@ effects.
 - `+`, `-`, `*`, and `/` on `Int64` and `Dec64` operands require numeric
   operands. Two `Int64` operands produce `Int64`; otherwise both operands are
   widened as needed and the result is `Dec64`. `Int64` division truncates
-  toward zero. `Int64` overflow and division by zero have unspecified
-  behavior. `Dec64` arithmetic follows IEEE 754.
+toward zero. `Int64` overflow and division by zero have undefined behavior;
+  no arithmetic-failure diagnostic or quotient is guaranteed. `Dec64` arithmetic
+  follows IEEE 754.
 - For `UInt8`, `UInt16`, `UInt32`, and `UInt64`, `+`, `-`, and `*` require two
   operands of the same `UIntN` type and produce that same type, using
   arithmetic modulo 2^N. `/` is unsigned integer division, discarding the
@@ -964,7 +1002,7 @@ linker's responsibility.
 
 ## ABI version and ownership
 
-The current Snacc ABI version is 6. The version covers the `snacc_main` entry,
+The current Snacc ABI version is 7. The version covers the `snacc_main` entry,
 the required `snacc_print_*` runtime imports, the permitted Rust bridge types
 (including the no-result bridge signature added in ABI version 2, the
 fixed-width unsigned and `Float32` types added in ABI version 3, and the
@@ -974,7 +1012,7 @@ representations and
 valid values, the C calling convention, and the ownership rules for values
 crossing those boundaries.
 
-ABI version 6 exports `snacc_main` as `extern "C" fn() -> i32` and imports:
+ABI version 7 exports `snacc_main` as `extern "C" fn() -> i32` and imports:
 
 | Symbol | Rust signature |
 | --- | --- |
@@ -987,7 +1025,7 @@ ABI version 6 exports `snacc_main` as `extern "C" fn() -> i32` and imports:
 | `snacc_print_u64` | `extern "C" fn(u64)` |
 | `snacc_print_f32` | `extern "C" fn(f32)` |
 
-Every value permitted across an ABI version 6 Rust bridge is a scalar passed
+Every value permitted across an ABI version 7 Rust bridge is a scalar passed
 or returned by value, a `Ref<T>` parameter borrowing one such scalar for the
 duration of the call, or no value at all (a no-result bridge's C ABI result is
 `void`). Crossing the boundary by value copies the value; no allocation,
@@ -995,10 +1033,10 @@ destructor obligation, or resource ownership crosses with it, and a Rust bridge
 may retain its scalar copy. A `Ref<T>` parameter borrows caller storage rather
 than transferring it: the bridge may read and write the referent during the
 call and must not retain access to it afterwards. No reference is returned, and
-no bridge result is a reference. Buffers, aggregates, and handles are not ABI
-version 6 values.
+no bridge result is a reference. Buffers, aggregates, handles, boxes, and
+owned strings are not ABI version 7 bridge values.
 
-At ABI version 6, `UInt8` and `Bool` share the Rust representation `u8`; the
+At ABI version 7, `UInt8` and `Bool` share the Rust representation `u8`; the
 generated Rust type assertion verifies width and ABI representation but cannot
 distinguish these two Snacc types from one another. Their distinct Snacc
 meanings remain the declaration author's contract. Standalone `Nil` was a
@@ -1011,13 +1049,13 @@ none of them may cross a Rust bridge, so every boundary contract above is
 unchanged by them. Inline sum types are the same: none of them may cross a
 Rust bridge either, not even one whose members individually have bridge
 representations, so no permitted type, representation, required symbol, or
-calling-convention rule above changes at version 6. The version still
-advances from 5 to 6 when inline sum types are added, because their new
-compiler-internal tag-plus-fields lowering is treated as an ABI-relevant
-compiler change: it forces every object and cache entry built by an older
-compiler to be rebuilt rather than reused, even one that never itself uses an
-inline sum. No version 5 object, runtime, or cached artifact is accepted by a
-version 6 build.
+calling-convention rule above changes at version 7. The version advanced from
+5 to 6 when inline sum types were added, and from 6 to 7 when Box allocation,
+ownership, cleanup, and allocator imports were added. These compiler-internal
+changes are ABI-relevant and force every object and cache entry built by an
+older compiler to be rebuilt. ABI version 7 requires `snacc_alloc(size, align)`
+and `snacc_dealloc(ptr, size, align)`; allocation failure does not return. No
+version 6 object, runtime, or cached artifact is accepted by a version 7 build.
 
 An ABI version must change when a permitted type, representation, valid-value
 rule, ownership rule, calling convention, required symbol, or required symbol

@@ -1,17 +1,17 @@
 # Specification 018: Inline Sum Types
 
-Status: Proposed
+Status: Closed
 
 Document kind: Language semantics (ISO/IEC-style specification)
 
 ## 1. Proposal state
 
-This implementation-ready specification adds inline structural sum types such
+This implemented specification adds inline structural sum types such
 as `Byte | Nil`. It complements named algebraic data types declared with
 `type Name is union ... end`; it does not replace them.
 
-`LANGUAGE.md` remains authoritative until this specification is accepted,
-implemented, and incorporated there.
+`LANGUAGE.md` remains authoritative; the implemented contract is incorporated
+there.
 
 This specification contains no open design questions. Section 11 fixes the
 implementation order and phase boundaries.
@@ -24,11 +24,11 @@ named, possibly structured cases:
 ~~~snacc
 type Shape is union
     | Circle is struct
-        radius: Dec64,
+        radius: Float64,
       end
     | Rectangle is struct
-        width: Dec64,
-        height: Dec64,
+        width: Float64,
+        height: Float64,
       end
 end
 ~~~
@@ -170,7 +170,7 @@ The selected member is determined as follows:
 4. More than one converted match is an ambiguity error.
 
 Consequently, an `Int64` value selects the exact `Int64` member of
-`Int64 | Dec64`, while it may widen into `Dec64 | Nil` because no exact
+`Int64 | Float64`, while it may widen into `Float64 | Nil` because no exact
 `Int64` member exists.
 
 An inline sum value is assignable to another inline sum only when their
@@ -202,9 +202,10 @@ A named union value may inject as one complete direct member of an inline sum,
 but its individual member values first inject into the named union only when an
 exact expected type establishes that route.
 
-The literals `nil` and `null` select `Nil` only when the expected inline or
-named union contains exactly one `Nil` member. They still have no standalone
-type. `nil == nil` and `print(nil)` remain invalid without an expected sum.
+The literal `nil` selects `Nil` only when the expected inline or named union
+contains exactly one `Nil` member. It still has no standalone type. `nil == nil`
+and `print(nil)` remain invalid without an expected sum. Specification 020
+removes the former `null` compatibility spelling.
 
 ## 6. Type tests and decomposition
 
@@ -469,8 +470,53 @@ Implementation is complete only when:
     agree;
 14. formatting, workspace checks, and all conformance tests pass.
 
-## 15. References
+## 15. Findings from Specifications 022 and 023
+
+Specification 023 makes inline sums the language's error-reporting mechanism,
+which exercises this specification harder than any example in it. Two findings
+follow. Neither reopens a rule above and neither blocks implementation, so
+section 1's readiness claim stands: the first is a forward-compatibility
+consequence that a later specification may act on, and the second belongs to
+the boundary between this specification and its consumers rather than to this
+design.
+
+**15.1 Exhaustiveness makes a published sum's member list a compatibility
+surface.** Section 9's rule -- an `is` chain over an inline sum may omit `else`
+only when it covers every direct member exactly once -- is what makes
+Specification 023's error handling safe: a program that ignores an I/O failure
+does not compile. It has a matching cost. Specification 023 section 15.1
+records that adding a ninth member to its predeclared `Error` union would break
+every exhaustive chain in every existing program, which is why that member list
+is frozen on first release.
+
+The same applies to any inline sum a library publishes in a signature. This
+specification should say plainly that a sum's member set is part of its
+compatibility contract, and that widening one is a breaking change for every
+exhaustive consumer -- a documentation addition, not a rule change.
+
+Whether a non-exhaustive opt-in is worth adding -- a way to write a chain that
+tolerates future members -- is a separate question. It is deliberately left
+open: the current design can be implemented as written, and an opt-in is a
+strictly additive later feature. Adding one now would weaken the exhaustiveness
+guarantee before anything has demonstrated it is too strict.
+
+**15.2 The fallible-result ABI shape is unspecified. (gap, shared with Specification 023)** Section 10 fixes
+an inline sum's *internal* representation as a private tag plus per-member
+storage, and Specification 023 relies on values of type `T | Error` crossing
+between generated Snacc code and `snacc-runtime`. Because the layout is
+compiler-private, such a value cannot cross as a value, and Specification 023
+section 12.2 defers the shape to "a tag and a payload out-parameter pair"
+without fixing it.
+
+Someone must fix it: which parameter carries the tag, how an owned `String` or
+`File` payload transfers ownership across the boundary, and how the degenerate
+`Nil | Error` case -- where one member carries nothing -- is encoded. It is a
+private ABI rather than a language rule, but it is a shared one, and both
+specifications currently point at each other for it.
+
+## 16. References
 
 - [`LANGUAGE.md`](../../LANGUAGE.md)
 - [RFC 016: Box Indirection and Recursive Data Structures](016-box-indirection-and-recursive-data.md)
 - [RFC 017: UTF-8 Strings, Byte Views, and Unicode Views](017-utf8-strings-and-views.md)
+- [Specification 020: Literal Cleanup and Numeric Radices](020-literal-cleanup-and-numeric-radices.md)

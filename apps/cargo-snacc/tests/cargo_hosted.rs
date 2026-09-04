@@ -1100,6 +1100,44 @@ fn abi_5_cache_manifests_are_never_reused_after_the_abi_6_bump() {
     );
 }
 
+/// RFC 016 Task C: an ABI version 6 cache object (the version predating this
+/// RFC's ABI 7 bump for boxed indirection's runtime allocator) is not reused
+/// once the compiler declares ABI version 7.
+#[test]
+fn abi_6_cache_manifests_are_never_reused_after_the_abi_7_bump() {
+    let target = tempfile::tempdir().expect("failed to create fixture target directory");
+    let build = cargo_snacc(target.path(), &["build", "--offline", "--verbose"]);
+    assert!(
+        build.status.success(),
+        "build failed:\n{}",
+        combined(&build)
+    );
+
+    let manifest_path = find_manifest(&target.path().join("snacc"))
+        .expect("content-addressed cache manifest was not written");
+    let encoded = fs::read_to_string(&manifest_path).unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    manifest["abi_version"] = serde_json::json!(6);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let rebuilt = cargo_snacc(target.path(), &["build", "--offline", "--verbose"]);
+    assert!(
+        rebuilt.status.success(),
+        "rebuild failed:\n{}",
+        combined(&rebuilt)
+    );
+    assert!(
+        String::from_utf8_lossy(&rebuilt.stdout).contains("Snacc object rebuilt"),
+        "an ABI-6 cache manifest must not be reused for an ABI-{}-build:\n{}",
+        snacc_compiler::ABI_VERSION,
+        combined(&rebuilt)
+    );
+}
+
 #[test]
 fn plain_cargo_check_succeeds_without_cargo_snacc() {
     let target = tempfile::tempdir().expect("failed to create fixture target directory");

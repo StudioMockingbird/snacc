@@ -3,7 +3,7 @@ use crate::semantics::checker::{
     ArithOp, CmpOp, Place, PlaceRoot, Program, TArg, TBlock, TCondition, TExpr, TMethodCall,
     TParam, TReceiver, TStmt, TSumTypeTest, TTypeTest, TValueIf, Ty,
 };
-use crate::semantics::types::{SumId, TypeDef, TypeId};
+use crate::semantics::types::{BoxId, SumId, TypeDef, TypeId};
 use crate::syntax::ast::NumLiteral;
 use crate::syntax::ast::ParamMode;
 use inkwell::AddressSpace;
@@ -13,7 +13,7 @@ use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::{Linkage, Module};
 use inkwell::targets::{
-    CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
+    CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetData, TargetMachine,
 };
 use inkwell::types::{
     BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType, IntType, StructType,
@@ -53,11 +53,12 @@ fn scalar_ty(context: &Context, ty: Ty) -> BasicTypeEnum<'_> {
         // tables first (see `llvm_ty`).
         Ty::User(_) => unreachable!("a user-defined type resolves through the layout table"),
         Ty::Sum(_) => unreachable!("an inline sum resolves through the sum layout table"),
-        // RFC 016 (Task B/C) has not yet given `Box<T>` a lowering strategy
-        // (its private-ABI pointer representation is phase 5 work).
-        Ty::Box(_) => {
-            unreachable!("RFC 016 (Task B/C) has not yet given 'Box<T>' a lowering strategy")
-        }
+        // Specification 016 section 4.1/10: `Box<T>` lowers to a non-null
+        // target pointer in the private Snacc ABI, exactly like `Ref<T>`'s
+        // own pointer representation (`function_type`'s `ParamMode::
+        // Reference` arm) -- pointers are opaque in this LLVM version, so
+        // the pointee's own type never appears here regardless of `T`.
+        Ty::Box(_) => context.ptr_type(AddressSpace::default()).into(),
     }
 }
 
@@ -473,7 +474,12 @@ fn build_module<'ctx>(
     let module = context.create_module(module_name);
     let builder = context.create_builder();
     module.set_triple(&triple);
-    module.set_data_layout(&machine.get_target_data().get_data_layout());
+    // Specification 016 section 8.2: `box(expression)` needs the target's
+    // real size and alignment for its pointee to call the runtime allocator
+    // correctly, so this target data outlives the one-off value used just
+    // above to set the module's data layout string.
+    let target_data = machine.get_target_data();
+    module.set_data_layout(&target_data.get_data_layout());
 
     // Named types come first: every function signature below may mention one.
     let (layout, sum_layout) = build_layout(context, &program.types, &program.sums)?;
@@ -548,6 +554,7 @@ fn build_module<'ctx>(
         program,
         layout: &layout,
         sums: &sum_layout,
+        target_data: &target_data,
     };
 
     for (name, function) in &program.funcs {
@@ -559,7 +566,12 @@ fn build_module<'ctx>(
         for (param, value) in function.params.iter().zip(llvm_function.get_params()) {
             env.push((param.name.clone(), param_slot(param, value)));
         }
-        cg.body(&mut env, &function.body, function.result)?;
+        cg.body(
+            &mut env,
+            &function.body,
+            function.result,
+            &function.param_drops,
+        )?;
     }
 
     for (id, method) in program.methods.iter().enumerate() {
@@ -579,7 +591,7 @@ fn build_module<'ctx>(
         {
             env.push((param.name.clone(), param_slot(param, value)));
         }
-        cg.body(&mut env, &method.body, method.result)?;
+        cg.body(&mut env, &method.body, method.result, &method.param_drops)?;
     }
 
     // The Rust runtime owns the platform entry point and calls this stable ABI
@@ -621,6 +633,12 @@ struct Codegen<'ctx, 'a> {
     /// LLVM types for every interned inline sum, indexed by `SumId`
     /// (Specification 018 section 8).
     sums: &'a [BasicTypeEnum<'ctx>],
+    /// The target's real size and alignment facts (Specification 016 section
+    /// 8.2): `box(expression)` and every drop of a boxed value need a
+    /// pointee's actual byte size and alignment to call the runtime
+    /// allocator/deallocator correctly, which an LLVM type alone does not
+    /// carry without consulting the target.
+    target_data: &'a TargetData,
 }
 
 /// Basic blocks a `break` may branch to, innermost last.
@@ -692,6 +710,109 @@ impl<'ctx> Codegen<'ctx, '_> {
             })
     }
 
+    /// A box's pointee type (Specification 016 section 4.1), mirroring
+    /// `Types::box_pointee` against the lowering-only snapshot `Program`
+    /// carries instead.
+    fn box_pointee(&self, id: BoxId) -> Ty {
+        self.program.boxes[id.index()]
+    }
+
+    /// The target's `usize`-equivalent integer type (Specification 016
+    /// section 8.2): the runtime allocator's `size`/`align` parameters are
+    /// Rust `usize`, whose width is always the target's pointer width.
+    fn usize_ty(&self) -> IntType<'ctx> {
+        self.context.ptr_sized_int_type(self.target_data, None)
+    }
+
+    /// A type's real target size and ABI alignment (Specification 016
+    /// section 8.2), for a runtime allocate/deallocate call's `size`/`align`
+    /// arguments.
+    fn size_align(&self, ty: Ty) -> (u64, u64) {
+        let llvm_ty = self.ty(ty);
+        (
+            self.target_data.get_abi_size(&llvm_ty),
+            u64::from(self.target_data.get_abi_alignment(&llvm_ty)),
+        )
+    }
+
+    /// Declares the runtime allocator import on first use, mirroring
+    /// `Codegen::print_import`.
+    fn alloc_import(&self) -> FunctionValue<'ctx> {
+        let symbol = "snacc_alloc";
+        self.module.get_function(symbol).unwrap_or_else(|| {
+            let usize_ty = self.usize_ty();
+            let ptr_ty = self.context.ptr_type(AddressSpace::default());
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                ptr_ty.fn_type(&[usize_ty.into(), usize_ty.into()], false),
+                None,
+            )
+        })
+    }
+
+    /// Declares the runtime deallocator import on first use, mirroring
+    /// `Codegen::print_import`.
+    fn dealloc_import(&self) -> FunctionValue<'ctx> {
+        let symbol = "snacc_dealloc";
+        self.module.get_function(symbol).unwrap_or_else(|| {
+            let usize_ty = self.usize_ty();
+            let ptr_ty = self.context.ptr_type(AddressSpace::default());
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context
+                    .void_type()
+                    .fn_type(&[ptr_ty.into(), usize_ty.into(), usize_ty.into()], false),
+                None,
+            )
+        })
+    }
+
+    /// Calls the runtime deallocator for `ptr`, sized and aligned for
+    /// `pointee` (Specification 016 section 8.1: a box releases its
+    /// allocation on destruction).
+    fn call_dealloc(&self, ptr: PointerValue<'ctx>, pointee: Ty) -> Result<(), String> {
+        let (size, align) = self.size_align(pointee);
+        let usize_ty = self.usize_ty();
+        let dealloc_fn = self.dealloc_import();
+        self.invoke(
+            dealloc_fn,
+            &[
+                ptr.into(),
+                usize_ty.const_int(size, false).into(),
+                usize_ty.const_int(align, false).into(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Follows zero or more `Box<T>` layers from an address `ptr` whose
+    /// current content is a value of `ty`, loading each box's stored pointer
+    /// value in turn, until `ty` is no longer `Ty::Box` (Specification 016
+    /// section 4.3). Mirrors `deref_box` in `checker.rs` at the value level:
+    /// that function decides *how many* layers automatic access crosses; this
+    /// one performs each crossing as a genuine load, since a box field or
+    /// local's own storage holds a pointer that must be read to reach its
+    /// pointee's real (heap) address.
+    fn deref_box_ptr(
+        &self,
+        mut ptr: PointerValue<'ctx>,
+        mut ty: Ty,
+    ) -> Result<(PointerValue<'ctx>, Ty), String> {
+        while let Ty::Box(id) = ty {
+            ptr = self
+                .builder
+                .build_load(self.context.ptr_type(AddressSpace::default()), ptr, "deref")
+                .map_err(|error| error.to_string())?
+                .into_pointer_value();
+            ty = self.box_pointee(id);
+        }
+        Ok((ptr, ty))
+    }
+
     fn current_function(&self) -> FunctionValue<'ctx> {
         self.builder
             .get_insert_block()
@@ -699,13 +820,25 @@ impl<'ctx> Codegen<'ctx, '_> {
             .expect("lowering always occurs inside a function")
     }
 
-    /// Lowers one function or method body and its return.
-    fn body(&self, env: &mut Env<'ctx>, block: &TBlock, result: Option<Ty>) -> Result<(), String> {
+    /// Lowers one function or method body and its return. `param_drops` is
+    /// the checked cleanup plan's by-value-parameter obligations
+    /// (Specification 016 section 8.1), run after the body's own locals
+    /// (already handled inside `self.block` via `block.drops`) and after the
+    /// result value itself has been fully computed, so a parameter returned
+    /// by value is never destroyed out from under its own return.
+    fn body(
+        &self,
+        env: &mut Env<'ctx>,
+        block: &TBlock,
+        result: Option<Ty>,
+        param_drops: &[Place],
+    ) -> Result<(), String> {
         let mut loops = Vec::new();
         let (value, terminated) = self.block(env, &mut loops, block)?;
         if terminated {
             return Ok(());
         }
+        self.drop_places(env, param_drops)?;
         match (result, value) {
             (Some(_), Some(value)) => self.builder.build_return(Some(&value)),
             (None, _) => self.builder.build_return(None),
@@ -760,8 +893,21 @@ impl<'ctx> Codegen<'ctx, '_> {
     }
 
     /// The address of a place, or `None` when its root is an SSA value with no
-    /// addressable storage. Field selectors lower to GEPs
-    /// (Specification 010 section 15.3).
+    /// addressable storage of its own. Field selectors lower to GEPs
+    /// (Specification 010 section 15.3), and a `Box<T>` step along the way
+    /// lowers to a load through the box's own stored pointer, crossing as
+    /// many layers as `place.path` requires before each field selector --
+    /// exactly mirroring `walk_fields`/`deref_box`'s automatic dereference in
+    /// `checker.rs` (Specification 016 section 4.3).
+    ///
+    /// A caller occasionally wants a place dereferenced *beyond* what
+    /// `place.path` alone implies -- a union/sum type-test subject or a
+    /// `Box<T>`-to-`Ref<T>` lending argument, both of which the checker
+    /// resolves by leaving `path` untouched but overwriting `place.ty` itself
+    /// to the already-dereferenced type (see `check_arm_condition` and
+    /// `check_reference_arg`). The trailing check below catches up to that by
+    /// dereferencing further whenever the path walk's own natural result
+    /// still disagrees with `place.ty`.
     fn place_ptr(
         &self,
         env: &Env<'ctx>,
@@ -770,16 +916,46 @@ impl<'ctx> Codegen<'ctx, '_> {
         let Some(slot) = lookup(env, root_name(&place.root)) else {
             return Err(internal("a checked place root is not in scope"));
         };
-        let Slot::Mutable(mut ptr) = slot else {
-            return Ok(None);
-        };
         let mut ty = place.root_ty;
+        let mut ptr = match slot {
+            Slot::Mutable(ptr) => ptr,
+            Slot::Value(value) => {
+                if place.path.is_empty() && place.ty == ty {
+                    // Nothing beyond the root's own SSA value is wanted; it
+                    // has no address of its own to hand back.
+                    return Ok(None);
+                }
+                let Ty::Box(id) = ty else {
+                    // A non-box SSA root (an immutable struct local, say)
+                    // still has no address; `place_value`'s `extract_value`
+                    // fallback reads through it instead.
+                    return Ok(None);
+                };
+                // The box's own SSA value already *is* the address of real
+                // (heap) storage for its pointee (Specification 016 section
+                // 4.3), unlike a `Slot::Mutable` root's address, which holds
+                // a box pointer that still needs loading -- so this peels
+                // exactly the outer layer "for free" before the loop below
+                // (which only ever performs genuine loads) continues through
+                // any further nested layers.
+                ty = self.box_pointee(id);
+                value.into_pointer_value()
+            }
+        };
         for &index in &place.path {
+            (ptr, ty) = self.deref_box_ptr(ptr, ty)?;
             ptr = self
                 .builder
                 .build_struct_gep(self.struct_ty(ty)?, ptr, index as u32, "field")
                 .map_err(|error| error.to_string())?;
             ty = self.field_ty(ty, index)?;
+        }
+        if ty != place.ty {
+            (ptr, ty) = self.deref_box_ptr(ptr, ty)?;
+            debug_assert_eq!(
+                ty, place.ty,
+                "a place's automatic dereference did not land on its own checked type"
+            );
         }
         Ok(Some((ptr, self.ty(place.ty))))
     }
@@ -857,6 +1033,13 @@ impl<'ctx> Codegen<'ctx, '_> {
             (Some(result), false) => Some(self.expr(env, loops, result)?),
             _ => None,
         };
+        // Specification 016 section 8.1: cleanup runs on every supported
+        // *normal* edge leaving an owning scope -- a block that already
+        // terminated (an unreachable fall-through, a `break`) leaves through
+        // neither, so no drop instruction is appended after its terminator.
+        if !terminated {
+            self.drop_places(env, &block.drops)?;
+        }
         env.truncate(scope);
         Ok((value, terminated))
     }
@@ -888,11 +1071,24 @@ impl<'ctx> Codegen<'ctx, '_> {
                 }
                 Ok(false)
             }
-            TStmt::Assign { place, value } => {
+            TStmt::Assign {
+                place,
+                value,
+                drop_before,
+            } => {
+                // Specification 016 section 6.3: the right operand evaluates
+                // completely before the destination is touched at all.
                 let value = self.expr(env, loops, value)?;
-                let Some((ptr, _)) = self.place_ptr(env, place)? else {
+                let Some((ptr, ty)) = self.place_ptr(env, place)? else {
                     return Err(internal("an assignment reached a place with no storage"));
                 };
+                if *drop_before {
+                    let old = self
+                        .builder
+                        .build_load(ty, ptr, "old")
+                        .map_err(|error| error.to_string())?;
+                    self.drop_value(place.ty, old)?;
+                }
                 self.builder
                     .build_store(ptr, value)
                     .map_err(|error| error.to_string())?;
@@ -1150,30 +1346,71 @@ impl<'ctx> Codegen<'ctx, '_> {
         }
     }
 
-    /// Specification 010 section 15.3: the receiver evaluates exactly once and
-    /// is passed by address. An addressable receiver place passes its own
-    /// address; a temporary or an immutable SSA root -- both of which the
-    /// checker only permits for a method that never writes through `self` --
-    /// gets compiler-owned storage.
+    /// Resolves a method call receiver to the address methods actually
+    /// expect: the pointee's storage after peeling every `Box<T>` layer the
+    /// receiver's static type has (Specification 016 section 4.3). Unlike
+    /// `place_ptr`'s own automatic dereference, a method-call receiver's
+    /// `place.ty` is deliberately left un-dereferenced by the checker (see
+    /// `check_method_call`'s comment on `TReceiver::Place`), so this always
+    /// derefs further on top of whatever `place_ptr`/`place_value` returned,
+    /// rather than relying on them to have already done it.
+    ///
+    /// `borrowed` is true exactly when the returned address is real
+    /// caller-owned storage rather than a compiler-owned temporary the call
+    /// result discards (Specification 010 section 15.3) -- a box's pointee is
+    /// always real heap storage, so a `Box<T>` receiver is `borrowed` under
+    /// the same rule as any other addressable place.
+    fn receiver_ptr(
+        &self,
+        env: &mut Env<'ctx>,
+        loops: &mut Loops<'ctx>,
+        receiver: &TReceiver,
+    ) -> Result<(PointerValue<'ctx>, bool), String> {
+        match receiver {
+            TReceiver::Place(place) => match self.place_ptr(env, place)? {
+                Some((ptr, _)) => {
+                    let (ptr, _) = self.deref_box_ptr(ptr, place.ty)?;
+                    Ok((ptr, true))
+                }
+                None => {
+                    let value = self.place_value(env, place)?;
+                    self.receiver_from_value(place.ty, value)
+                }
+            },
+            TReceiver::Value(value, ty) => {
+                let value = self.expr(env, loops, value)?;
+                self.receiver_from_value(*ty, value)
+            }
+        }
+    }
+
+    /// A receiver read as a bare value with no place of its own. A `Box<T>`
+    /// value already *is* the address of real storage, so it is peeled
+    /// directly with no compiler-owned temporary of its own; anything else
+    /// gets compiler-owned storage the call result discards (Specification
+    /// 010 section 15.3).
+    fn receiver_from_value(
+        &self,
+        ty: Ty,
+        value: BasicValueEnum<'ctx>,
+    ) -> Result<(PointerValue<'ctx>, bool), String> {
+        match ty {
+            Ty::Box(id) => {
+                let pointee = self.box_pointee(id);
+                let (ptr, _) = self.deref_box_ptr(value.into_pointer_value(), pointee)?;
+                Ok((ptr, false))
+            }
+            _ => Ok((self.materialize(value, SELF)?, false)),
+        }
+    }
+
     fn method_call(
         &self,
         env: &mut Env<'ctx>,
         loops: &mut Loops<'ctx>,
         call: &TMethodCall,
     ) -> Result<inkwell::values::CallSiteValue<'ctx>, String> {
-        let (receiver, borrowed) = match &call.receiver {
-            TReceiver::Place(place) => match self.place_ptr(env, place)? {
-                Some((ptr, _)) => (ptr, true),
-                None => {
-                    let value = self.place_value(env, place)?;
-                    (self.materialize(value, SELF)?, false)
-                }
-            },
-            TReceiver::Value(value) => {
-                let value = self.expr(env, loops, value)?;
-                (self.materialize(value, SELF)?, false)
-            }
-        };
+        let (receiver, borrowed) = self.receiver_ptr(env, loops, &call.receiver)?;
         // Compiler-owned storage is discarded when the call returns, so a
         // method that may assign through `self` must have reached the caller's
         // own storage. The checker enforces a mutable receiver root for exactly
@@ -1262,7 +1499,9 @@ impl<'ctx> Codegen<'ctx, '_> {
 
         self.builder.position_at_end(merge);
         if incoming.is_empty() {
-            return Err("a value-producing 'if' had no branch that produces a value".into());
+            return Err(internal(
+                "a value-producing 'if' had no branch that produces a value",
+            ));
         }
         let phi = self
             .builder
@@ -1632,11 +1871,42 @@ impl<'ctx> Codegen<'ctx, '_> {
             // consuming context for the checker's own move-availability
             // analysis; lowering reads the place identically either way.
             TExpr::Place(place, _) => self.place_value(env, place),
-            TExpr::FieldRead { base, index, .. } => {
-                let base = self.expr(env, loops, base)?;
-                self.builder
-                    .build_extract_value(as_struct(base)?, *index as u32, "field")
-                    .map_err(|error| error.to_string())
+            TExpr::FieldRead {
+                base,
+                base_ty,
+                index,
+                ty,
+            } => {
+                let base_value = self.expr(env, loops, base)?;
+                match base_ty {
+                    // Specification 016 section 4.3: a fresh box value (not a
+                    // place) reached this field access, so lowering derefs it
+                    // the same number of layers `checker.rs`'s `deref_box`
+                    // did to resolve the field, then reads through the
+                    // resulting real address instead of extracting from an
+                    // (absent) aggregate SSA value.
+                    Ty::Box(id) => {
+                        let pointee = self.box_pointee(*id);
+                        let (ptr, struct_ty) =
+                            self.deref_box_ptr(base_value.into_pointer_value(), pointee)?;
+                        let field = self
+                            .builder
+                            .build_struct_gep(
+                                self.struct_ty(struct_ty)?,
+                                ptr,
+                                *index as u32,
+                                "field",
+                            )
+                            .map_err(|error| error.to_string())?;
+                        self.builder
+                            .build_load(self.ty(*ty), field, "field")
+                            .map_err(|error| error.to_string())
+                    }
+                    _ => self
+                        .builder
+                        .build_extract_value(as_struct(base_value)?, *index as u32, "field")
+                        .map_err(|error| error.to_string()),
+                }
             }
             // Specification 010 section 8.2: arguments evaluate left to right in
             // written order, then land in their declared field slots.
@@ -1837,18 +2107,229 @@ impl<'ctx> Codegen<'ctx, '_> {
                 self.invoke(function, &[value.into()])?;
                 Ok(value)
             }
-            // RFC 016 (Task B/C) has not yet given `box(expression)` a
-            // lowering strategy: allocation, single-evaluation cleanup
-            // registration, and the private Snacc ABI's pointer
-            // representation are all still unimplemented. The checker
-            // already accepts `box(...)` (Task A), so a program reaching
-            // this arm is possible; the backend does not silently miscompile
-            // it.
-            TExpr::Box(..) => Err(internal(
-                "'box(expression)' reached lowering, which RFC 016 (Task B/C) has not yet \
-                 implemented",
-            )),
+            // Specification 016 section 4.2 and 8.2: the operand evaluates
+            // exactly once, the runtime allocator is sized and aligned for
+            // the *pointee* type (not the box pointer itself), and the
+            // evaluated value is stored into the fresh allocation before its
+            // address is produced as the box's own value. The cleanup
+            // obligation this allocation creates is not registered here --
+            // it is whatever the checked cleanup plan already attached to
+            // wherever this `box(...)` result ends up bound (a block's
+            // `drops`, a function's `param_drops`, or an assignment's
+            // `drop_before`), exactly like any other move-only value.
+            TExpr::Box(operand, ty) => {
+                let Ty::Box(id) = *ty else {
+                    return Err(internal("a 'box(...)' node did not have a box result type"));
+                };
+                let pointee = self.box_pointee(id);
+                let value = self.expr(env, loops, operand)?;
+                let (size, align) = self.size_align(pointee);
+                let usize_ty = self.usize_ty();
+                let alloc_fn = self.alloc_import();
+                let call = self.invoke(
+                    alloc_fn,
+                    &[
+                        usize_ty.const_int(size, false).into(),
+                        usize_ty.const_int(align, false).into(),
+                    ],
+                )?;
+                let ptr = call
+                    .try_as_basic_value()
+                    .expect_basic("'snacc_alloc' always returns a pointer")
+                    .into_pointer_value();
+                self.builder
+                    .build_store(ptr, value)
+                    .map_err(|error| error.to_string())?;
+                Ok(ptr.into())
+            }
         }
+    }
+
+    /// Recursively destroys one owned value of `ty` (Specification 016
+    /// section 8.1). Only ever called where the checked cleanup plan already
+    /// decided `ty` is move-only -- a copyable value is never dropped -- so
+    /// every arm recurses only into fields/members/pointees that are
+    /// themselves move-only, skipping a copyable one entirely rather than
+    /// re-deriving that fact from scratch at each level.
+    fn drop_value(&self, ty: Ty, value: BasicValueEnum<'ctx>) -> Result<(), String> {
+        match ty {
+            Ty::Box(id) => {
+                let pointee = self.box_pointee(id);
+                let ptr = value.into_pointer_value();
+                if is_move_only(self.program, pointee) {
+                    let pointee_ty = self.ty(pointee);
+                    let loaded = self
+                        .builder
+                        .build_load(pointee_ty, ptr, "boxed")
+                        .map_err(|error| error.to_string())?;
+                    self.drop_value(pointee, loaded)?;
+                }
+                self.call_dealloc(ptr, pointee)
+            }
+            Ty::User(id) => match self.def(id) {
+                TypeDef::Represented { target, .. } => self.drop_value(*target, value),
+                TypeDef::Struct { fields, .. } | TypeDef::UnionMember { fields, .. } => {
+                    // Specification 016 section 8.1: a struct drops its
+                    // move-only fields in source declaration order.
+                    for (index, (_, field_ty)) in fields.iter().enumerate() {
+                        if is_move_only(self.program, *field_ty) {
+                            let field = self
+                                .builder
+                                .build_extract_value(as_struct(value)?, index as u32, "field")
+                                .map_err(|error| error.to_string())?;
+                            self.drop_value(*field_ty, field)?;
+                        }
+                    }
+                    Ok(())
+                }
+                TypeDef::Union { members, .. } => self.drop_union(members, value),
+            },
+            Ty::Sum(id) => {
+                let members = self.program.sums[id.index()].clone();
+                self.drop_sum(&members, value)
+            }
+            // A caller only ever reaches this function for a move-only type
+            // (Specification 016 section 5.3 composes structurally, so a
+            // scalar is never move-only itself); kept as a safe no-op rather
+            // than an internal-error panic since a struct/union/sum's field
+            // loop above deliberately does not pre-filter its recursive call
+            // by scalar-ness before checking `is_move_only`.
+            _ => Ok(()),
+        }
+    }
+
+    /// A union's drop (Specification 016 section 8.1: "a union drops only its
+    /// active payload"): the active member is not statically known here, so
+    /// this dispatches on the union's own runtime tag, mirroring
+    /// `Codegen::equal_union`'s tag-then-member-block shape exactly, except
+    /// each block runs a drop (a side effect) rather than producing a phi
+    /// value.
+    fn drop_union(&self, members: &[TypeId], value: BasicValueEnum<'ctx>) -> Result<(), String> {
+        let tag = self
+            .builder
+            .build_extract_value(as_struct(value)?, 0, "tag")
+            .map_err(|error| error.to_string())?
+            .into_int_value();
+        let function = self.current_function();
+        let done = self.context.append_basic_block(function, "drop_done");
+        let unknown = self.context.append_basic_block(function, "drop_unknown");
+        let mut cases = Vec::with_capacity(members.len());
+        for member in members {
+            let tag_value = self.member_tag(*member)?;
+            let block = self.context.append_basic_block(function, "drop_member");
+            cases.push((
+                self.context
+                    .i32_type()
+                    .const_int(u64::from(tag_value), false),
+                block,
+            ));
+        }
+        self.builder
+            .build_switch(tag, unknown, &cases)
+            .map_err(|error| error.to_string())?;
+        // A stored tag outside the union's members means construction wrote
+        // one that does not exist.
+        self.builder.position_at_end(unknown);
+        self.exhausted()?;
+
+        for (member, (_, block)) in members.iter().zip(&cases) {
+            self.builder.position_at_end(*block);
+            let member_ty = Ty::User(*member);
+            if is_move_only(self.program, member_ty) {
+                let field_index = self.member_tag(*member)? + 1;
+                let payload = self
+                    .builder
+                    .build_extract_value(as_struct(value)?, field_index, "member")
+                    .map_err(|error| error.to_string())?;
+                self.drop_value(member_ty, payload)?;
+            }
+            self.builder
+                .build_unconditional_branch(done)
+                .map_err(|error| error.to_string())?;
+        }
+        self.builder.position_at_end(done);
+        Ok(())
+    }
+
+    /// An inline sum's drop: identical strategy to [`Self::drop_union`],
+    /// except a member's deterministic tag is its position in `members`
+    /// rather than a `TypeId`'s own tag (Specification 018 section 8's
+    /// tag-plus-fields shape, reused unchanged).
+    fn drop_sum(&self, members: &[Ty], value: BasicValueEnum<'ctx>) -> Result<(), String> {
+        let tag = self
+            .builder
+            .build_extract_value(as_struct(value)?, 0, "tag")
+            .map_err(|error| error.to_string())?
+            .into_int_value();
+        let function = self.current_function();
+        let done = self.context.append_basic_block(function, "drop_done");
+        let unknown = self.context.append_basic_block(function, "drop_unknown");
+        let cases: Vec<_> = (0..members.len())
+            .map(|tag| {
+                (
+                    self.context.i32_type().const_int(tag as u64, false),
+                    self.context.append_basic_block(function, "drop_member"),
+                )
+            })
+            .collect();
+        self.builder
+            .build_switch(tag, unknown, &cases)
+            .map_err(|error| error.to_string())?;
+        self.builder.position_at_end(unknown);
+        self.exhausted()?;
+
+        for (index, (member, (_, block))) in members.iter().zip(cases).enumerate() {
+            self.builder.position_at_end(block);
+            if is_move_only(self.program, *member) {
+                let payload = self
+                    .builder
+                    .build_extract_value(as_struct(value)?, index as u32 + 1, "member")
+                    .map_err(|error| error.to_string())?;
+                self.drop_value(*member, payload)?;
+            }
+            self.builder
+                .build_unconditional_branch(done)
+                .map_err(|error| error.to_string())?;
+        }
+        self.builder.position_at_end(done);
+        Ok(())
+    }
+
+    /// Runs the checked cleanup plan's drops (Specification 016 section 8.1),
+    /// in the order the checker already put them in (reverse declaration
+    /// order): loads each place's current value, then destroys it.
+    fn drop_places(&self, env: &Env<'ctx>, drops: &[Place]) -> Result<(), String> {
+        for place in drops {
+            let value = self.place_value(env, place)?;
+            self.drop_value(place.ty, value)?;
+        }
+        Ok(())
+    }
+}
+
+/// Mirrors `Types::is_move_only` (Specification 016 section 5.3) using only
+/// the lowering-time `Program` snapshot, since the backend does not carry the
+/// checker's own `Types` table. Recursion only follows by-value fields/
+/// members, which the checker's layout-cycle check already proved acyclic,
+/// and a `Box<T>` edge short-circuits to `true` without recursing into its
+/// pointee, so this needs no memoization -- the same reasoning
+/// `Types::is_move_only` itself relies on.
+fn is_move_only(program: &Program, ty: Ty) -> bool {
+    match ty {
+        Ty::Box(_) => true,
+        Ty::User(id) => match &program.types[id.index()] {
+            TypeDef::Represented { target, .. } => is_move_only(program, *target),
+            TypeDef::Struct { fields, .. } | TypeDef::UnionMember { fields, .. } => {
+                fields.iter().any(|(_, ty)| is_move_only(program, *ty))
+            }
+            TypeDef::Union { members, .. } => members
+                .iter()
+                .any(|member| is_move_only(program, Ty::User(*member))),
+        },
+        Ty::Sum(id) => program.sums[id.index()]
+            .iter()
+            .any(|member| is_move_only(program, *member)),
+        _ => false,
     }
 }
 

@@ -10,7 +10,7 @@ pub use semantics::checker::{Program, TParam, Ty};
 pub use syntax::ast::{ParamMode, Program as AstProgram};
 
 /// Contract version for generated objects, runtime imports, and Rust bridges.
-pub const ABI_VERSION: u32 = 6;
+pub const ABI_VERSION: u32 = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Optimization {

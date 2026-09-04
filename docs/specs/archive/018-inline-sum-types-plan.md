@@ -2,7 +2,7 @@
 
 Document kind: Execution plan
 
-Specification: [docs/specs/018-inline-sum-types.md](018-inline-sum-types.md)
+Specification: [Specification 018: Inline Sum Types](018-inline-sum-types.md)
 
 Base: main @ 1e28408 (RFC 013 complete). Spec 015 (recursion) lands in parallel
 and touches no shared surface, so this plan does not depend on it landing
@@ -20,7 +20,8 @@ authority on behavior.
   `backend/llvm.rs` and are checked via `TypeDef::Union`/`UnionMember` in
   `types.rs`. Spec 018 section 8 explicitly says to reuse this lowering
   strategy for inline sums, not invent a new one.
-- `nil`/`null` contextual resolution and `CONTEXTLESS_NIL` already exist
+- contextual `nil` resolution and `CONTEXTLESS_NIL` already exist; Specification
+  020 removes the former `null` compatibility spelling
   (Milestone 5, commit 6b76b54) for named unions only. Spec 018 extends the
   same contextual-injection idea to inline sums; do not duplicate the concept,
   reuse/generalize it.
@@ -53,7 +54,7 @@ authority on behavior.
    retain source order only for diagnostic rendering.
 5. Injection rules (spec section 5): exact direct-member match first, then
    unique existing-implicit-conversion match, else type error, else ambiguity
-   error. `nil`/`null` select the sum's `Nil` member only when the expected
+   error. `nil` selects the sum's `Nil` member only when the expected
    sum contains exactly one `Nil` member — generalize the existing
    `CONTEXTLESS_NIL` machinery rather than forking it.
 6. Sum-to-sum assignment requires identical normalized member sets — no

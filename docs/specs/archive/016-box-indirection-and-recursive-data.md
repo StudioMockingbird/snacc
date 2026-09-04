@@ -1,20 +1,20 @@
 # RFC 016: Box Indirection and Recursive Data Structures
 
-Status: Proposed
+Status: Closed
 
 Document kind: Feature specification (Rust-style RFC)
 
 ## 1. Proposal state
 
-This RFC is implementation-ready. It adds explicit, uniquely owned heap
+This RFC is implemented. It adds explicit, uniquely owned heap
 indirection through `Box<T>`. The first version supports finite recursive
 layouts, construction, traversal, mutation through mutable roots, whole-value
 ownership transfer, and deterministic destruction. It does not add shared
 ownership, raw pointers, user-visible lifetimes, ownership cycles, cloning, or
 Rust bridge support.
 
-`LANGUAGE.md` remains authoritative. Until this RFC is accepted, implemented,
-and incorporated there, `Box<T>` is not part of Snacc.
+`LANGUAGE.md` remains authoritative; the implemented contract is incorporated
+there.
 
 Inline optional links such as `Box<Node> | Nil` use the structural sum types
 defined by [Specification 018](018-inline-sum-types.md), which must be
@@ -626,7 +626,66 @@ tree and linked-list use cases.
 - integration with user-defined generic types after generic programming is
   specified.
 
-## 16. References
+## 16. Findings from Specifications 022 and 023
+
+Specifications 022 and 023 depend on this RFC's ownership and cleanup model and
+surfaced six items that belong here rather than in either of them.
+
+None of them reopens a rule above, and section 1's readiness claim stands: this
+RFC can be implemented exactly as written. Items marked **gap** need text here
+before the *dependent* specification can land -- they are forward obligations
+that activate when concurrency or I/O is accepted, not holes in the design
+below. 16.1 and 16.3 constrain this RFC's successor rather than this RFC.
+
+**16.1 Shared ownership must arrive with its concurrency rule. (gap)**
+Section 9 leaves `Shared<T>`, `Weak<T>`, arena handles, and garbage collection
+unchosen. Specification 022 section 7.3 shows that its entire data-race
+argument -- no `Send` marker, no `Sync` marker, no escape analysis -- holds
+*only* while nothing in the language shares ownership. A future shared-ownership
+facility added without a concurrency rule in the same change silently
+invalidates that argument and makes concurrent Snacc programs unsound. Whatever
+this RFC's successor chooses, the concurrency rule is part of the same
+specification, not a follow-up.
+
+**16.2 Cleanup cannot report a failure.** Section 8.1's deterministic
+destruction runs on scope exit with nowhere to put an error. Specification 023
+section 9.1 hits this directly: a buffered file's close error is discarded
+unless the program calls `flush` first, and nothing makes it. Every language
+with RAII has this wart. Specification 025 deliberately accepts only
+no-result deferred calls, so a fallible flush or close remains an explicit
+ordinary call before exit rather than silently losing or replacing an error.
+
+**16.3 A consuming receiver method is a distinct need. (gap)** Section 6.4
+defers moving a move-only value *out of* a subplace. Specification 023 wants
+something different: a method that consumes its whole receiver, so that
+`file.close()` can report an error and make the handle unusable afterwards.
+That is a whole-value transfer of the receiver, not a subplace move, and the
+current consuming-context list in section 6.1 does not include a method
+receiver. Decide whether it should.
+
+**16.4 Who destroys a value moved into a concurrent task? (gap)**
+Specification 022 section 10.2 passes spawn arguments in a payload struct and
+runs them through a compiler-generated thunk. A move-only value passed by value
+into a spawn is therefore owned by the *task*, and the thunk -- not the
+spawning frame -- must run its cleanup plan. Specification 023 section 11 does
+exactly this with a `TcpStream`. This RFC's checked cleanup plan must cover a
+generated thunk as a scope, which no section currently says.
+
+**16.5 Adding a move-only field is a breaking change.** Section 5.3 propagates
+move-only status structurally, so adding one `Box<T>` or one file handle to an
+existing copyable struct silently makes every existing copy of that struct a
+move, and every second use an error. That is correct behavior and a real
+migration hazard worth stating in the specification rather than discovering in
+a diagnostic.
+
+**16.6 The move checker needs multi-span diagnostics.** Section 11's messages
+must point at the consuming operation *and* the invalid later use.
+`Diagnostic` in the compiler currently carries a single optional span.
+Specification 022 section 14.23 needs the same facility for its borrow rules,
+so this is shared infrastructure worth building once rather than a cost either
+specification should carry alone.
+
+## 17. References
 
 - [`LANGUAGE.md`](../../LANGUAGE.md)
 - [RFC 015: Function and Method Recursion](015-function-recursion.md)

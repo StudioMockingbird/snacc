@@ -2,7 +2,7 @@
 
 Document kind: Execution plan
 
-Specification: [docs/specs/016-box-indirection-and-recursive-data.md](016-box-indirection-and-recursive-data.md)
+Specification: [RFC 016: Box Indirection and Recursive Data Structures](016-box-indirection-and-recursive-data.md)
 
 Base: after Specification 018 lands in full (Task A committed at ce19c80; Task
 B in flight). Section 5.2 of RFC 016 shows an inline-optional-link example
