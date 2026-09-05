@@ -1,6 +1,6 @@
 type Point is struct
-    x: Dec64,
-    y: Dec64,
+    x: Float64,
+    y: Float64,
 end
 
 extern rust "snacc_user_take_point" fun take(point: Point)

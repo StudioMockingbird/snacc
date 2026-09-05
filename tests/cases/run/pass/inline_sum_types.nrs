@@ -13,12 +13,12 @@ type SumShape is union
       end
 end
 
-fun sum_maybe_byte(found: Bool, byte: UInt8): UInt8 | Nil do
+fun sum_maybe_byte(found: Bool, byte: Byte): Byte | Nil do
     if found then byte else nil end
 end
 
-fun sum_describe_byte(value: UInt8 | Nil): UInt8 do
-    if value is UInt8(byte) then
+fun sum_describe_byte(value: Byte | Nil): Byte do
+    if value is Byte(byte) then
         byte
     elseif value is Nil then
         0u8
@@ -37,8 +37,8 @@ fun sum_shape_area(value: SumShape | Nil): Int64 do
     end
 end
 
-let sum_present: UInt8 | Nil = sum_maybe_byte(true, 7u8)
-let sum_absent: UInt8 | Nil = sum_maybe_byte(false, 7u8)
+let sum_present: Byte | Nil = sum_maybe_byte(true, 7u8)
+let sum_absent: Byte | Nil = sum_maybe_byte(false, 7u8)
 print(sum_describe_byte(sum_present))
 print(sum_describe_byte(sum_absent))
 

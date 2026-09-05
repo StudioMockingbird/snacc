@@ -1,6 +1,6 @@
 # Specification 021: Truthiness and Equality
 
-Status: Proposed
+Status: Closed
 
 Document kind: Language semantics (ISO/IEC-style specification)
 
@@ -29,7 +29,7 @@ depends on:
 
 - [Specification 018](archive/018-inline-sum-types.md) for structural sum identity,
   active alternatives, and contextual `nil`;
-- [Specification 020](020-literal-cleanup-and-numeric-radices.md) for the
+- [Specification 020](archive/020-literal-cleanup-and-numeric-radices.md) for the
   `Float64` name and final numeric literal surface;
 - [RFC 016](archive/016-box-indirection-and-recursive-data.md) for box truthiness and
   the explicit absence of box equality;
@@ -888,5 +888,5 @@ condition as a success test.
 - [RFC 017: UTF-8 Strings, Byte Views, and Unicode Views](017-utf8-strings-and-views.md)
 - [Specification 018: Inline Sum Types](archive/018-inline-sum-types.md)
 - [Specification 019: Collections and Iteration](019-collections-and-iteration.md)
-- [Specification 020: Literal Cleanup and Numeric Radices](020-literal-cleanup-and-numeric-radices.md)
+- [Specification 020: Literal Cleanup and Numeric Radices](archive/020-literal-cleanup-and-numeric-radices.md)
 - [Specification 024: Error Handling](024-error-handling.md)

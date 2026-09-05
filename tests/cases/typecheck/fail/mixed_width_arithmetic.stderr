@@ -1,1 +1,1 @@
-arithmetic operands must be two numbers of the same type, found 'UInt8' and 'UInt16'
+arithmetic operands must be two numbers of the same type, found 'Byte' and 'UInt16'

@@ -1,7 +1,7 @@
 // Specification 011 section 6.1: no implicit conversion establishes a
-// reference. `Int64` widens to `Dec64` as a value, but not as a referent.
+// reference. `Int64` widens to `Float64` as a value, but not as a referent.
 
-fun scale(value: Ref<Dec64>) do
+fun scale(value: Ref<Float64>) do
     value = value * 2.0
 end
 

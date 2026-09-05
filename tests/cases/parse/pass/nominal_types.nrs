@@ -3,8 +3,8 @@
 type UserId is Int64
 
 type Point is struct
-    x: Dec64,
-    y: Dec64,
+    x: Float64,
+    y: Float64,
 end
 
 type Marker is struct end
@@ -27,11 +27,11 @@ type MaybeUser is union
     | Nil
 end
 
-method Point.length(): Dec64 do
+method Point.length(): Float64 do
     self.x * self.x + self.y * self.y
 end
 
-method Point.translate(dx: Dec64, dy: Dec64) do
+method Point.translate(dx: Float64, dy: Float64) do
     self.x = self.x + dx
     self.y = self.y + dy
 end

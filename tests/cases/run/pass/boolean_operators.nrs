@@ -1,0 +1,12 @@
+fun side_effect(): Bool do
+    print(1)
+    true
+end
+
+print(!false)
+print(true and false)
+print(false or true)
+print(false and side_effect())
+print(true or side_effect())
+let combined: Bool = 1 < 2 and !(2 < 1)
+print(combined)

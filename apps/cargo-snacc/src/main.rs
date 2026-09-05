@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use snacc_compiler::{
-    CompileOptions, Diagnostics, Optimization, ParamMode, Program, TParam, Ty, check,
-    emit_object_with_options,
+    CollectionDef, CompileOptions, Diagnostics, Optimization, ParamMode, Program, TParam, Ty,
+    check, emit_object_with_options,
 };
 use std::env;
 use std::fs;
@@ -867,13 +867,24 @@ fn apply_bridge_assertions(command: &mut Command, assertions: &BridgeAssertions)
 fn rust_abi_type(ty: Ty) -> &'static str {
     match ty {
         Ty::Int64 => "i64",
-        Ty::Dec64 => "f64",
+        Ty::Float64 => "f64",
         Ty::Bool => "u8",
-        Ty::UInt8 => "u8",
+        Ty::Byte => "u8",
         Ty::UInt16 => "u16",
         Ty::UInt32 => "u32",
         Ty::UInt64 => "u64",
         Ty::Float32 => "f32",
+        Ty::String
+        | Ty::Unicode
+        | Ty::ViewByte
+        | Ty::ViewUnicode
+        | Ty::Array(_)
+        | Ty::List(_)
+        | Ty::View(_)
+        | Ty::Map(_)
+        | Ty::Set(_) => unreachable!(
+            "internal error: strings, Unicode values, and views are not supported by the Rust bridge"
+        ),
         // Specification 010 section 16 rejects every user-defined type at every
         // `extern rust` parameter and result, and Specification 012 section 12
         // removes standalone `Nil` from the bridge entirely. Declaration
@@ -900,25 +911,71 @@ fn rust_abi_type(ty: Ty) -> &'static str {
     }
 }
 
-/// Specification 011 section 12.2: `Ref<T>` maps to `&mut R` where `R` is the
-/// referent's existing scalar mapping. A value parameter and a reference
-/// parameter are never interchangeable, so the assertion spells the reference
-/// out and a mode change fails the generated `const _` on the next build.
-fn rust_abi_param_type(param: &TParam) -> String {
-    match param.mode {
-        ParamMode::Value => rust_abi_type(param.ty).to_string(),
-        ParamMode::Reference => format!("&mut {}", rust_abi_type(param.ty)),
+fn rust_view_element_type(checked: &Program, ty: Ty) -> Option<&'static str> {
+    let element = match ty {
+        Ty::ViewByte => Ty::Byte,
+        Ty::ViewUnicode => Ty::Unicode,
+        Ty::View(id) => match checked.collections.get(id.0 as usize)? {
+            CollectionDef::View { elem } => *elem,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    match element {
+        Ty::Byte => Some("u8"),
+        Ty::UInt16 => Some("u16"),
+        Ty::UInt32 => Some("u32"),
+        Ty::UInt64 => Some("u64"),
+        Ty::Int64 => Some("i64"),
+        Ty::Bool => Some("u8"),
+        Ty::Unicode => Some("u32"),
+        Ty::Float32 => Some("f32"),
+        Ty::Float64 => Some("f64"),
+        _ => None,
     }
 }
 
-/// A bridge without a result (`TExtern.result: None`) has a C ABI result of
-/// `void`; the Rust assertion for it spells that out as `-> ()` explicitly
-/// rather than omitting the arrow, so every generated line keeps the same
-/// shape.
-fn rust_abi_result_type(ty: Option<Ty>) -> &'static str {
+/// The ordinary Rust signature exposed to a host author. Views are borrowed
+/// slices; the generated adapter below is the only code that sees their raw
+/// pointer and length representation.
+fn rust_source_type(checked: &Program, ty: Ty) -> String {
+    if let Some(element) = rust_view_element_type(checked, ty) {
+        return format!("&[{element}]");
+    }
+    rust_abi_type(ty).to_string()
+}
+
+/// Specification 011 section 12.2: `Ref<T>` maps to `&mut R` in ordinary Rust
+/// source. The generated C ABI adapter receives a mutable pointer for it.
+fn rust_source_param_type(checked: &Program, param: &TParam) -> String {
+    match param.mode {
+        ParamMode::Value => rust_source_type(checked, param.ty),
+        ParamMode::Reference => format!("&mut {}", rust_source_type(checked, param.ty)),
+    }
+}
+
+fn rust_physical_params(checked: &Program, params: &[TParam]) -> Vec<String> {
+    let mut physical = Vec::new();
+    for param in params {
+        if param.mode == ParamMode::Value {
+            if let Some(element) = rust_view_element_type(checked, param.ty) {
+                physical.push(format!("*const {element}"));
+                physical.push("usize".to_string());
+                continue;
+            }
+        }
+        physical.push(match param.mode {
+            ParamMode::Value => rust_abi_type(param.ty).to_string(),
+            ParamMode::Reference => format!("*mut {}", rust_abi_type(param.ty)),
+        });
+    }
+    physical
+}
+
+fn rust_bridge_result_type(ty: Option<Ty>) -> String {
     match ty {
-        Some(ty) => rust_abi_type(ty),
-        None => "()",
+        Some(ty) => rust_abi_type(ty).to_string(),
+        None => "()".to_string(),
     }
 }
 
@@ -935,18 +992,70 @@ fn render_bridge_assertions(checked: &Program, entry: &Path, source: &str) -> St
     ));
     for name in names {
         let extern_decl = &checked.externs[name];
-        let params = extern_decl
+        let source_params = extern_decl
             .params
             .iter()
-            .map(rust_abi_param_type)
+            .map(|param| rust_source_param_type(checked, param))
             .collect::<Vec<_>>()
             .join(", ");
+        let result = rust_bridge_result_type(extern_decl.result);
+        let physical_params = rust_physical_params(checked, &extern_decl.params);
+        let mut physical_names = Vec::new();
+        let mut call_args = Vec::new();
+        let mut conversions = Vec::new();
+        let mut physical_index = 0usize;
+        for (source_index, param) in extern_decl.params.iter().enumerate() {
+            let source_name = format!("arg{source_index}");
+            if param.mode == ParamMode::Value {
+                if let Some(element) = rust_view_element_type(checked, param.ty) {
+                    let pointer_name = format!("{source_name}_ptr");
+                    let length_name = format!("{source_name}_len");
+                    physical_names.push(pointer_name.clone());
+                    physical_names.push(length_name.clone());
+                    conversions.push(format!(
+                        "    let {source_name} = if {length_name} == 0 {{\n        unsafe {{ core::slice::from_raw_parts(core::ptr::NonNull::<{element}>::dangling().as_ptr(), 0) }}\n    }} else {{\n        unsafe {{ core::slice::from_raw_parts({pointer_name}, {length_name}) }}\n    }};\n"
+                    ));
+                    call_args.push(source_name);
+                    physical_index += 2;
+                    let _ = element;
+                } else {
+                    physical_names.push(source_name.clone());
+                    call_args.push(source_name);
+                    physical_index += 1;
+                }
+            } else {
+                physical_names.push(source_name.clone());
+                conversions.push(format!(
+                    "    let {source_name} = unsafe {{ &mut *{source_name} }};\n"
+                ));
+                call_args.push(source_name);
+                physical_index += 1;
+            }
+        }
+        debug_assert_eq!(physical_index, physical_params.len());
+        let physical_signature = physical_names
+            .into_iter()
+            .zip(physical_params)
+            .map(|(name, ty)| format!("{name}: {ty}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let call = format!(
+            "crate::interop::{}({})",
+            extern_decl.symbol,
+            call_args.join(", ")
+        );
         let (line, column) = line_column(source, extern_decl.span.start);
         rendered.push_str(&format!(
-            "const _: unsafe extern \"C\" fn({params}) -> {ret} = crate::interop::{symbol}; // snacc: {name} ({entry}:{line}:{column})\n",
-            ret = rust_abi_result_type(extern_decl.result),
+            "const _: fn({source_params}) -> {result} = crate::interop::{symbol}; // snacc: {name} ({entry}:{line}:{column})\n\
+             #[unsafe(export_name = \"{symbol}\")]\n\
+             pub extern \"C\" fn __snacc_bridge_{symbol}({physical_signature}) -> {result} {{\n\
+             {conversions}    {call}\n\
+             }}\n",
+            result = result,
             symbol = extern_decl.symbol,
             entry = entry.display(),
+            conversions = conversions.concat(),
+            call = call,
         ));
     }
     rendered
@@ -1550,7 +1659,7 @@ mod tests {
     fn render_bridge_assertions_sorts_by_snacc_name_and_maps_types() {
         let source = concat!(
             "extern rust \"snacc_user_zeta\" fun zeta(value: Bool)\n",
-            "extern rust \"snacc_user_alpha\" fun alpha(a: Int64, b: Dec64): Bool\n",
+            "extern rust \"snacc_user_alpha\" fun alpha(a: Int64, b: Float64): Bool\n",
             "print(0)\n"
         );
         let checked = check(source).expect("bridge declarations should type check");
@@ -1578,7 +1687,7 @@ mod tests {
     #[test]
     fn render_bridge_assertions_maps_every_new_scalar_type() {
         let source = concat!(
-            "extern rust \"snacc_user_u8\" fun echo_u8(value: UInt8): UInt8\n",
+            "extern rust \"snacc_user_u8\" fun echo_u8(value: Byte): Byte\n",
             "extern rust \"snacc_user_u16\" fun echo_u16(value: UInt16): UInt16\n",
             "extern rust \"snacc_user_u32\" fun echo_u32(value: UInt32): UInt32\n",
             "extern rust \"snacc_user_u64\" fun echo_u64(value: UInt64): UInt64\n",

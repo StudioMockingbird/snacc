@@ -1,1 +1,1 @@
-type MaybeByte is UInt8 | Nil
+type MaybeByte is Byte | Nil

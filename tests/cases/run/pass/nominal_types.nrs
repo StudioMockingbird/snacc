@@ -6,8 +6,8 @@
 type Meters is Int64
 
 type Vec2 is struct
-    x: Dec64,
-    y: Dec64,
+    x: Float64,
+    y: Float64,
 end
 
 type Tag is struct end
@@ -19,7 +19,7 @@ end
 
 // A scalar field of every Specification 009 width, carried inside a struct.
 type Packet is struct
-    code: UInt8,
+    code: Byte,
     ratio: Float32,
 end
 
@@ -41,11 +41,11 @@ type Maybe is union
     | Nil
 end
 
-method Vec2.dot_self(): Dec64 do
+method Vec2.dot_self(): Float64 do
     self.x * self.x + self.y * self.y
 end
 
-method Vec2.shift(dx: Dec64, dy: Dec64) do
+method Vec2.shift(dx: Float64, dy: Float64) do
     self.x = self.x + dx
     self.y = self.y + dy
 end

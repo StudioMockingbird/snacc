@@ -1,6 +1,6 @@
 # Specification 019: Collections and Iteration
 
-Status: Proposed
+Status: Closed
 
 Document kind: Language semantics (ISO/IEC-style specification)
 
@@ -29,7 +29,7 @@ This specification depends on:
   `View<Byte>` and `View<Unicode>` borrow model;
 - [Specification 018](archive/018-inline-sum-types.md) for fallible slice results such
   as `View<T> | Nil`; and
-- [Specification 020](020-literal-cleanup-and-numeric-radices.md) for the
+- [Specification 020](archive/020-literal-cleanup-and-numeric-radices.md) for the
   uniform `Float32` and `Float64` floating-point names.
 
 It generalizes RFC 017's two closed view forms into `View<T>`. It does not
@@ -952,5 +952,5 @@ outside the program's own memory.
 - [RFC 016: Box Indirection and Recursive Data Structures](archive/016-box-indirection-and-recursive-data.md)
 - [RFC 017: UTF-8 Strings, Byte Views, and Unicode Views](017-utf8-strings-and-views.md)
 - [Specification 018: Inline Sum Types](archive/018-inline-sum-types.md)
-- [Specification 020: Literal Cleanup and Numeric Radices](020-literal-cleanup-and-numeric-radices.md)
-- [Specification 021: Truthiness and Equality](021-truthiness-and-equality.md)
+- [Specification 020: Literal Cleanup and Numeric Radices](archive/020-literal-cleanup-and-numeric-radices.md)
+- [Specification 021: Truthiness and Equality](archive/021-truthiness-and-equality.md)

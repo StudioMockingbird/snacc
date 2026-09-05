@@ -1,6 +1,6 @@
 type Point is struct
-    x: Dec64,
-    y: Dec64,
+    x: Float64,
+    y: Float64,
 end
 
 let point: Point = Point(x: 3.0)

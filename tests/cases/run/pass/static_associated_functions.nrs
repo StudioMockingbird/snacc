@@ -1,0 +1,23 @@
+type StaticPoint is struct
+    x: Int64
+end
+
+type StaticShape is union
+    | Dot
+end
+
+static StaticPoint.origin(): StaticPoint do
+    StaticPoint(x: 42)
+end
+
+static StaticShape.Dot.make(): StaticShape.Dot do
+    StaticShape.Dot()
+end
+
+static Int64.answer(): Int64 do
+    7
+end
+
+print(StaticPoint.origin().x)
+print(Int64.answer())
+let static_shape_value: StaticShape.Dot = StaticShape.Dot.make()

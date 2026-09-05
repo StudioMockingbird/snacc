@@ -97,6 +97,53 @@ impl BoxId {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CollectionId(pub u32);
+
+impl CollectionId {
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Compiler-owned metadata for the closed collection families. These are
+/// interned by complete element/key arguments so every checked collection has
+/// one stable identity before lowering.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CollectionDef {
+    Array { elem: Ty, len: u64 },
+    List { elem: Ty },
+    View { elem: Ty },
+    Map { key: Ty, value: Ty },
+    Set { elem: Ty },
+}
+
+#[derive(Default)]
+pub struct CollectionTable {
+    defs: Vec<CollectionDef>,
+    index: HashMap<CollectionDef, CollectionId>,
+}
+
+impl CollectionTable {
+    pub fn intern(&mut self, def: CollectionDef) -> CollectionId {
+        if let Some(id) = self.index.get(&def) {
+            return *id;
+        }
+        let id = CollectionId(self.defs.len() as u32);
+        self.defs.push(def.clone());
+        self.index.insert(def, id);
+        id
+    }
+
+    pub fn get(&self, id: CollectionId) -> &CollectionDef {
+        &self.defs[id.index()]
+    }
+
+    pub fn all(&self) -> &[CollectionDef] {
+        &self.defs
+    }
+}
+
 /// Interns each `Box<T>`'s pointee type, mirroring [`SumTable`] above: a
 /// box's whole identity is its one pointee type (Specification 016 section
 /// 4.1), so two occurrences of `Box<Int64>` share one [`Ty::Box`] id and no
@@ -248,6 +295,8 @@ pub struct Types {
     /// already allocated during declaration collection (Specification 016
     /// section 4.1).
     boxes: BoxTable,
+    collections: CollectionTable,
+    generic_specializations: HashMap<String, TypeId>,
 }
 
 impl Types {
@@ -310,6 +359,30 @@ impl Types {
                 .collect::<Vec<_>>()
                 .join(" | "),
             Ty::Box(id) => format!("Box<{}>", self.display(self.boxes.pointee(id))),
+            Ty::Array(id) => match self.collections.get(id) {
+                CollectionDef::Array { elem, len } => {
+                    format!("Array<{}, {}>", self.display(*elem), len)
+                }
+                _ => "Array<?>".into(),
+            },
+            Ty::List(id) => match self.collections.get(id) {
+                CollectionDef::List { elem } => format!("List<{}>", self.display(*elem)),
+                _ => "List<?>".into(),
+            },
+            Ty::View(id) => match self.collections.get(id) {
+                CollectionDef::View { elem } => format!("View<{}>", self.display(*elem)),
+                _ => "View<?>".into(),
+            },
+            Ty::Map(id) => match self.collections.get(id) {
+                CollectionDef::Map { key, value } => {
+                    format!("Map<{}, {}>", self.display(*key), self.display(*value))
+                }
+                _ => "Map<?, ?>".into(),
+            },
+            Ty::Set(id) => match self.collections.get(id) {
+                CollectionDef::Set { elem } => format!("Set<{}>", self.display(*elem)),
+                _ => "Set<?>".into(),
+            },
             scalar => scalar.to_string(),
         }
     }
@@ -329,7 +402,13 @@ impl Types {
             // Specification 016 section 8.3: direct equality involving a box
             // is unsupported initially, regardless of whether the pointee
             // itself would support it.
-            Ty::Box(_) => false,
+            Ty::Box(_) | Ty::Map(_) | Ty::Set(_) => false,
+            Ty::Array(id) | Ty::List(id) | Ty::View(id) => match self.collections.get(id) {
+                CollectionDef::Array { elem, .. }
+                | CollectionDef::List { elem }
+                | CollectionDef::View { elem } => self.supports_equality(*elem),
+                _ => false,
+            },
             // Every scalar compares with itself.
             _ => true,
         }
@@ -349,7 +428,12 @@ impl Types {
                 .members(id)
                 .iter()
                 .any(|member| self.is_move_only(*member)),
-            Ty::Box(_) => true,
+            Ty::Box(_) | Ty::String | Ty::List(_) | Ty::Map(_) | Ty::Set(_) => true,
+            Ty::Array(id) => match self.collections.get(id) {
+                CollectionDef::Array { elem, .. } => self.is_move_only(*elem),
+                _ => false,
+            },
+            Ty::View(_) => false,
             _ => false,
         }
     }
@@ -392,6 +476,89 @@ impl Types {
     pub fn all_boxes(&self) -> &[Ty] {
         self.boxes.all()
     }
+
+    pub fn collection(&self, id: CollectionId) -> &CollectionDef {
+        self.collections.get(id)
+    }
+
+    pub fn intern_collection(&mut self, def: CollectionDef) -> CollectionId {
+        self.collections.intern(def)
+    }
+
+    pub fn all_collections(&self) -> &[CollectionDef] {
+        self.collections.all()
+    }
+
+    pub fn generic_specialization(&self, name: &str, args: &[Ty]) -> Option<TypeId> {
+        self.generic_specializations
+            .get(&format!("{name}<{args:?}>"))
+            .copied()
+    }
+
+    pub fn reserve_generic_struct(&mut self, key: String, name: String) -> TypeId {
+        if let Some(id) = self.generic_specializations.get(&key).copied() {
+            return id;
+        }
+        let id = TypeId(self.defs.len() as u32);
+        self.defs.push(TypeDef::Struct {
+            name,
+            fields: Vec::new(),
+        });
+        self.equality.push(false);
+        self.move_only.push(false);
+        self.generic_specializations.insert(key, id);
+        id
+    }
+
+    pub fn finish_generic_struct(&mut self, id: TypeId, fields: Vec<(String, Ty)>) {
+        if let TypeDef::Struct { fields: target, .. } = &mut self.defs[id.index()] {
+            *target = fields;
+        }
+    }
+
+    /// Returns the first by-value cycle reachable from a newly materialized
+    /// generic struct. Boxed edges terminate exactly as they do for ordinary
+    /// declarations.
+    pub fn generic_layout_cycle(&self, start: TypeId) -> Option<Vec<String>> {
+        fn visit(
+            types: &Types,
+            id: TypeId,
+            stack: &mut Vec<TypeId>,
+            done: &mut HashMap<TypeId, ()>,
+        ) -> Option<Vec<String>> {
+            if let Some(position) = stack.iter().position(|entry| *entry == id) {
+                return Some(
+                    stack[position..]
+                        .iter()
+                        .chain(std::iter::once(&id))
+                        .map(|entry| types.def(*entry).name().to_string())
+                        .collect(),
+                );
+            }
+            if done.contains_key(&id) {
+                return None;
+            }
+            stack.push(id);
+            for next in contained(types.def(id), &types.sums) {
+                if let Some(cycle) = visit(types, next, stack, done) {
+                    return Some(cycle);
+                }
+            }
+            stack.pop();
+            done.insert(id, ());
+            None
+        }
+
+        visit(self, start, &mut Vec::new(), &mut HashMap::new())
+    }
+
+    /// Generic specializations extend the type graph after declaration
+    /// collection, so their structural capabilities are recomputed once each
+    /// new finite layout is complete.
+    pub fn refresh_generic_properties(&mut self) {
+        self.equality = equality_support(&self.defs, &self.sums);
+        self.move_only = move_only_support(&self.defs, &self.sums);
+    }
 }
 
 /// Everything declaration collection produces.
@@ -401,6 +568,9 @@ pub struct Collected {
     pub method_index: HashMap<(TypeId, String), MethodId>,
     /// Resolved signatures for `fun` and `extern rust` declarations.
     pub sigs: HashMap<String, FuncSig>,
+    /// Qualified callable key for each source-order static declaration.
+    pub static_names: Vec<Option<String>>,
+    pub specialization_count: usize,
 }
 
 #[derive(Clone)]
@@ -411,7 +581,7 @@ pub struct FuncSig {
 
 /// A partially built table: the name maps exist before any body is resolved so
 /// field and represented types can refer to types declared later.
-struct Builder {
+struct Builder<'src> {
     defs: Vec<Option<TypeDef>>,
     spans: Vec<Span>,
     top_level: HashMap<String, TypeId>,
@@ -422,9 +592,15 @@ struct Builder {
     /// Interned box pointees, moved into the finished [`Types`] once
     /// collection ends (Specification 016 section 4.1).
     boxes: BoxTable,
+    collections: CollectionTable,
+    /// Generic type templates are kept out of the nominal type table until an
+    /// explicit application requests a concrete specialization.
+    generic_types: HashMap<String, (Vec<&'src str>, TypeBody<'src>)>,
+    generic_specializations: HashMap<String, TypeId>,
+    generic_stack: Vec<String>,
 }
 
-impl Builder {
+impl Builder<'_> {
     fn allocate(&mut self, name: String, span: Span) -> TypeId {
         let id = TypeId(self.defs.len() as u32);
         self.defs.push(None);
@@ -475,10 +651,19 @@ pub const SUM_AS_REPRESENTED_TARGET: &str = "an inline sum cannot be a represent
 
 /// Resolves one written type. Returns `None` after reporting an unresolved or
 /// malformed path, a standalone `Nil`, or an invalid sum.
-fn resolve(
-    builder: &mut Builder,
-    ty: &Spanned<TypeRef<'_>>,
+fn resolve<'src>(
+    builder: &mut Builder<'src>,
+    ty: &Spanned<TypeRef<'src>>,
     errors: &mut Vec<Error>,
+) -> Option<Ty> {
+    resolve_with_params(builder, ty, errors, &HashMap::new())
+}
+
+fn resolve_with_params<'src>(
+    builder: &mut Builder<'src>,
+    ty: &Spanned<TypeRef<'src>>,
+    errors: &mut Vec<Error>,
+    params: &HashMap<&'src str, Ty>,
 ) -> Option<Ty> {
     match &ty.0 {
         TypeRef::Builtin(TypeName::Nil) => {
@@ -491,6 +676,11 @@ fn resolve(
         TypeRef::Builtin(name) => Some(Ty::from(*name)),
         TypeRef::Named(segments) => {
             let first = segments[0].0;
+            if segments.len() == 1
+                && let Some(ty) = params.get(first)
+            {
+                return Some(*ty);
+            }
             let Some(root) = builder.top_level.get(first).copied() else {
                 errors.push(Error {
                     span: segments[0].1,
@@ -525,7 +715,8 @@ fn resolve(
                 }
             }
         }
-        TypeRef::Sum(members) => resolve_sum(builder, members, ty.1, errors),
+        TypeRef::Apply { path, args } => resolve_apply(builder, path, args, ty.1, errors, params),
+        TypeRef::Sum(members) => resolve_sum_with_params(builder, members, ty.1, errors, params),
         // Specification 016 section 4.1: the pointee resolves through
         // ordinary type resolution. `Ref<T>` and a no-result type have no
         // `TypeRef` spelling that reaches here at all (the parser's
@@ -535,10 +726,226 @@ fn resolve(
         // failed to resolve on its own already reported its own error and
         // falls back to `Ty::Nil` like every other filler here.
         TypeRef::Box(inner) => {
-            let pointee = resolve(builder, inner, errors).unwrap_or(Ty::Nil);
+            let pointee = resolve_with_params(builder, inner, errors, params).unwrap_or(Ty::Nil);
             Some(Ty::Box(builder.boxes.intern(pointee)))
         }
+        TypeRef::View(inner) => {
+            match resolve_with_params(builder, inner, errors, params).unwrap_or(Ty::Nil) {
+                Ty::Byte => Some(Ty::ViewByte),
+                Ty::Unicode => Some(Ty::ViewUnicode),
+                other => Some(Ty::View(
+                    builder
+                        .collections
+                        .intern(CollectionDef::View { elem: other }),
+                )),
+            }
+        }
+        TypeRef::Array(inner, len) => {
+            let elem = resolve_with_params(builder, inner, errors, params).unwrap_or(Ty::Nil);
+            resolve_collection(builder, CollectionDef::Array { elem, len: *len })
+        }
+        TypeRef::List(inner) => {
+            let elem = resolve_with_params(builder, inner, errors, params).unwrap_or(Ty::Nil);
+            resolve_collection(builder, CollectionDef::List { elem })
+        }
+        TypeRef::Map(key, value) => {
+            let key = resolve_with_params(builder, key, errors, params).unwrap_or(Ty::Nil);
+            let value = resolve_with_params(builder, value, errors, params).unwrap_or(Ty::Nil);
+            resolve_collection(builder, CollectionDef::Map { key, value })
+        }
+        TypeRef::Set(inner) => {
+            let elem = resolve_with_params(builder, inner, errors, params).unwrap_or(Ty::Nil);
+            resolve_collection(builder, CollectionDef::Set { elem })
+        }
     }
+}
+
+fn resolve_apply<'src>(
+    builder: &mut Builder<'src>,
+    path: &[Spanned<&'src str>],
+    args: &[Spanned<TypeRef<'src>>],
+    span: Span,
+    errors: &mut Vec<Error>,
+    params: &HashMap<&'src str, Ty>,
+) -> Option<Ty> {
+    if path.len() != 1 {
+        errors.push(Error {
+            span,
+            msg: "generic type applications must name a top-level type".into(),
+        });
+        return None;
+    }
+    let name = path[0].0;
+    let Some((names, body)) = builder.generic_types.get(name).cloned() else {
+        errors.push(Error {
+            span: path[0].1,
+            msg: format!("Unknown generic type '{name}'"),
+        });
+        return None;
+    };
+    if names.len() != args.len() {
+        errors.push(Error {
+            span,
+            msg: format!(
+                "generic type '{name}' expects {} type arguments, found {}",
+                names.len(),
+                args.len()
+            ),
+        });
+    }
+    let mut concrete = Vec::with_capacity(args.len());
+    for arg in args {
+        concrete.push(resolve_with_params(builder, arg, errors, params).unwrap_or(Ty::Nil));
+    }
+    if concrete.len() != names.len() {
+        return None;
+    }
+    let key = format!("{name}<{concrete:?}>");
+    if let Some(id) = builder.generic_specializations.get(&key) {
+        return Some(Ty::User(*id));
+    }
+    if builder.generic_stack.len() >= 128 {
+        errors.push(Error {
+            span,
+            msg: "generic specialization depth exceeds 128".into(),
+        });
+        return None;
+    }
+    if builder.generic_specializations.len() >= 4096 {
+        errors.push(Error {
+            span,
+            msg: "generic specialization limit exceeded (maximum 4096)".into(),
+        });
+        return None;
+    }
+    let TypeBody::Struct(fields) = body else {
+        errors.push(Error {
+            span,
+            msg: format!("generic type '{name}' must be a struct"),
+        });
+        return None;
+    };
+    let id = TypeId(builder.defs.len() as u32);
+    builder.defs.push(None);
+    builder.spans.push(span);
+    builder.generic_specializations.insert(key, id);
+    let display_args = concrete
+        .iter()
+        .map(|ty| defs_display(&builder.defs, &builder.sums, &builder.boxes, *ty))
+        .collect::<Vec<_>>();
+    let substitutions: HashMap<&'src str, Ty> = names.iter().copied().zip(concrete).collect();
+    builder.generic_stack.push(name.to_string());
+    let resolved = fields
+        .iter()
+        .map(|field| {
+            (
+                field.name.to_string(),
+                resolve_with_params(builder, &field.ty, errors, &substitutions).unwrap_or(Ty::Nil),
+            )
+        })
+        .collect();
+    builder.generic_stack.pop();
+    builder.defs[id.index()] = Some(TypeDef::Struct {
+        name: format!("{name}<{}>", display_args.join(", ")),
+        fields: resolved,
+    });
+    Some(Ty::User(id))
+}
+
+fn validate_generic_type_ref(
+    builder: &Builder<'_>,
+    ty: &Spanned<TypeRef<'_>>,
+    params: &[&str],
+    nil_member: bool,
+    errors: &mut Vec<Error>,
+) {
+    match &ty.0 {
+        TypeRef::Builtin(TypeName::Nil) if !nil_member => errors.push(Error {
+            span: ty.1,
+            msg: STANDALONE_NIL.to_string(),
+        }),
+        TypeRef::Builtin(_) => {}
+        TypeRef::Named(path) => {
+            if path.len() == 1 && params.contains(&path[0].0) {
+                return;
+            }
+            let Some(root) = builder.top_level.get(path[0].0).copied() else {
+                errors.push(Error {
+                    span: path[0].1,
+                    msg: format!("Unknown type '{}'", path[0].0),
+                });
+                return;
+            };
+            if path.len() == 2 {
+                if !builder.members.contains_key(&(root, path[1].0.to_string())) {
+                    errors.push(Error {
+                        span: path[1].1,
+                        msg: format!("Unknown type '{}.{}'", path[0].0, path[1].0),
+                    });
+                }
+            } else if path.len() > 2 {
+                errors.push(Error {
+                    span: ty.1,
+                    msg: "a qualified type name has at most two components".into(),
+                });
+            }
+        }
+        TypeRef::Apply { path, args } => {
+            if path.len() != 1 {
+                errors.push(Error {
+                    span: ty.1,
+                    msg: "generic type applications must name a top-level type".into(),
+                });
+            } else if let Some((expected, _)) = builder.generic_types.get(path[0].0) {
+                if expected.len() != args.len() {
+                    errors.push(Error {
+                        span: ty.1,
+                        msg: format!(
+                            "generic type '{}' expects {} type arguments, found {}",
+                            path[0].0,
+                            expected.len(),
+                            args.len()
+                        ),
+                    });
+                }
+            } else {
+                errors.push(Error {
+                    span: path[0].1,
+                    msg: format!("Unknown generic type '{}'", path[0].0),
+                });
+            }
+            for argument in args {
+                validate_generic_type_ref(builder, argument, params, false, errors);
+            }
+        }
+        TypeRef::Sum(members) => {
+            for member in members {
+                validate_generic_type_ref(builder, member, params, true, errors);
+            }
+        }
+        TypeRef::Box(inner)
+        | TypeRef::View(inner)
+        | TypeRef::Array(inner, _)
+        | TypeRef::List(inner)
+        | TypeRef::Set(inner) => {
+            validate_generic_type_ref(builder, inner, params, false, errors);
+        }
+        TypeRef::Map(key, value) => {
+            validate_generic_type_ref(builder, key, params, false, errors);
+            validate_generic_type_ref(builder, value, params, false, errors);
+        }
+    }
+}
+
+fn resolve_collection(builder: &mut Builder<'_>, def: CollectionDef) -> Option<Ty> {
+    let id = builder.collections.intern(def.clone());
+    Some(match def {
+        CollectionDef::Array { .. } => Ty::Array(id),
+        CollectionDef::List { .. } => Ty::List(id),
+        CollectionDef::View { .. } => Ty::View(id),
+        CollectionDef::Map { .. } => Ty::Map(id),
+        CollectionDef::Set { .. } => Ty::Set(id),
+    })
 }
 
 /// The qualified name of any resolved type, for a builder whose declarations
@@ -567,11 +974,12 @@ fn defs_display(defs: &[Option<TypeDef>], sums: &SumTable, boxes: &BoxTable, ty:
 /// nested sum (from a parenthesized group) into its own already-flattened
 /// members, then applies the member-set rules shared with local `let`
 /// resolution (`resolve_type` in `checker.rs`).
-fn resolve_sum(
-    builder: &mut Builder,
-    members: &[Spanned<TypeRef<'_>>],
+fn resolve_sum_with_params<'src>(
+    builder: &mut Builder<'src>,
+    members: &[Spanned<TypeRef<'src>>],
     span: Span,
     errors: &mut Vec<Error>,
+    params: &HashMap<&'src str, Ty>,
 ) -> Option<Ty> {
     let mut raw: Vec<(Option<Ty>, Span)> = Vec::new();
     for member in members {
@@ -584,7 +992,7 @@ fn resolve_sum(
             raw.push((Some(Ty::Nil), member.1));
             continue;
         }
-        match resolve(builder, member, errors) {
+        match resolve_with_params(builder, member, errors, params) {
             Some(Ty::Sum(id)) => {
                 for flattened in builder.sums.members(id).to_vec() {
                     raw.push((Some(flattened), member.1));
@@ -816,7 +1224,7 @@ fn move_only_support(defs: &[TypeDef], sums: &SumTable) -> Vec<bool> {
                 .to_vec()
                 .iter()
                 .any(|member| ty_move_only(member, defs, sums, memo)),
-            Ty::Box(_) => true,
+            Ty::Box(_) | Ty::String => true,
             _ => false,
         }
     }
@@ -849,9 +1257,9 @@ fn move_only_support(defs: &[TypeDef], sums: &SumTable) -> Vec<bool> {
 
 /// Resolves a parameter list. Duplicate names belong to the function-wide
 /// binding check in the checker, not here.
-fn resolve_params(
-    builder: &mut Builder,
-    params: &[Param<'_>],
+fn resolve_params<'src>(
+    builder: &mut Builder<'src>,
+    params: &[Param<'src>],
     errors: &mut Vec<Error>,
 ) -> Vec<TParam> {
     let mut resolved = Vec::with_capacity(params.len());
@@ -883,6 +1291,7 @@ fn reject_bridge_user_types(
     defs: &[Option<TypeDef>],
     sums: &SumTable,
     boxes: &BoxTable,
+    collections: &CollectionTable,
     params: &[TParam],
     result: Option<Ty>,
     declaration: &ExternFunc<'_>,
@@ -907,11 +1316,44 @@ fn reject_bridge_user_types(
                  are rejected in 'extern rust' parameters and results",
                 name(ty)
             ),
+            Ty::ViewByte | Ty::ViewUnicode => continue,
+            Ty::View(id) => {
+                let valid = matches!(collections.get(id), CollectionDef::View { elem } if matches!(
+                    elem,
+                    Ty::Byte
+                        | Ty::UInt16
+                        | Ty::UInt32
+                        | Ty::UInt64
+                        | Ty::Int64
+                        | Ty::Bool
+                        | Ty::Unicode
+                        | Ty::Float32
+                        | Ty::Float64
+                ));
+                if valid {
+                    continue;
+                }
+                format!(
+                    "'{}' is not a supported Rust bridge view; View<T> requires a scalar element type",
+                    name(ty)
+                )
+            }
             _ => continue,
         };
         errors.push(Error {
             span: declaration.span,
             msg,
+        });
+    }
+    if let Some(result) = result
+        && matches!(result, Ty::ViewByte | Ty::ViewUnicode | Ty::View(_))
+    {
+        errors.push(Error {
+            span: declaration.span,
+            msg: format!(
+                "'{}' is a borrowed view type; views cannot be bridge results",
+                name(result)
+            ),
         });
     }
     // Specification 011 section 12.1: a bridge reference refers only to a
@@ -929,6 +1371,14 @@ fn reject_bridge_user_types(
                     name(param.ty)
                 ),
             });
+        } else if matches!(param.ty, Ty::ViewByte | Ty::ViewUnicode | Ty::View(_)) {
+            errors.push(Error {
+                span: declaration.span,
+                msg: format!(
+                    "'Ref<{}>' cannot cross a Rust bridge; use a by-value View<T> parameter",
+                    name(param.ty)
+                ),
+            });
         }
     }
 }
@@ -943,11 +1393,72 @@ pub fn collect(program: &AstProgram<'_>, errors: &mut Vec<Error>) -> Collected {
         members: HashMap::new(),
         sums: SumTable::default(),
         boxes: BoxTable::default(),
+        collections: CollectionTable::default(),
+        generic_types: HashMap::new(),
+        generic_specializations: HashMap::new(),
+        generic_stack: Vec::new(),
     };
+
+    // Specification 024: Error is a compiler-predeclared nominal struct. It
+    // participates in ordinary field construction and ownership; reserving
+    // its name before source declarations prevents redeclaration without a
+    // second special-case in name resolution.
+    let error_id = builder.allocate("Error".into(), program.body.span);
+    builder.defs[error_id.index()] = Some(TypeDef::Struct {
+        name: "Error".into(),
+        fields: vec![
+            ("category".into(), Ty::String),
+            ("header".into(), Ty::String),
+            ("message".into(), Ty::String),
+        ],
+    });
 
     // Step 1: every top-level type name, in source order.
     let mut declaration_ids = Vec::with_capacity(program.types.len());
     for declaration in &program.types {
+        if !declaration.generic_params.is_empty() {
+            if builder.top_level.contains_key(declaration.name)
+                || builder.generic_types.contains_key(declaration.name)
+            {
+                errors.push(Error {
+                    span: declaration.name_span,
+                    msg: format!("Type '{}' already exists", declaration.name),
+                });
+                declaration_ids.push(None);
+                continue;
+            }
+            if !matches!(declaration.body, TypeBody::Struct(_)) {
+                errors.push(Error {
+                    span: declaration.span,
+                    msg: "generic type declarations currently support struct bodies only".into(),
+                });
+            }
+            let mut params = Vec::new();
+            for (name, span) in &declaration.generic_params {
+                if params.contains(name) {
+                    errors.push(Error {
+                        span: *span,
+                        msg: format!("Generic parameter '{name}' already exists"),
+                    });
+                } else {
+                    params.push(*name);
+                }
+            }
+            builder.generic_types.insert(
+                declaration.name.to_string(),
+                (params, declaration.body.clone()),
+            );
+            declaration_ids.push(None);
+            continue;
+        }
+        if builder.generic_types.contains_key(declaration.name) {
+            errors.push(Error {
+                span: declaration.name_span,
+                msg: format!("Type '{}' already exists", declaration.name),
+            });
+            declaration_ids.push(None);
+            continue;
+        }
         if let Some(existing) = builder.top_level.get(declaration.name) {
             let previous = builder.spans[existing.index()];
             errors.push(Error {
@@ -1019,6 +1530,32 @@ pub fn collect(program: &AstProgram<'_>, errors: &mut Vec<Error>) -> Collected {
         member_ids.push(ids);
     }
 
+    for declaration in program
+        .types
+        .iter()
+        .filter(|declaration| !declaration.generic_params.is_empty())
+    {
+        let params = declaration
+            .generic_params
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>();
+        if let TypeBody::Struct(fields) = &declaration.body {
+            let mut names = Vec::new();
+            for field in fields {
+                if names.contains(&field.name) {
+                    errors.push(Error {
+                        span: field.name_span,
+                        msg: format!("Field '{}.{}' already exists", declaration.name, field.name),
+                    });
+                } else {
+                    names.push(field.name);
+                }
+                validate_generic_type_ref(&builder, &field.ty, &params, false, errors);
+            }
+        }
+    }
+
     // Step 3: resolve every body now that all names exist.
     for ((declaration, id), members) in program.types.iter().zip(&declaration_ids).zip(&member_ids)
     {
@@ -1069,44 +1606,15 @@ pub fn collect(program: &AstProgram<'_>, errors: &mut Vec<Error>) -> Collected {
         builder.defs[id.index()] = Some(def);
     }
 
-    // A name that failed to resolve leaves a hole; fill it with an empty struct
-    // so later phases still index the table safely.
-    let defs: Vec<TypeDef> = builder
-        .defs
-        .iter()
-        .enumerate()
-        .map(|(index, def)| {
-            def.clone().unwrap_or(TypeDef::Struct {
-                name: format!("<unresolved type #{index}>"),
-                fields: Vec::new(),
-            })
-        })
-        .collect();
-
-    // Step 4: infinite layout, before any expression is checked.
-    let acyclic = reject_layout_cycles(&defs, &builder.spans, &builder.sums, errors);
-    let equality = if acyclic {
-        equality_support(&defs, &builder.sums)
-    } else {
-        vec![false; defs.len()]
-    };
-    // Specification 016 section 5.3: computed only once layout is proven
-    // finite, exactly like `equality` above. The default for an already
-    // layout-rejected program is inconsequential (nothing consumes it before
-    // `errors` is reported), so `true` is chosen only for symmetry with
-    // `equality`'s "assume the restrictive answer" default.
-    let move_only = if acyclic {
-        move_only_support(&defs, &builder.sums)
-    } else {
-        vec![true; defs.len()]
-    };
-
-    // Step 5: callable signatures, bridge rejection, and call-head conflicts.
+    // Step 4: callable signatures and their concrete generic type uses.
     let mut sigs: HashMap<String, FuncSig> = HashMap::new();
     let mut func_names: Vec<&str> = program.funcs.keys().copied().collect();
     func_names.sort_unstable();
     for name in func_names {
         let function: &Func<'_> = &program.funcs[name];
+        if !function.generic_params.is_empty() {
+            continue;
+        }
         let params = resolve_params(&mut builder, &function.args, errors);
         let result = function
             .ret
@@ -1127,6 +1635,7 @@ pub fn collect(program: &AstProgram<'_>, errors: &mut Vec<Error>) -> Collected {
             &builder.defs,
             &builder.sums,
             &builder.boxes,
+            &builder.collections,
             &params,
             result,
             function,
@@ -1135,9 +1644,63 @@ pub fn collect(program: &AstProgram<'_>, errors: &mut Vec<Error>) -> Collected {
         sigs.insert(name.to_string(), FuncSig { params, result });
     }
 
+    let mut static_names = Vec::with_capacity(program.statics.len());
+    for declaration in &program.statics {
+        let Some(receiver) = resolve(&mut builder, &declaration.receiver, errors) else {
+            static_names.push(None);
+            continue;
+        };
+        if !matches!(
+            receiver,
+            Ty::Float64
+                | Ty::Int64
+                | Ty::Bool
+                | Ty::String
+                | Ty::Unicode
+                | Ty::Byte
+                | Ty::UInt16
+                | Ty::UInt32
+                | Ty::UInt64
+                | Ty::Float32
+                | Ty::User(_)
+        ) {
+            errors.push(Error {
+                span: declaration.receiver.1,
+                msg: "A static associated function must name one concrete predeclared or user-defined type".into(),
+            });
+            static_names.push(None);
+            continue;
+        }
+        let receiver_name = defs_display(&builder.defs, &builder.sums, &builder.boxes, receiver);
+        let key = format!("{receiver_name}.{}", declaration.name.0);
+        if matches!(key.as_str(), "String.from_utf8" | "String.from_unicode") {
+            errors.push(Error {
+                span: declaration.name.1,
+                msg: format!("Associated function '{key}' is built in and cannot be redeclared"),
+            });
+            static_names.push(None);
+            continue;
+        }
+        if sigs.contains_key(&key) {
+            errors.push(Error {
+                span: declaration.name.1,
+                msg: format!("Associated function '{key}' already exists"),
+            });
+            static_names.push(None);
+            continue;
+        }
+        let params = resolve_params(&mut builder, &declaration.args, errors);
+        let result = declaration
+            .ret
+            .as_ref()
+            .and_then(|ty| resolve(&mut builder, ty, errors));
+        sigs.insert(key.clone(), FuncSig { params, result });
+        static_names.push(Some(key));
+    }
+
     // Specification 010 section 6.1: one call head cannot mean two things.
     for declaration in &program.types {
-        if sigs.contains_key(declaration.name) {
+        if sigs.contains_key(declaration.name) || program.funcs.contains_key(declaration.name) {
             errors.push(Error {
                 span: declaration.name_span,
                 msg: format!(
@@ -1162,7 +1725,9 @@ pub fn collect(program: &AstProgram<'_>, errors: &mut Vec<Error>) -> Collected {
                 span: name_span,
                 msg: format!(
                     "Method '{}.{name}' already exists; methods are not overloaded",
-                    defs[receiver.index()].name()
+                    builder.defs[receiver.index()]
+                        .as_ref()
+                        .map_or("<unresolved type>", TypeDef::name)
                 ),
             });
             continue;
@@ -1183,6 +1748,34 @@ pub fn collect(program: &AstProgram<'_>, errors: &mut Vec<Error>) -> Collected {
         });
     }
 
+    // A callable signature may be the first place that materializes a generic
+    // struct specialization. Freeze and validate the complete type graph only
+    // after every signature has resolved, never from an earlier partial
+    // snapshot.
+    let defs: Vec<TypeDef> = builder
+        .defs
+        .iter()
+        .enumerate()
+        .map(|(index, def)| {
+            def.clone().unwrap_or(TypeDef::Struct {
+                name: format!("<unresolved type #{index}>"),
+                fields: Vec::new(),
+            })
+        })
+        .collect();
+    let acyclic = reject_layout_cycles(&defs, &builder.spans, &builder.sums, errors);
+    let equality = if acyclic {
+        equality_support(&defs, &builder.sums)
+    } else {
+        vec![false; defs.len()]
+    };
+    let move_only = if acyclic {
+        move_only_support(&defs, &builder.sums)
+    } else {
+        vec![true; defs.len()]
+    };
+
+    let specialization_count = builder.generic_specializations.len();
     Collected {
         types: Types {
             defs,
@@ -1192,17 +1785,21 @@ pub fn collect(program: &AstProgram<'_>, errors: &mut Vec<Error>) -> Collected {
             move_only,
             sums: builder.sums,
             boxes: builder.boxes,
+            collections: builder.collections,
+            generic_specializations: builder.generic_specializations,
         },
         methods,
         method_index,
         sigs,
+        static_names,
+        specialization_count,
     }
 }
 
-fn resolve_fields(
-    builder: &mut Builder,
+fn resolve_fields<'src>(
+    builder: &mut Builder<'src>,
     owner: &str,
-    fields: &[crate::syntax::ast::FieldDecl<'_>],
+    fields: &[crate::syntax::ast::FieldDecl<'src>],
     errors: &mut Vec<Error>,
 ) -> Vec<(String, Ty)> {
     let mut resolved: Vec<(String, Ty)> = Vec::new();
@@ -1222,7 +1819,7 @@ fn resolve_fields(
 
 /// Resolves a method's receiver path: `Type.method` or `Union.Member.method`.
 fn method_receiver(
-    builder: &Builder,
+    builder: &Builder<'_>,
     declaration: &MethodDecl<'_>,
     errors: &mut Vec<Error>,
 ) -> Option<TypeId> {

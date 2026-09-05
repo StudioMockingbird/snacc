@@ -18,8 +18,62 @@ use std::{
 use tempfile::TempDir;
 
 #[test]
-fn runtime_implements_abi_version_seven() {
-    assert_eq!(snacc_runtime::ABI_VERSION, 7);
+fn runtime_implements_abi_version_twelve() {
+    assert_eq!(snacc_runtime::ABI_VERSION, 12);
+}
+
+#[test]
+fn integer_maps_and_sets_support_mutation_and_iteration() {
+    let mut map = snacc_runtime::SnaccMap {
+        ptr: std::ptr::null_mut(),
+        len: 0,
+        cap: 0,
+    };
+    assert_eq!(snacc_runtime::snacc_map_i64_i64_insert(&mut map, 7, 70), 1);
+    assert_eq!(snacc_runtime::snacc_map_i64_i64_insert(&mut map, 9, 90), 1);
+    assert_eq!(snacc_runtime::snacc_map_i64_i64_insert(&mut map, 7, 71), 0);
+    assert_eq!(map.len, 2);
+    assert_eq!(snacc_runtime::snacc_map_i64_i64_key_at(&map, 0), 7);
+    assert_eq!(snacc_runtime::snacc_map_i64_i64_value_at(&map, 0), 71);
+    assert_eq!(snacc_runtime::snacc_map_i64_i64_index(&map, 9), 90);
+    snacc_runtime::snacc_map_i64_i64_reserve(&mut map, 8);
+    assert!(map.cap >= 8);
+    assert_eq!(snacc_runtime::snacc_map_i64_i64_delete(&mut map, 9), 1);
+    snacc_runtime::snacc_map_i64_i64_drop(&map);
+
+    let mut set = snacc_runtime::SnaccSet {
+        ptr: std::ptr::null_mut(),
+        len: 0,
+        cap: 0,
+    };
+    assert_eq!(snacc_runtime::snacc_set_i64_insert(&mut set, 3), 1);
+    assert_eq!(snacc_runtime::snacc_set_i64_insert(&mut set, 3), 0);
+    snacc_runtime::snacc_set_i64_reserve(&mut set, 8);
+    assert!(set.cap >= 8);
+    assert_eq!(snacc_runtime::snacc_set_i64_at(&set, 0), 3);
+    assert_eq!(snacc_runtime::snacc_set_i64_contains(&set, 3), 1);
+    assert_eq!(snacc_runtime::snacc_set_i64_delete(&mut set, 3), 1);
+    snacc_runtime::snacc_set_i64_drop(&set);
+}
+
+#[test]
+fn string_collection_iteration_returns_non_owning_descriptors() {
+    let bytes = b"Alice";
+    let mut map = snacc_runtime::SnaccMap {
+        ptr: std::ptr::null_mut(),
+        len: 0,
+        cap: 0,
+    };
+    let key = snacc_runtime::snacc_string_new(bytes.as_ptr(), bytes.len());
+    assert_eq!(
+        snacc_runtime::snacc_map_string_i64_insert(&mut map, &key, 10),
+        1
+    );
+    let borrowed = snacc_runtime::snacc_map_string_i64_key_at(&map, 0);
+    assert_eq!(borrowed.cap, 0);
+    let borrowed_bytes = unsafe { std::slice::from_raw_parts(borrowed.ptr, borrowed.len) };
+    assert_eq!(borrowed_bytes, bytes);
+    snacc_runtime::snacc_map_string_i64_drop(&map);
 }
 
 // ---------------------------------------------------------------------
@@ -68,6 +122,61 @@ fn snacc_alloc_of_a_zero_sized_pointee_is_non_null_and_never_reaches_the_allocat
     // global allocator, so passing it back is always safe.
     snacc_runtime::snacc_dealloc(first, 0, 8);
     snacc_runtime::snacc_dealloc(second, 0, 8);
+}
+
+#[test]
+fn scalar_list_push_grows_and_clear_resets_length() {
+    let mut list = snacc_runtime::SnaccList {
+        ptr: std::ptr::null_mut(),
+        len: 0,
+        cap: 0,
+    };
+    for value in 0..10 {
+        snacc_runtime::snacc_list_push_i64(&mut list, value);
+    }
+    assert_eq!(list.len, 10);
+    assert!(list.cap >= 10);
+    // Safety: the runtime just initialized `list.len` contiguous i64 values.
+    let values = unsafe { std::slice::from_raw_parts(list.ptr.cast::<i64>(), list.len) };
+    assert_eq!(values, &(0..10).collect::<Vec<_>>());
+    snacc_runtime::snacc_list_clear(&mut list);
+    assert_eq!(list.len, 0);
+    snacc_runtime::snacc_dealloc(
+        list.ptr,
+        list.cap * std::mem::size_of::<i64>(),
+        std::mem::align_of::<i64>(),
+    );
+}
+
+#[test]
+fn scalar_list_insert_remove_pop_and_reserve_preserve_order() {
+    let mut list = snacc_runtime::SnaccList {
+        ptr: std::ptr::null_mut(),
+        len: 0,
+        cap: 0,
+    };
+    snacc_runtime::snacc_list_push_i64(&mut list, 10);
+    snacc_runtime::snacc_list_push_i64(&mut list, 30);
+    snacc_runtime::snacc_list_insert_i64(&mut list, 1, 20);
+    assert_eq!(snacc_runtime::snacc_list_remove_i64(&mut list, 0), 10);
+    assert_eq!(snacc_runtime::snacc_list_pop_i64(&mut list), 30);
+    assert_eq!(list.len, 1);
+    // A reserve request is a lower bound, not an exact capacity request.
+    snacc_runtime::snacc_list_reserve(
+        &mut list,
+        10,
+        std::mem::size_of::<i64>(),
+        std::mem::align_of::<i64>(),
+    );
+    assert!(list.cap >= 10);
+    // Safety: one initialized i64 remains at the start of the allocation.
+    let values = unsafe { std::slice::from_raw_parts(list.ptr.cast::<i64>(), list.len) };
+    assert_eq!(values, &[20]);
+    snacc_runtime::snacc_dealloc(
+        list.ptr,
+        list.cap * std::mem::size_of::<i64>(),
+        std::mem::align_of::<i64>(),
+    );
 }
 
 fn run(command: &mut Command, what: &str) -> Output {

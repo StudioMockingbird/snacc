@@ -1,1 +1,1 @@
-extern rust "snacc_user_maybe" fun maybe(): UInt8 | Nil
+extern rust "snacc_user_maybe" fun maybe(): Byte | Nil

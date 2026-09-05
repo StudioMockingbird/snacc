@@ -1,9 +1,11 @@
 use crate::syntax::ast::{
     Arg, BinaryOp, Block, BlockElement, Condition, Expr, ExternFunc, FieldDecl, Func, IfForm,
-    MethodDecl, Param, ParamMode, PlacePath, PlaceRootName, Program, Span, Spanned, TypeBody,
-    TypeDecl, TypeName, TypeRef, TypeTest, UnionMemberDecl, Value,
+    MethodDecl, NumLiteral, Param, ParamMode, PlacePath, PlaceRootName, Program, Span, Spanned,
+    StaticDecl, StringPart, TypeBody, TypeDecl, TypeName, TypeRef, TypeTest, UnaryOp,
+    UnionMemberDecl, Value,
 };
 use crate::syntax::lexer::Token;
+use crate::syntax::lexer::{decode_string_content, normalize_line_endings};
 use chumsky::{input::ValueInput, prelude::*};
 use std::collections::HashMap;
 
@@ -13,11 +15,13 @@ where
     I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
 {
     select! {
-        Token::TyDec64 => TypeName::Dec64,
+        Token::TyFloat64 => TypeName::Float64,
         Token::TyInt64 => TypeName::Int64,
         Token::TyBool => TypeName::Bool,
         Token::TyNil => TypeName::Nil,
-        Token::TyUInt8 => TypeName::UInt8,
+        Token::TyString => TypeName::String,
+        Token::TyUnicode => TypeName::Unicode,
+        Token::TyByte => TypeName::Byte,
         Token::TyUInt16 => TypeName::UInt16,
         Token::TyUInt32 => TypeName::UInt32,
         Token::TyUInt64 => TypeName::UInt64,
@@ -74,15 +78,77 @@ where
             .then_ignore(just(Token::Op(">")))
             .map_with(|inner, e| (TypeRef::Box(Box::new(inner)), e.span()));
 
+        let view = just(Token::TyView)
+            .ignore_then(just(Token::Op("<")))
+            .ignore_then(sum_type.clone())
+            .then_ignore(just(Token::Op(">")))
+            .map_with(|inner, e| (TypeRef::View(Box::new(inner)), e.span()));
+
+        let array = just(Token::TyArray)
+            .ignore_then(just(Token::Op("<")))
+            .ignore_then(sum_type.clone())
+            .then_ignore(just(Token::Ctrl(',')))
+            .then(select! { Token::Num(NumLiteral::Int(length)) => length })
+            .then_ignore(just(Token::Op(">")))
+            .validate(|(inner, length), e, emitter| {
+                if length < 0 {
+                    emitter.emit(Rich::custom(
+                        e.span(),
+                        "Array length must be non-negative".to_string(),
+                    ));
+                }
+                (
+                    TypeRef::Array(Box::new(inner), length.max(0) as u64),
+                    e.span(),
+                )
+            });
+        let list = just(Token::TyList)
+            .ignore_then(just(Token::Op("<")))
+            .ignore_then(sum_type.clone())
+            .then_ignore(just(Token::Op(">")))
+            .map_with(|inner, e| (TypeRef::List(Box::new(inner)), e.span()));
+        let map = just(Token::TyMap)
+            .ignore_then(just(Token::Op("<")))
+            .ignore_then(sum_type.clone())
+            .then_ignore(just(Token::Ctrl(',')))
+            .then(sum_type.clone())
+            .then_ignore(just(Token::Op(">")))
+            .map_with(|(key, value), e| (TypeRef::Map(Box::new(key), Box::new(value)), e.span()));
+        let set = just(Token::TySet)
+            .ignore_then(just(Token::Op("<")))
+            .ignore_then(sum_type.clone())
+            .then_ignore(just(Token::Op(">")))
+            .map_with(|inner, e| (TypeRef::Set(Box::new(inner)), e.span()));
+
+        let named_path = name_parser()
+            .separated_by(just(Token::Ctrl('.')))
+            .at_least(1)
+            .collect::<Vec<_>>();
+        let generic_args = just(Token::Op("<"))
+            .ignore_then(
+                sum_type
+                    .clone()
+                    .separated_by(just(Token::Ctrl(',')))
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .then_ignore(just(Token::Op(">")));
+        let applied = named_path
+            .clone()
+            .then(generic_args)
+            .map(|(path, args)| TypeRef::Apply { path, args });
+
         let primary = builtin_type_parser()
             .map(TypeRef::Builtin)
-            .or(name_parser()
-                .separated_by(just(Token::Ctrl('.')))
-                .at_least(1)
-                .collect::<Vec<_>>()
-                .map(TypeRef::Named))
+            .or(applied)
+            .or(named_path.map(TypeRef::Named))
             .map_with(|ty, e| (ty, e.span()))
             .or(boxed)
+            .or(view)
+            .or(array)
+            .or(list)
+            .or(map)
+            .or(set)
             .or(sum_type
                 .clone()
                 .delimited_by(just(Token::Ctrl('(')), just(Token::Ctrl(')'))))
@@ -217,9 +283,43 @@ where
             Token::Nil => Expr::Value(Value::Nil),
             Token::Bool(x) => Expr::Value(Value::Bool(x)),
             Token::Num(n) => Expr::Value(Value::Num(n)),
-            Token::Str(s) => Expr::Value(Value::Str(s)),
+            Token::Unicode(value) => Expr::Value(Value::Unicode(value)),
         }
         .labelled("value");
+
+        let string = select! { Token::Str(s) => s }.validate(|value, extra, emitter| {
+            match decode_string_content(value) {
+                Ok(value) => Expr::Value(Value::Str(value)),
+                Err(message) => {
+                    emitter.emit(Rich::custom(extra.span(), message));
+                    Expr::Error
+                }
+            }
+        });
+
+        let raw_string = select! { Token::RawStr(s) => s }
+            .map(|value| Expr::Value(Value::Str(normalize_line_endings(value))));
+
+        let interpolated =
+            select! { Token::Interpolated(parts) => parts }.validate(|parts, extra, emitter| {
+                let mut checked = Vec::with_capacity(parts.len());
+                for part in parts {
+                    match part {
+                        crate::syntax::lexer::InterpolatedPart::Literal(value) => {
+                            checked.push(StringPart::Literal(value));
+                        }
+                        crate::syntax::lexer::InterpolatedPart::Expression(tokens) => {
+                            match parse_interpolation_expression(&tokens) {
+                                Ok(value) => checked.push(StringPart::Expression(value)),
+                                Err(message) => {
+                                    emitter.emit(Rich::custom(extra.span(), message));
+                                }
+                            }
+                        }
+                    }
+                }
+                Expr::Interpolated(checked)
+            });
 
         let name = name_parser();
 
@@ -233,6 +333,22 @@ where
             .clone()
             .map(Expr::List)
             .delimited_by(just(Token::Ctrl('[')), just(Token::Ctrl(']')));
+
+        let empty_call = just(Token::Ctrl('(')).then_ignore(just(Token::Ctrl(')')));
+        let map_new = just(Token::TyMap)
+            .ignore_then(just(Token::Op("<")))
+            .ignore_then(sum_type_parser())
+            .then_ignore(just(Token::Ctrl(',')))
+            .then(sum_type_parser())
+            .then_ignore(just(Token::Op(">")))
+            .then_ignore(empty_call.clone())
+            .map(|(key, value)| Expr::MapNew(key, value));
+        let set_new = just(Token::TySet)
+            .ignore_then(just(Token::Op("<")))
+            .ignore_then(sum_type_parser())
+            .then_ignore(just(Token::Op(">")))
+            .then_ignore(empty_call)
+            .map(Expr::SetNew);
 
         // `argument = [ identifier, ":" ], expression`. A named argument is
         // recorded without deciding whether the call head can accept one.
@@ -250,12 +366,17 @@ where
             .map_with(|args, e| (args, e.span()));
 
         let atom = val
+            .or(string)
+            .or(raw_string)
+            .or(interpolated)
             .or(select! { Token::SelfKw => Expr::SelfRef })
             // A built-in type name is a call head only: `Int64(id)` unwraps one
             // represented layer. Checking rejects it in any other position.
             .or(builtin_type_parser().map(Expr::BuiltinType))
             .or(name.clone().map(|(name, _)| Expr::Local(name)))
             .or(list)
+            .or(map_new)
+            .or(set_new)
             .or(just(Token::Print)
                 .ignore_then(
                     expr.clone()
@@ -292,27 +413,66 @@ where
 
         // `postfix = atom, { arguments | member-suffix }`. Nothing here decides
         // whether a name is a type, field, constructor, or method.
+        let generic_arguments = just(Token::Op("<"))
+            .ignore_then(
+                type_ref_parser()
+                    .separated_by(just(Token::Ctrl(',')))
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .then_ignore(just(Token::Op(">")))
+            .map_with(|args, e| (args, e.span()))
+            .then(arguments.clone());
+
         enum Suffix<'src> {
             Call(Spanned<Vec<Arg<'src>>>),
+            GenericCall(
+                Spanned<Vec<Spanned<TypeRef<'src>>>>,
+                Spanned<Vec<Arg<'src>>>,
+            ),
             Member(Spanned<&'src str>),
+            Index(Spanned<Expr<'src>>),
         }
-        let suffix = arguments
-            .map(Suffix::Call)
-            .or(just(Token::Ctrl('.')).ignore_then(name).map(Suffix::Member));
+        let suffix = generic_arguments
+            .map(|(type_args, args)| Suffix::GenericCall(type_args, args))
+            .or(arguments.map(Suffix::Call))
+            .or(just(Token::Ctrl('.')).ignore_then(name).map(Suffix::Member))
+            .or(expr
+                .clone()
+                .delimited_by(just(Token::Ctrl('[')), just(Token::Ctrl(']')))
+                .map(Suffix::Index));
         let postfix = atom.foldl_with(suffix.repeated(), |base, suffix, e| {
             let expr = match suffix {
                 Suffix::Call(args) => Expr::Call(Box::new(base), args),
+                Suffix::GenericCall(type_args, args) => {
+                    Expr::GenericCall(Box::new(base), type_args, args)
+                }
                 Suffix::Member(name) => Expr::Member(Box::new(base), name),
+                Suffix::Index(index) => Expr::Index(Box::new(base), Box::new(index)),
             };
             (expr, e.span())
+        });
+
+        // Unary negation recurses into itself, not the complete expression:
+        // this preserves right associativity and keeps `!a or b` grouped as
+        // `(!a) or b` rather than `!(a or b)`.
+        let unary = recursive(|unary| {
+            just(Token::Op("!"))
+                .ignore_then(unary.clone())
+                .map_with(|value, e| (Expr::Unary(UnaryOp::Not, Box::new(value)), e.span()))
+                .or(just(Token::ReturnOnError)
+                    .ignore_then(postfix.clone())
+                    .map_with(|value, e| (Expr::ReturnOnError(Box::new(value)), e.span())))
+                .or(postfix.clone())
+                .boxed()
         });
 
         let op = just(Token::Op("*"))
             .to(BinaryOp::Mul)
             .or(just(Token::Op("/")).to(BinaryOp::Div));
-        let product = postfix
+        let product = unary
             .clone()
-            .foldl_with(op.then(postfix).repeated(), |a, (op, b), e| {
+            .foldl_with(op.then(unary.clone()).repeated(), |a, (op, b), e| {
                 (Expr::Binary(Box::new(a), op, Box::new(b)), e.span())
             });
 
@@ -332,15 +492,53 @@ where
             .or(just(Token::Op("<=")).to(BinaryOp::LessEq))
             .or(just(Token::Op(">")).to(BinaryOp::Greater))
             .or(just(Token::Op(">=")).to(BinaryOp::GreaterEq));
-        let compare = sum
-            .clone()
-            .foldl_with(op.then(sum).repeated(), |a, (op, b), e| {
-                (Expr::Binary(Box::new(a), op, Box::new(b)), e.span())
-            });
+        // A comparison accepts at most one operator. Besides enforcing the
+        // language rule, this leaves `f<T>(x)` unambiguous once generic calls
+        // are added: a second `<`/`>` cannot be consumed as a legal chain.
+        let compare =
+            sum.clone()
+                .then(op.then(sum.clone()).or_not())
+                .map_with(|(left, comparison), e| match comparison {
+                    Some((op, right)) => {
+                        (Expr::Binary(Box::new(left), op, Box::new(right)), e.span())
+                    }
+                    None => left,
+                });
 
-        compare.labelled("expression").as_context()
+        let logical_and = compare.clone().foldl_with(
+            just(Token::And)
+                .to(BinaryOp::And)
+                .then(compare.clone())
+                .repeated(),
+            |a, (op, b), e| (Expr::Binary(Box::new(a), op, Box::new(b)), e.span()),
+        );
+        let logical_or = logical_and.clone().foldl_with(
+            just(Token::Or)
+                .to(BinaryOp::Or)
+                .then(logical_and.clone())
+                .repeated(),
+            |a, (op, b), e| (Expr::Binary(Box::new(a), op, Box::new(b)), e.span()),
+        );
+
+        logical_or.labelled("expression").as_context()
     })
     .boxed()
+}
+
+/// Parses one already-tokenized interpolation expression outside the
+/// recursive parser-construction closure. Keeping this helper concrete avoids
+/// recursively instantiating the full expression parser type.
+fn parse_interpolation_expression<'src>(
+    tokens: &[Spanned<Token<'src>>],
+) -> Result<Spanned<Expr<'src>>, String> {
+    let input_span: Span = (0usize..0usize).into();
+    let (value, errors) = expr_parser()
+        .parse(tokens.map(input_span, |(token, span)| (token, span)))
+        .into_output_errors();
+    if let Some(error) = errors.first() {
+        return Err(error.to_string());
+    }
+    value.ok_or_else(|| "interpolation expression produced no syntax".into())
 }
 
 /// `condition = type-test | expression`. A type test is valid only as a
@@ -354,19 +552,21 @@ where
     // Every built-in type name is a reserved word rather than an identifier,
     // so a member path accepts each one as its own segment spelling.
     // Specification 018 section 3 extends the tested member to any direct
-    // sum member, including a built-in scalar (`is UInt8(byte)`), not only
+    // sum member, including a built-in scalar (`is Byte(byte)`), not only
     // `Nil` as before.
     let segment = select! {
         Token::Ident(name) => name,
         Token::TyNil => "Nil",
-        Token::TyDec64 => "Dec64",
+        Token::TyFloat64 => "Float64",
         Token::TyInt64 => "Int64",
         Token::TyBool => "Bool",
-        Token::TyUInt8 => "UInt8",
         Token::TyUInt16 => "UInt16",
         Token::TyUInt32 => "UInt32",
         Token::TyUInt64 => "UInt64",
         Token::TyFloat32 => "Float32",
+        Token::TyString => "String",
+        Token::TyUnicode => "Unicode",
+        Token::TyByte => "Byte",
     }
     .map_with(|name, e| (name, e.span()));
 
@@ -426,7 +626,7 @@ where
 
     let let_ = just(Token::Let)
         .ignore_then(just(Token::Mut).or_not().map(|m| m.is_some()))
-        .then(name)
+        .then(name.clone())
         .then_ignore(just(Token::Ctrl(':')))
         .then(type_ref_parser())
         .then_ignore(just(Token::Op("=")))
@@ -451,6 +651,13 @@ where
         .map(|(place, value)| BlockElement::Assign { place, value })
         .labelled("assignment");
 
+    let indexed_assign = expr
+        .clone()
+        .then_ignore(just(Token::Op("=")))
+        .then(expr.clone())
+        .map(|(target, value)| BlockElement::IndexedAssign { target, value })
+        .labelled("indexed assignment");
+
     let while_ = just(Token::While)
         .ignore_then(expr.clone())
         .then_ignore(just(Token::Do))
@@ -463,7 +670,54 @@ where
         })
         .labelled("while statement");
 
+    let for_ = just(Token::For)
+        .ignore_then(name.clone())
+        .then(just(Token::Ctrl(',')).ignore_then(name.clone()).or_not())
+        .then_ignore(just(Token::In))
+        .then(expr.clone())
+        .then_ignore(just(Token::Do))
+        .then(block.clone())
+        .then_ignore(just(Token::End))
+        .map_with(|(((value, key), iterable), body), e| BlockElement::For {
+            value,
+            key,
+            iterable,
+            body,
+            span: e.span(),
+        })
+        .labelled("for statement");
+
     let break_ = just(Token::Break).map_with(|_, e| BlockElement::Break(e.span()));
+
+    let defer_ = just(Token::Defer)
+        .to(false)
+        .or(just(Token::DeferOnError).to(true))
+        .then(expr.clone())
+        .map_with(|(on_error, call), e| BlockElement::Defer {
+            on_error,
+            call,
+            span: e.span(),
+        })
+        .labelled("deferred call");
+
+    // `return-statement = "return", [ expression ]` (Specification 026
+    // section 4). `return` is bare only when the next token closes the
+    // current block (`end`, `elseif`, `else`) or ends the token stream (the
+    // top-level program boundary); `.rewind()` peeks that fact without
+    // consuming it. Every other token must begin one maximal expression, so
+    // `return let x: Int64 = 1` fails to parse rather than silently
+    // splitting into a bare return followed by a `let` -- `let` cannot begin
+    // an expression, matching section 4 rule 2's "must begin one expression".
+    let return_boundary = just(Token::End)
+        .ignored()
+        .or(just(Token::ElseIf).ignored())
+        .or(just(Token::Else).ignored())
+        .or(end())
+        .rewind();
+    let return_ = just(Token::Return)
+        .ignore_then(return_boundary.map(|()| None).or(expr.clone().map(Some)))
+        .map_with(|value, e| BlockElement::Return(value, e.span()))
+        .labelled("return statement");
 
     let arm = condition_parser()
         .then_ignore(just(Token::Then))
@@ -490,9 +744,13 @@ where
 
     element.define(
         let_.or(while_)
+            .or(for_)
             .or(break_)
+            .or(defer_)
+            .or(return_)
             .or(if_)
             .or(assign)
+            .or(indexed_assign)
             .or(expr.map(BlockElement::Expr))
             .map_with(|element, e| (element, e.span()))
             .boxed(),
@@ -520,6 +778,7 @@ enum Item<'src> {
     Extern(Spanned<&'src str>, ExternFunc<'src>),
     Type(TypeDecl<'src>),
     Method(MethodDecl<'src>),
+    Static(StaticDecl<'src>),
     Element(Spanned<BlockElement<'src>>),
 }
 
@@ -604,6 +863,15 @@ where
 
     let type_decl = just(Token::Type)
         .ignore_then(name.clone().labelled("type name"))
+        .then(
+            name.clone()
+                .separated_by(just(Token::Ctrl(',')))
+                .at_least(1)
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::Op("<")), just(Token::Op(">")))
+                .or_not()
+                .map(|params| params.unwrap_or_default()),
+        )
         .then_ignore(just(Token::Is))
         .then(
             struct_body
@@ -611,10 +879,11 @@ where
                 .or(union_body.map(TypeBody::Union))
                 .or(type_ref.clone().map(TypeBody::Represented)),
         )
-        .map_with(|((name, name_span), body), e| {
+        .map_with(|(((name, name_span), generic_params), body), e| {
             Item::Type(TypeDecl {
                 name,
                 name_span,
+                generic_params,
                 body,
                 span: e.span(),
             })
@@ -644,16 +913,63 @@ where
         })
         .labelled("method declaration");
 
-    let func = just(Token::Fun)
-        .ignore_then(name.clone().labelled("function name"))
+    let builtin_static_target = builtin_type_parser()
+        .map_with(|receiver, e| (TypeRef::Builtin(receiver), e.span()))
+        .then_ignore(just(Token::Ctrl('.')))
+        .then(name.clone());
+    let named_static_target = name
+        .clone()
+        .separated_by(just(Token::Ctrl('.')))
+        .at_least(2)
+        .at_most(3)
+        .collect::<Vec<_>>()
+        .map_with(|mut path, e| {
+            let name = path.pop().expect("at least two path components");
+            ((TypeRef::Named(path), e.span()), name)
+        });
+    let static_decl = just(Token::Static)
+        .ignore_then(
+            builtin_static_target
+                .or(named_static_target)
+                .labelled("associated type and function name"),
+        )
         .then(args.clone())
         .then(result.clone())
         .then_ignore(just(Token::Do))
         .then(block_parser().then_ignore(just(Token::End)))
-        .map_with(|(((name, args), ret), body), e| {
+        .map_with(|(((target, args), ret), body), e| {
+            let (receiver, name) = target;
+            Item::Static(StaticDecl {
+                receiver,
+                name,
+                args,
+                ret,
+                span: e.span(),
+                body,
+            })
+        })
+        .labelled("static associated-function declaration");
+
+    let func = just(Token::Fun)
+        .ignore_then(name.clone().labelled("function name"))
+        .then(
+            name.clone()
+                .separated_by(just(Token::Ctrl(',')))
+                .at_least(1)
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::Op("<")), just(Token::Op(">")))
+                .or_not()
+                .map(|params| params.unwrap_or_default()),
+        )
+        .then(args.clone())
+        .then(result.clone())
+        .then_ignore(just(Token::Do))
+        .then(block_parser().then_ignore(just(Token::End)))
+        .map_with(|((((name, generic_params), args), ret), body), e| {
             Item::Func(
                 name,
                 Func {
+                    generic_params,
                     args,
                     ret,
                     span: e.span(),
@@ -689,6 +1005,7 @@ where
         .or(func)
         .or(type_decl)
         .or(method_decl)
+        .or(static_decl)
         .or(block_element_parser().map(Item::Element));
 
     item.repeated()
@@ -700,6 +1017,7 @@ where
             let mut link_names = HashMap::new();
             let mut types = Vec::new();
             let mut methods = Vec::new();
+            let mut statics = Vec::new();
             let mut elements = Vec::new();
             for item in items {
                 match item {
@@ -734,6 +1052,7 @@ where
                     }
                     Item::Type(declaration) => types.push(declaration),
                     Item::Method(declaration) => methods.push(declaration),
+                    Item::Static(declaration) => statics.push(declaration),
                     Item::Element(element) => elements.push(element),
                 }
             }
@@ -742,6 +1061,7 @@ where
                 externs,
                 types,
                 methods,
+                statics,
                 body: Block { elements, span },
             }
         })
@@ -852,6 +1172,61 @@ mod tests {
         assert!(matches!(body.elements[0].0, BlockElement::Break(_)));
     }
 
+    // Specification 026 section 4: bare return only immediately before a
+    // block boundary (`end`, `elseif`, `else`); a value otherwise.
+
+    #[test]
+    fn parses_a_bare_return_immediately_before_every_block_boundary() {
+        for source in [
+            "fun f() do return end",
+            "fun f() do if true then return else return end end",
+            "fun f() do if true then return elseif false then return end end",
+        ] {
+            assert_parses(source);
+        }
+        let program = parse("fun f() do return end");
+        let BlockElement::Return(value, _) = &program.funcs["f"].body.elements[0].0 else {
+            panic!("expected a return statement");
+        };
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn parses_a_valued_return_everywhere_else() {
+        let program = parse("fun f(): Int64 do return 1 + 2 end");
+        let BlockElement::Return(value, _) = &program.funcs["f"].body.elements[0].0 else {
+            panic!("expected a return statement");
+        };
+        assert!(value.is_some());
+    }
+
+    #[test]
+    fn a_bare_return_is_never_followed_by_another_element_in_the_same_block() {
+        // `return print(1)` parses as one return statement carrying the
+        // value-producing expression `print(1)`, never a bare return
+        // followed by a separate `print(1)` statement.
+        let program = parse("fun f() do return print(1) end");
+        assert_eq!(program.funcs["f"].body.elements.len(), 1);
+        let BlockElement::Return(value, _) = &program.funcs["f"].body.elements[0].0 else {
+            panic!("expected a return statement");
+        };
+        assert!(matches!(value.as_ref().unwrap().0, Expr::Print(_)));
+    }
+
+    #[test]
+    fn rejects_a_return_immediately_followed_by_a_non_expression_keyword() {
+        // `let` cannot begin an expression, so `return` here must consume one
+        // maximal expression per section 4 rule 2 and fails to parse rather
+        // than silently splitting into a bare return followed by `let`.
+        assert_rejects("fun f() do return let x: Int64 = 1 end");
+    }
+
+    #[test]
+    fn return_is_reserved_and_not_an_identifier() {
+        assert_rejects("let return: Int64 = 1");
+        assert_rejects("fun return(): Int64 do 1 end");
+    }
+
     #[test]
     fn parses_a_function_without_a_result_type() {
         let program = parse("fun announce(value: Int64) do print(value) end");
@@ -871,6 +1246,18 @@ mod tests {
     fn parses_a_bridge_without_a_result_type() {
         let program = parse("extern rust \"snacc_user_log\" fun log(value: Int64)");
         assert!(program.externs["log"].ret.is_none());
+    }
+
+    #[test]
+    fn parses_raw_strings_without_escape_processing() {
+        let program = parse("let path: String = r#\"C:\\\\snacc\\n\"#");
+        let BlockElement::Let { value, .. } = &program.body.elements[0].0 else {
+            panic!("expected a raw string declaration");
+        };
+        assert!(matches!(
+            &value.0,
+            Expr::Value(Value::Str(text)) if text == "C:\\\\snacc\\n"
+        ));
     }
 
     #[test]
@@ -949,7 +1336,7 @@ mod tests {
     #[test]
     fn parses_every_new_type_name_in_every_type_position() {
         for (name, expected) in [
-            ("UInt8", TypeName::UInt8),
+            ("Byte", TypeName::Byte),
             ("UInt16", TypeName::UInt16),
             ("UInt32", TypeName::UInt32),
             ("UInt64", TypeName::UInt64),
@@ -971,11 +1358,17 @@ mod tests {
                 expected
             );
         }
-        let program = parse("let byte: UInt8 = 1u8 let ratio: Float32 = 0.5f32");
+        let program = parse("let byte: Byte = 1u8 let ratio: Float32 = 0.5f32");
         let BlockElement::Let { ty, .. } = &program.body.elements[0].0 else {
             panic!("expected a declaration");
         };
-        assert_eq!(builtin(ty), TypeName::UInt8);
+        assert_eq!(builtin(ty), TypeName::Byte);
+    }
+
+    #[test]
+    fn rejects_the_removed_uint8_source_type_name() {
+        assert_rejects("let byte: UInt8 = 1u8");
+        assert_rejects("fun take(value: UInt8) do print(value) end");
     }
 
     #[test]
@@ -998,9 +1391,9 @@ mod tests {
     #[test]
     fn parses_a_struct_with_and_without_a_trailing_comma() {
         for source in [
-            "type Point is struct x: Dec64, y: Dec64, end",
-            "type Point is struct x: Dec64, y: Dec64 end",
-            "type Point is struct\n    x: Dec64\n    y: Dec64\nend",
+            "type Point is struct x: Float64, y: Float64, end",
+            "type Point is struct x: Float64, y: Float64 end",
+            "type Point is struct\n    x: Float64\n    y: Float64\nend",
         ] {
             let program = parse(source);
             let TypeBody::Struct(fields) = &program.types[0].body else {
@@ -1042,7 +1435,7 @@ mod tests {
     #[test]
     fn parses_top_level_and_member_method_receivers() {
         let program = parse(
-            "method Point.length(): Dec64 do 1.0 end\n\
+            "method Point.length(): Float64 do 1.0 end\n\
              method Shape.Circle.area(): Int64 do 1 end",
         );
         assert_eq!(program.methods.len(), 2);
@@ -1134,10 +1527,10 @@ mod tests {
     #[test]
     fn rejects_malformed_declaration_delimiters() {
         for source in [
-            "type Point is struct x: Dec64,",
+            "type Point is struct x: Float64,",
             "type Shape is union | end",
             "type Shape is union end",
-            "method Point.length(): Dec64 do 1.0",
+            "method Point.length(): Float64 do 1.0",
             "type is Int64",
             "method () do end",
         ] {
@@ -1188,8 +1581,8 @@ mod tests {
     fn parses_a_reference_parameter_in_every_permitted_declaration() {
         for source in [
             "fun add_into(x: Int64, y: Int64, result: Ref<Int64>) do result = x + y end",
-            "type Point is struct x: Dec64, end\n\
-             method Point.give(other: Ref<Dec64>) do other = self.x end",
+            "type Point is struct x: Float64, end\n\
+             method Point.give(other: Ref<Float64>) do other = self.x end",
             "extern rust \"snacc_user_bump\" fun bump(value: Ref<Int64>)",
         ] {
             assert_parses(source);
@@ -1258,6 +1651,32 @@ mod tests {
         assert_eq!(program.body.elements.len(), 4);
     }
 
+    #[test]
+    fn boolean_precedence_and_unary_negation_are_grouped_by_the_contract() {
+        let program = parse("let value: Bool = !!true or false and true");
+        let BlockElement::Let { value, .. } = &program.body.elements[0].0 else {
+            panic!("expected a declaration")
+        };
+        let Expr::Binary(left, BinaryOp::Or, right) = &value.0 else {
+            panic!("expected the outer operator to be 'or'")
+        };
+        assert!(matches!(&left.0, Expr::Unary(UnaryOp::Not, _)));
+        assert!(matches!(&right.0, Expr::Binary(_, BinaryOp::And, _)));
+    }
+
+    #[test]
+    fn comparison_chaining_is_rejected_at_one_expression_level() {
+        for source in ["1 < 2 > 0", "1 == 1 == true", "1 < 2 <= 3"] {
+            assert_rejects(source);
+        }
+    }
+
+    #[test]
+    fn boolean_operators_are_reserved_keywords() {
+        assert_rejects("let and: Bool = true");
+        assert_rejects("let or: Bool = false");
+    }
+
     // Specification 018 sections 3 and 6: `|` forms an inline sum type in
     // every value-type position, and a type test may name any direct member.
 
@@ -1278,14 +1697,14 @@ mod tests {
     #[test]
     fn parses_an_inline_sum_type_in_every_value_type_position() {
         for source in [
-            "type Point is struct x: Dec64, end\nfun read(): UInt8 | Nil do nil end",
-            "type Point is struct x: Dec64, end\nfun take(value: UInt8 | Nil) do print(1) end",
-            "type Point is struct x: Dec64, end\nlet result: UInt8 | Nil = nil",
-            "type Point is struct x: Dec64, end\ntype Holder is struct value: UInt8 | Nil, end",
-            "type Point is struct x: Dec64, end\n\
-             extern rust \"snacc_user_maybe\" fun maybe(): UInt8 | Nil",
-            "type Point is struct x: Dec64, end\n\
-             method Point.length(): UInt8 | Nil do nil end",
+            "type Point is struct x: Float64, end\nfun read(): Byte | Nil do nil end",
+            "type Point is struct x: Float64, end\nfun take(value: Byte | Nil) do print(1) end",
+            "type Point is struct x: Float64, end\nlet result: Byte | Nil = nil",
+            "type Point is struct x: Float64, end\ntype Holder is struct value: Byte | Nil, end",
+            "type Point is struct x: Float64, end\n\
+             extern rust \"snacc_user_maybe\" fun maybe(): Byte | Nil",
+            "type Point is struct x: Float64, end\n\
+             method Point.length(): Byte | Nil do nil end",
         ] {
             assert_parses(source);
         }
@@ -1293,9 +1712,9 @@ mod tests {
 
     #[test]
     fn a_sum_type_records_every_member_in_source_order() {
-        let program = parse("let result: UInt8 | Bool | Nil = nil");
+        let program = parse("let result: Byte | Bool | Nil = nil");
         let ty = let_ty(&program, 0);
-        assert_eq!(sum_member_names(&ty), vec!["UInt8", "Bool", "Nil"]);
+        assert_eq!(sum_member_names(&ty), vec!["Byte", "Bool", "Nil"]);
     }
 
     #[test]
@@ -1303,9 +1722,9 @@ mod tests {
         // A sum-type production with no `|` collapses to its one primary, and
         // a fully parenthesized single member is exactly ordinary grouping,
         // not a one-member sum.
-        let program = parse("let value: (UInt8) = 1u8");
+        let program = parse("let value: (Byte) = 1u8");
         let ty = let_ty(&program, 0);
-        assert_eq!(builtin(&ty), TypeName::UInt8);
+        assert_eq!(builtin(&ty), TypeName::Byte);
     }
 
     #[test]
@@ -1313,20 +1732,20 @@ mod tests {
         // Flattening `(A | B) | C` into one three-member set is a resolution
         // concern; the parser only needs to record the grouped sum as one
         // member of the outer sum, in source order.
-        let program = parse("let value: (UInt8 | Bool) | Nil = nil");
+        let program = parse("let value: (Byte | Bool) | Nil = nil");
         let ty = let_ty(&program, 0);
         let TypeRef::Sum(members) = &ty.0 else {
             panic!("expected an inline sum type");
         };
         assert_eq!(members.len(), 2);
-        assert_eq!(sum_member_names(&members[0]), vec!["UInt8", "Bool"]);
+        assert_eq!(sum_member_names(&members[0]), vec!["Byte", "Bool"]);
         assert_eq!(members[1].0.to_string(), "Nil");
     }
 
     #[test]
     fn whitespace_around_the_sum_operator_has_no_significance() {
-        let tight = parse("let value: UInt8|Bool|Nil = nil");
-        let spaced = parse("let value: UInt8 | Bool | Nil = nil");
+        let tight = parse("let value: Byte|Bool|Nil = nil");
+        let spaced = parse("let value: Byte | Bool | Nil = nil");
         assert_eq!(
             sum_member_names(&let_ty(&tight, 0)),
             sum_member_names(&let_ty(&spaced, 0))
@@ -1336,9 +1755,9 @@ mod tests {
     #[test]
     fn rejects_malformed_sum_separators() {
         for source in [
-            "let value: | UInt8 = 1u8",
-            "let value: UInt8 | = 1u8",
-            "let value: UInt8 || Bool = nil",
+            "let value: | Byte = 1u8",
+            "let value: Byte | = 1u8",
+            "let value: Byte || Bool = nil",
             "let value: () = 1u8",
         ] {
             assert_rejects(source);
@@ -1348,8 +1767,8 @@ mod tests {
     #[test]
     fn rejects_a_reference_as_a_sum_member() {
         for source in [
-            "let value: Ref<UInt8> | Nil = nil",
-            "fun f(value: UInt8 | Ref<Nil>) do print(1) end",
+            "let value: Ref<Byte> | Nil = nil",
+            "fun f(value: Byte | Ref<Nil>) do print(1) end",
         ] {
             assert_rejects(source);
         }
@@ -1357,7 +1776,7 @@ mod tests {
 
     #[test]
     fn a_reference_referent_may_be_a_sum_type() {
-        assert_parses("fun replace(value: Ref<UInt8 | Nil>) do value = nil end");
+        assert_parses("fun replace(value: Ref<Byte | Nil>) do value = nil end");
     }
 
     #[test]
@@ -1371,8 +1790,8 @@ mod tests {
     #[test]
     fn parses_a_type_test_naming_a_builtin_direct_member() {
         let program = parse(
-            "fun show(value: UInt8 | Nil) do \
-             if value is UInt8(byte) then print(1) elseif value is Nil then print(2) end end",
+            "fun show(value: Byte | Nil) do \
+             if value is Byte(byte) then print(1) elseif value is Nil then print(2) end end",
         );
         let BlockElement::If(form) = &program.funcs["show"].body.elements[0].0 else {
             panic!("expected an if form");
@@ -1380,7 +1799,7 @@ mod tests {
         let Condition::TypeTest(first) = &form.arms[0].0 else {
             panic!("expected a type test");
         };
-        assert_eq!(first.member[0].0, "UInt8");
+        assert_eq!(first.member[0].0, "Byte");
         assert_eq!(first.binding.map(|(name, _)| name), Some("byte"));
         let Condition::TypeTest(second) = &form.arms[1].0 else {
             panic!("expected a type test");

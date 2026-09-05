@@ -1,7 +1,7 @@
 use crate::Optimization;
 use crate::semantics::checker::{
-    ArithOp, CmpOp, Place, PlaceRoot, Program, TArg, TBlock, TCondition, TExpr, TMethodCall,
-    TParam, TReceiver, TStmt, TSumTypeTest, TTypeTest, TValueIf, Ty,
+    ArithOp, CmpOp, LogicalOp, Place, PlaceRoot, Program, TArg, TBlock, TCleanup, TCondition,
+    TExpr, TMethodCall, TParam, TReceiver, TStmt, TSumTypeTest, TTypeTest, TValueIf, Ty,
 };
 use crate::semantics::types::{BoxId, SumId, TypeDef, TypeId};
 use crate::syntax::ast::NumLiteral;
@@ -19,11 +19,11 @@ use inkwell::types::{
     BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType, IntType, StructType,
 };
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue,
-    StructValue,
+    BasicMetadataValueEnum, BasicValue, BasicValueEnum, FloatValue, FunctionValue, IntValue,
+    PointerValue, StructValue,
 };
 use inkwell::{FloatPredicate, IntPredicate, OptimizationLevel};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Marks a backend failure that is a compiler bug rather than a property of the
 /// program. Specification 010 section 19 phase 5 step 7 requires an LLVM
@@ -36,6 +36,228 @@ fn internal(message: impl std::fmt::Display) -> String {
     format!("{INTERNAL_ERROR}{message}")
 }
 
+fn concat_part_tag(ty: Ty) -> Result<u64, String> {
+    match ty {
+        Ty::Int64 => Ok(1),
+        Ty::Byte => Ok(2),
+        Ty::UInt16 => Ok(3),
+        Ty::UInt32 => Ok(4),
+        Ty::UInt64 => Ok(5),
+        Ty::Float32 => Ok(6),
+        Ty::Float64 => Ok(7),
+        Ty::Bool => Ok(8),
+        Ty::Unicode => Ok(9),
+        _ => Err(internal("unsupported scalar concatenation part")),
+    }
+}
+
+fn scalar_map_symbol(prefix: &str, operation: &str) -> &'static str {
+    match (prefix, operation) {
+        ("u8", "contains") => "snacc_map_u8_i64_contains",
+        ("u8", "insert") => "snacc_map_u8_i64_insert",
+        ("u8", "delete") => "snacc_map_u8_i64_delete",
+        ("u8", "index") => "snacc_map_u8_i64_index",
+        ("u8", "take") => "snacc_map_u8_i64_take",
+        ("u8", "reserve") => "snacc_map_u8_i64_reserve",
+        ("u8", "key_at") => "snacc_map_u8_i64_key_at",
+        ("u8", "value_at") => "snacc_map_u8_i64_value_at",
+        ("u8", "clear") => "snacc_map_u8_i64_clear",
+        ("u8", "drop") => "snacc_map_u8_i64_drop",
+        ("u16", "contains") => "snacc_map_u16_i64_contains",
+        ("u16", "insert") => "snacc_map_u16_i64_insert",
+        ("u16", "delete") => "snacc_map_u16_i64_delete",
+        ("u16", "index") => "snacc_map_u16_i64_index",
+        ("u16", "take") => "snacc_map_u16_i64_take",
+        ("u16", "reserve") => "snacc_map_u16_i64_reserve",
+        ("u16", "key_at") => "snacc_map_u16_i64_key_at",
+        ("u16", "value_at") => "snacc_map_u16_i64_value_at",
+        ("u16", "clear") => "snacc_map_u16_i64_clear",
+        ("u16", "drop") => "snacc_map_u16_i64_drop",
+        ("u32", "contains") => "snacc_map_u32_i64_contains",
+        ("u32", "insert") => "snacc_map_u32_i64_insert",
+        ("u32", "delete") => "snacc_map_u32_i64_delete",
+        ("u32", "index") => "snacc_map_u32_i64_index",
+        ("u32", "take") => "snacc_map_u32_i64_take",
+        ("u32", "reserve") => "snacc_map_u32_i64_reserve",
+        ("u32", "key_at") => "snacc_map_u32_i64_key_at",
+        ("u32", "value_at") => "snacc_map_u32_i64_value_at",
+        ("u32", "clear") => "snacc_map_u32_i64_clear",
+        ("u32", "drop") => "snacc_map_u32_i64_drop",
+        ("u64", "contains") => "snacc_map_u64_i64_contains",
+        ("u64", "insert") => "snacc_map_u64_i64_insert",
+        ("u64", "delete") => "snacc_map_u64_i64_delete",
+        ("u64", "index") => "snacc_map_u64_i64_index",
+        ("u64", "take") => "snacc_map_u64_i64_take",
+        ("u64", "reserve") => "snacc_map_u64_i64_reserve",
+        ("u64", "key_at") => "snacc_map_u64_i64_key_at",
+        ("u64", "value_at") => "snacc_map_u64_i64_value_at",
+        ("u64", "clear") => "snacc_map_u64_i64_clear",
+        ("u64", "drop") => "snacc_map_u64_i64_drop",
+        ("i64", "contains") => "snacc_map_i64_i64_contains",
+        ("i64", "insert") => "snacc_map_i64_i64_insert",
+        ("i64", "delete") => "snacc_map_i64_i64_delete",
+        ("i64", "index") => "snacc_map_i64_i64_index",
+        ("i64", "take") => "snacc_map_i64_i64_take",
+        ("i64", "reserve") => "snacc_map_i64_i64_reserve",
+        ("i64", "key_at") => "snacc_map_i64_i64_key_at",
+        ("i64", "value_at") => "snacc_map_i64_i64_value_at",
+        ("i64", "clear") => "snacc_map_i64_i64_clear",
+        ("i64", "drop") => "snacc_map_i64_i64_drop",
+        ("bool", "contains") => "snacc_map_bool_i64_contains",
+        ("bool", "insert") => "snacc_map_bool_i64_insert",
+        ("bool", "delete") => "snacc_map_bool_i64_delete",
+        ("bool", "index") => "snacc_map_bool_i64_index",
+        ("bool", "take") => "snacc_map_bool_i64_take",
+        ("bool", "reserve") => "snacc_map_bool_i64_reserve",
+        ("bool", "key_at") => "snacc_map_bool_i64_key_at",
+        ("bool", "value_at") => "snacc_map_bool_i64_value_at",
+        ("bool", "clear") => "snacc_map_bool_i64_clear",
+        ("bool", "drop") => "snacc_map_bool_i64_drop",
+        ("unicode", "contains") => "snacc_map_unicode_i64_contains",
+        ("unicode", "insert") => "snacc_map_unicode_i64_insert",
+        ("unicode", "delete") => "snacc_map_unicode_i64_delete",
+        ("unicode", "index") => "snacc_map_unicode_i64_index",
+        ("unicode", "take") => "snacc_map_unicode_i64_take",
+        ("unicode", "reserve") => "snacc_map_unicode_i64_reserve",
+        ("unicode", "key_at") => "snacc_map_unicode_i64_key_at",
+        ("unicode", "value_at") => "snacc_map_unicode_i64_value_at",
+        ("unicode", "clear") => "snacc_map_unicode_i64_clear",
+        ("unicode", "drop") => "snacc_map_unicode_i64_drop",
+        _ => unreachable!("unsupported scalar map runtime symbol"),
+    }
+}
+
+fn scalar_map_raw_symbol(prefix: &str, operation: &str) -> &'static str {
+    match (prefix, operation) {
+        ("u8", "contains") => "snacc_map_u8_raw_contains",
+        ("u8", "insert") => "snacc_map_u8_raw_insert",
+        ("u8", "delete") => "snacc_map_u8_raw_delete",
+        ("u8", "index") => "snacc_map_u8_raw_index",
+        ("u8", "take") => "snacc_map_u8_raw_take",
+        ("u8", "reserve") => "snacc_map_u8_raw_reserve",
+        ("u8", "key_at") => "snacc_map_u8_raw_key_at",
+        ("u8", "value_at") => "snacc_map_u8_raw_value_at",
+        ("u8", "clear") => "snacc_map_u8_raw_clear",
+        ("u8", "drop") => "snacc_map_u8_raw_drop",
+        ("u16", "contains") => "snacc_map_u16_raw_contains",
+        ("u16", "insert") => "snacc_map_u16_raw_insert",
+        ("u16", "delete") => "snacc_map_u16_raw_delete",
+        ("u16", "index") => "snacc_map_u16_raw_index",
+        ("u16", "take") => "snacc_map_u16_raw_take",
+        ("u16", "reserve") => "snacc_map_u16_raw_reserve",
+        ("u16", "key_at") => "snacc_map_u16_raw_key_at",
+        ("u16", "value_at") => "snacc_map_u16_raw_value_at",
+        ("u16", "clear") => "snacc_map_u16_raw_clear",
+        ("u16", "drop") => "snacc_map_u16_raw_drop",
+        ("u32", "contains") => "snacc_map_u32_raw_contains",
+        ("u32", "insert") => "snacc_map_u32_raw_insert",
+        ("u32", "delete") => "snacc_map_u32_raw_delete",
+        ("u32", "index") => "snacc_map_u32_raw_index",
+        ("u32", "take") => "snacc_map_u32_raw_take",
+        ("u32", "reserve") => "snacc_map_u32_raw_reserve",
+        ("u32", "key_at") => "snacc_map_u32_raw_key_at",
+        ("u32", "value_at") => "snacc_map_u32_raw_value_at",
+        ("u32", "clear") => "snacc_map_u32_raw_clear",
+        ("u32", "drop") => "snacc_map_u32_raw_drop",
+        ("u64", "contains") => "snacc_map_u64_raw_contains",
+        ("u64", "insert") => "snacc_map_u64_raw_insert",
+        ("u64", "delete") => "snacc_map_u64_raw_delete",
+        ("u64", "index") => "snacc_map_u64_raw_index",
+        ("u64", "take") => "snacc_map_u64_raw_take",
+        ("u64", "reserve") => "snacc_map_u64_raw_reserve",
+        ("u64", "key_at") => "snacc_map_u64_raw_key_at",
+        ("u64", "value_at") => "snacc_map_u64_raw_value_at",
+        ("u64", "clear") => "snacc_map_u64_raw_clear",
+        ("u64", "drop") => "snacc_map_u64_raw_drop",
+        ("bool", "contains") => "snacc_map_bool_raw_contains",
+        ("bool", "insert") => "snacc_map_bool_raw_insert",
+        ("bool", "delete") => "snacc_map_bool_raw_delete",
+        ("bool", "index") => "snacc_map_bool_raw_index",
+        ("bool", "take") => "snacc_map_bool_raw_take",
+        ("bool", "reserve") => "snacc_map_bool_raw_reserve",
+        ("bool", "key_at") => "snacc_map_bool_raw_key_at",
+        ("bool", "value_at") => "snacc_map_bool_raw_value_at",
+        ("bool", "clear") => "snacc_map_bool_raw_clear",
+        ("bool", "drop") => "snacc_map_bool_raw_drop",
+        ("unicode", "contains") => "snacc_map_unicode_raw_contains",
+        ("unicode", "insert") => "snacc_map_unicode_raw_insert",
+        ("unicode", "delete") => "snacc_map_unicode_raw_delete",
+        ("unicode", "index") => "snacc_map_unicode_raw_index",
+        ("unicode", "take") => "snacc_map_unicode_raw_take",
+        ("unicode", "reserve") => "snacc_map_unicode_raw_reserve",
+        ("unicode", "key_at") => "snacc_map_unicode_raw_key_at",
+        ("unicode", "value_at") => "snacc_map_unicode_raw_value_at",
+        ("unicode", "clear") => "snacc_map_unicode_raw_clear",
+        ("unicode", "drop") => "snacc_map_unicode_raw_drop",
+        ("i64", "contains") => "snacc_map_i64_raw_contains",
+        ("i64", "insert") => "snacc_map_i64_raw_insert",
+        ("i64", "delete") => "snacc_map_i64_raw_delete",
+        ("i64", "index") => "snacc_map_i64_raw_index",
+        ("i64", "take") => "snacc_map_i64_raw_take",
+        ("i64", "reserve") => "snacc_map_i64_raw_reserve",
+        ("i64", "key_at") => "snacc_map_i64_raw_key_at",
+        ("i64", "value_at") => "snacc_map_i64_raw_value_at",
+        ("i64", "clear") => "snacc_map_i64_raw_clear",
+        ("i64", "drop") => "snacc_map_i64_raw_drop",
+        _ => unreachable!("unsupported scalar raw map runtime symbol"),
+    }
+}
+
+fn scalar_set_symbol(prefix: &str, operation: &str) -> &'static str {
+    match (prefix, operation) {
+        ("u8", "contains") => "snacc_set_u8_contains",
+        ("u8", "insert") => "snacc_set_u8_insert",
+        ("u8", "delete") => "snacc_set_u8_delete",
+        ("u8", "at") => "snacc_set_u8_at",
+        ("u8", "reserve") => "snacc_set_u8_reserve",
+        ("u8", "clear") => "snacc_set_u8_clear",
+        ("u8", "drop") => "snacc_set_u8_drop",
+        ("u16", "contains") => "snacc_set_u16_contains",
+        ("u16", "insert") => "snacc_set_u16_insert",
+        ("u16", "delete") => "snacc_set_u16_delete",
+        ("u16", "at") => "snacc_set_u16_at",
+        ("u16", "reserve") => "snacc_set_u16_reserve",
+        ("u16", "clear") => "snacc_set_u16_clear",
+        ("u16", "drop") => "snacc_set_u16_drop",
+        ("u32", "contains") => "snacc_set_u32_contains",
+        ("u32", "insert") => "snacc_set_u32_insert",
+        ("u32", "delete") => "snacc_set_u32_delete",
+        ("u32", "at") => "snacc_set_u32_at",
+        ("u32", "reserve") => "snacc_set_u32_reserve",
+        ("u32", "clear") => "snacc_set_u32_clear",
+        ("u32", "drop") => "snacc_set_u32_drop",
+        ("u64", "contains") => "snacc_set_u64_contains",
+        ("u64", "insert") => "snacc_set_u64_insert",
+        ("u64", "delete") => "snacc_set_u64_delete",
+        ("u64", "at") => "snacc_set_u64_at",
+        ("u64", "reserve") => "snacc_set_u64_reserve",
+        ("u64", "clear") => "snacc_set_u64_clear",
+        ("u64", "drop") => "snacc_set_u64_drop",
+        ("i64", "contains") => "snacc_set_i64_contains",
+        ("i64", "insert") => "snacc_set_i64_insert",
+        ("i64", "delete") => "snacc_set_i64_delete",
+        ("i64", "at") => "snacc_set_i64_at",
+        ("i64", "reserve") => "snacc_set_i64_reserve",
+        ("i64", "clear") => "snacc_set_i64_clear",
+        ("i64", "drop") => "snacc_set_i64_drop",
+        ("bool", "contains") => "snacc_set_bool_contains",
+        ("bool", "insert") => "snacc_set_bool_insert",
+        ("bool", "delete") => "snacc_set_bool_delete",
+        ("bool", "at") => "snacc_set_bool_at",
+        ("bool", "reserve") => "snacc_set_bool_reserve",
+        ("bool", "clear") => "snacc_set_bool_clear",
+        ("bool", "drop") => "snacc_set_bool_drop",
+        ("unicode", "contains") => "snacc_set_unicode_contains",
+        ("unicode", "insert") => "snacc_set_unicode_insert",
+        ("unicode", "delete") => "snacc_set_unicode_delete",
+        ("unicode", "at") => "snacc_set_unicode_at",
+        ("unicode", "reserve") => "snacc_set_unicode_reserve",
+        ("unicode", "clear") => "snacc_set_unicode_clear",
+        ("unicode", "drop") => "snacc_set_unicode_drop",
+        _ => unreachable!("unsupported scalar set runtime symbol"),
+    }
+}
+
 /// The receiver's name in a lowered method body. `self` is a reserved word, so
 /// no local can collide with it.
 const SELF: &str = "self";
@@ -43,12 +265,45 @@ const SELF: &str = "self";
 /// Specification 009 section 5.2: the value/storage type for each scalar.
 fn scalar_ty(context: &Context, ty: Ty) -> BasicTypeEnum<'_> {
     match ty {
-        Ty::Dec64 => context.f64_type().into(),
+        Ty::Float64 => context.f64_type().into(),
         Ty::Float32 => context.f32_type().into(),
         Ty::Int64 | Ty::UInt64 => context.i64_type().into(),
         Ty::UInt32 => context.i32_type().into(),
         Ty::UInt16 => context.i16_type().into(),
-        Ty::Bool | Ty::Nil | Ty::UInt8 => context.i8_type().into(),
+        Ty::Bool | Ty::Nil | Ty::Byte => context.i8_type().into(),
+        Ty::Unicode => context.i32_type().into(),
+        Ty::String => {
+            let ptr = context.ptr_type(AddressSpace::default());
+            context
+                .struct_type(
+                    &[
+                        ptr.into(),
+                        context.i64_type().into(),
+                        context.i64_type().into(),
+                    ],
+                    false,
+                )
+                .into()
+        }
+        Ty::ViewByte | Ty::ViewUnicode => {
+            let ptr = context.ptr_type(AddressSpace::default());
+            context
+                .struct_type(&[ptr.into(), context.i64_type().into()], false)
+                .into()
+        }
+        Ty::Array(_) | Ty::List(_) | Ty::Map(_) | Ty::Set(_) | Ty::View(_) => {
+            let ptr = context.ptr_type(AddressSpace::default());
+            context
+                .struct_type(
+                    &[
+                        ptr.into(),
+                        context.i64_type().into(),
+                        context.i64_type().into(),
+                    ],
+                    false,
+                )
+                .into()
+        }
         // Every caller routes `Ty::User` and `Ty::Sum` through their layout
         // tables first (see `llvm_ty`).
         Ty::User(_) => unreachable!("a user-defined type resolves through the layout table"),
@@ -251,9 +506,9 @@ impl<'ctx> Layout<'ctx, '_> {
 /// Whether a type is lowered as a floating-point value rather than an integer.
 fn is_float(ty: Ty) -> bool {
     match ty {
-        Ty::Dec64 | Ty::Float32 => true,
+        Ty::Float64 | Ty::Float32 => true,
         Ty::Int64
-        | Ty::UInt8
+        | Ty::Byte
         | Ty::UInt16
         | Ty::UInt32
         | Ty::UInt64
@@ -262,6 +517,15 @@ fn is_float(ty: Ty) -> bool {
         | Ty::User(_)
         | Ty::Sum(_)
         | Ty::Box(_) => false,
+        Ty::String
+        | Ty::Unicode
+        | Ty::ViewByte
+        | Ty::ViewUnicode
+        | Ty::Array(_)
+        | Ty::List(_)
+        | Ty::View(_)
+        | Ty::Map(_)
+        | Ty::Set(_) => false,
     }
 }
 
@@ -269,16 +533,34 @@ fn is_float(ty: Ty) -> bool {
 /// read from the checked type, never inferred from an LLVM bit width.
 fn is_unsigned(ty: Ty) -> bool {
     match ty {
-        Ty::UInt8 | Ty::UInt16 | Ty::UInt32 | Ty::UInt64 => true,
+        Ty::Byte | Ty::UInt16 | Ty::UInt32 | Ty::UInt64 => true,
         Ty::Int64
-        | Ty::Dec64
+        | Ty::Float64
         | Ty::Float32
         | Ty::Bool
         | Ty::Nil
         | Ty::User(_)
         | Ty::Sum(_)
         | Ty::Box(_) => false,
+        Ty::String | Ty::ViewByte | Ty::ViewUnicode => false,
+        Ty::Unicode => true,
+        Ty::Array(_) | Ty::List(_) | Ty::View(_) | Ty::Map(_) | Ty::Set(_) => false,
     }
+}
+
+fn is_scalar_collection_element(ty: Ty) -> bool {
+    matches!(
+        ty,
+        Ty::Int64
+            | Ty::Byte
+            | Ty::UInt16
+            | Ty::UInt32
+            | Ty::UInt64
+            | Ty::Float32
+            | Ty::Float64
+            | Ty::Bool
+            | Ty::Unicode
+    )
 }
 
 /// The runtime import that prints one scalar.
@@ -287,14 +569,22 @@ fn print_import<'ctx>(
     ty: Ty,
 ) -> Result<(&'static str, Vec<BasicMetadataTypeEnum<'ctx>>), String> {
     let symbol = match ty {
-        Ty::Dec64 => "snacc_print_f64",
+        Ty::Float64 => "snacc_print_f64",
         Ty::Float32 => "snacc_print_f32",
         Ty::Int64 => "snacc_print_i64",
-        Ty::UInt8 => "snacc_print_u8",
+        Ty::Byte => "snacc_print_u8",
         Ty::UInt16 => "snacc_print_u16",
         Ty::UInt32 => "snacc_print_u32",
         Ty::UInt64 => "snacc_print_u64",
         Ty::Bool => "snacc_print_bool",
+        Ty::String => {
+            return Ok((
+                "snacc_print_string_ptr",
+                vec![context.ptr_type(AddressSpace::default()).into()],
+            ));
+        }
+        Ty::Unicode => "snacc_print_unicode",
+        Ty::ViewUnicode => "snacc_print_unicode_view",
         // Specification 010 section 14 rejects printing a user-defined type and
         // Specification 012 section 10 leaves no standalone `Nil` value at all,
         // so neither reaches lowering.
@@ -304,6 +594,10 @@ fn print_import<'ctx>(
         // Specification 016 section 8.3 rejects direct printing of a box in
         // the checker, so this never reaches lowering.
         Ty::Box(_) => return Err(internal("a box type reached 'print' lowering")),
+        Ty::ViewByte => return Err(internal("a byte view reached 'print' lowering")),
+        Ty::Array(_) | Ty::List(_) | Ty::View(_) | Ty::Map(_) | Ty::Set(_) => {
+            return Err(internal("a collection reached 'print' lowering"));
+        }
     };
     Ok((symbol, vec![scalar_ty(context, ty).into()]))
 }
@@ -317,7 +611,7 @@ fn is_subword_int<'ctx>(ty: impl TryInto<IntType<'ctx>>) -> bool {
 /// and results on every target Snacc emits for (confirmed against rustc's own
 /// IR). Specification 009 section 5.2 requires the backend to match that rather
 /// than assume an LLVM width alone defines the call ABI, so declarations and
-/// their call sites both get the attribute -- this covers `UInt8`, `UInt16`,
+/// their call sites both get the attribute -- this covers `Byte`, `UInt16`,
 /// and the pre-existing `Bool`/`Nil` `u8` mapping alike.
 fn zero_extend_subwords<'ctx>(
     context: &'ctx Context,
@@ -358,23 +652,36 @@ fn declare<'ctx>(
 /// referent's own type never appears in the signature.
 fn function_type<'ctx>(
     context: &'ctx Context,
+    target_data: &TargetData,
     layout: &[BasicTypeEnum<'ctx>],
     sums: &[BasicTypeEnum<'ctx>],
     leading: &[BasicMetadataTypeEnum<'ctx>],
     params: &[TParam],
     result: Option<Ty>,
+    bridge: bool,
 ) -> FunctionType<'ctx> {
     let mut llvm_params = leading.to_vec();
     for param in params {
-        llvm_params.push(match param.mode {
-            ParamMode::Value => llvm_ty(context, layout, sums, param.ty).into(),
-            ParamMode::Reference => context.ptr_type(AddressSpace::default()).into(),
-        });
+        match param.mode {
+            ParamMode::Value if bridge && is_bridge_view_ty(param.ty) => {
+                let pointer = context.ptr_type(AddressSpace::default());
+                llvm_params.push(pointer.into());
+                llvm_params.push(context.ptr_sized_int_type(target_data, None).into());
+            }
+            ParamMode::Value => llvm_params.push(llvm_ty(context, layout, sums, param.ty).into()),
+            ParamMode::Reference => {
+                llvm_params.push(context.ptr_type(AddressSpace::default()).into())
+            }
+        }
     }
     match result {
         Some(ty) => llvm_ty(context, layout, sums, ty).fn_type(&llvm_params, false),
         None => context.void_type().fn_type(&llvm_params, false),
     }
+}
+
+fn is_bridge_view_ty(ty: Ty) -> bool {
+    matches!(ty, Ty::ViewByte | Ty::ViewUnicode | Ty::View(_))
 }
 
 /// How a local's current value is reached. Immutable roots stay as SSA values;
@@ -494,11 +801,13 @@ fn build_module<'ctx>(
             &function.symbol,
             function_type(
                 context,
+                &target_data,
                 &layout,
                 &sum_layout,
                 &[],
                 &function.params,
                 function.result,
+                true,
             ),
             None,
         );
@@ -511,11 +820,13 @@ fn build_module<'ctx>(
             &format!("snacc_fn_{name}"),
             function_type(
                 context,
+                &target_data,
                 &layout,
                 &sum_layout,
                 &[],
                 &function.params,
                 function.result,
+                false,
             ),
             Some(Linkage::Internal),
         );
@@ -535,11 +846,13 @@ fn build_module<'ctx>(
             &format!("snacc_method_{}_{id}", method.receiver.0),
             function_type(
                 context,
+                &target_data,
                 &layout,
                 &sum_layout,
                 &[receiver_param],
                 &method.params,
                 method.result,
+                false,
             ),
             Some(Linkage::Internal),
         ));
@@ -771,21 +1084,65 @@ impl<'ctx> Codegen<'ctx, '_> {
         })
     }
 
+    /// Declares the single fatal runtime entry used for every invalid
+    /// floating-point result. Keeping this as one import gives the NaN
+    /// invariant a stable ABI surface instead of one symbol per operation.
+    fn invalid_floating_operation_import(&self) -> FunctionValue<'ctx> {
+        let symbol = "snacc_invalid_floating_operation";
+        self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.void_type().fn_type(&[], false),
+                None,
+            )
+        })
+    }
+
+    /// Branches around one unordered floating-point check. LLVM's UNO
+    /// predicate is true exactly when either operand is NaN; comparing a
+    /// value with itself therefore detects NaN without changing the value.
+    fn validate_float(&self, value: FloatValue<'ctx>, label: &str) -> Result<(), String> {
+        let is_nan = self
+            .builder
+            .build_float_compare(FloatPredicate::UNO, value, value, label)
+            .map_err(|error| error.to_string())?;
+        let function = self.current_function();
+        let invalid = self.context.append_basic_block(function, "invalid_float");
+        let valid = self.context.append_basic_block(function, "valid_float");
+        self.builder
+            .build_conditional_branch(is_nan, invalid, valid)
+            .map_err(|error| error.to_string())?;
+        self.builder.position_at_end(invalid);
+        self.invoke(self.invalid_floating_operation_import(), &[])?;
+        self.builder
+            .build_unreachable()
+            .map_err(|error| error.to_string())?;
+        self.builder.position_at_end(valid);
+        Ok(())
+    }
+
     /// Calls the runtime deallocator for `ptr`, sized and aligned for
     /// `pointee` (Specification 016 section 8.1: a box releases its
     /// allocation on destruction).
     fn call_dealloc(&self, ptr: PointerValue<'ctx>, pointee: Ty) -> Result<(), String> {
         let (size, align) = self.size_align(pointee);
-        let usize_ty = self.usize_ty();
+        self.call_raw_dealloc(
+            ptr,
+            self.usize_ty().const_int(size, false),
+            self.usize_ty().const_int(align, false),
+        )
+    }
+
+    fn call_raw_dealloc(
+        &self,
+        ptr: PointerValue<'ctx>,
+        size: IntValue<'ctx>,
+        align: IntValue<'ctx>,
+    ) -> Result<(), String> {
         let dealloc_fn = self.dealloc_import();
-        self.invoke(
-            dealloc_fn,
-            &[
-                ptr.into(),
-                usize_ty.const_int(size, false).into(),
-                usize_ty.const_int(align, false).into(),
-            ],
-        )?;
+        self.invoke(dealloc_fn, &[ptr.into(), size.into(), align.into()])?;
         Ok(())
     }
 
@@ -1033,15 +1390,130 @@ impl<'ctx> Codegen<'ctx, '_> {
             (Some(result), false) => Some(self.expr(env, loops, result)?),
             _ => None,
         };
-        // Specification 016 section 8.1: cleanup runs on every supported
-        // *normal* edge leaving an owning scope -- a block that already
-        // terminated (an unreachable fall-through, a `break`) leaves through
-        // neither, so no drop instruction is appended after its terminator.
+        // Specification 025: only a normal fall-through executes the block's
+        // normal cleanup plan. Early exits carry their own plan on the checked
+        // statement, so no second cleanup is appended after a terminator.
         if !terminated {
-            self.drop_places(env, &block.drops)?;
+            self.cleanup(env, loops, &block.cleanup, None)?;
         }
         env.truncate(scope);
         Ok((value, terminated))
+    }
+
+    /// Emits one checked cleanup plan in its stored execution order. `error`
+    /// is absent for a statically successful exit and present for a return
+    /// whose active result tag selects success or error. Deferred calls that
+    /// consume a root disarm that root's later destruction in the applicable
+    /// branch.
+    fn cleanup(
+        &self,
+        env: &mut Env<'ctx>,
+        loops: &mut Loops<'ctx>,
+        cleanup: &[TCleanup],
+        error: Option<IntValue<'ctx>>,
+    ) -> Result<(), String> {
+        let mut always_consumed = HashSet::new();
+        let mut error_consumed = HashSet::new();
+        for entry in cleanup {
+            match entry {
+                TCleanup::Drop(place) if always_consumed.contains(&place.root) => {}
+                TCleanup::Drop(place) if error_consumed.contains(&place.root) => {
+                    let Some(error) = error else {
+                        return Err(internal(
+                            "an error-only deferred move reached a successful cleanup plan",
+                        ));
+                    };
+                    let function = self.current_function();
+                    let skip = self.context.append_basic_block(function, "skip_drop");
+                    let run = self.context.append_basic_block(function, "run_drop");
+                    let merge = self.context.append_basic_block(function, "drop_merge");
+                    self.builder
+                        .build_conditional_branch(error, skip, run)
+                        .map_err(|err| err.to_string())?;
+                    self.builder.position_at_end(run);
+                    self.drop_places(env, std::slice::from_ref(place))?;
+                    self.builder
+                        .build_unconditional_branch(merge)
+                        .map_err(|err| err.to_string())?;
+                    self.builder.position_at_end(skip);
+                    self.builder
+                        .build_unconditional_branch(merge)
+                        .map_err(|err| err.to_string())?;
+                    self.builder.position_at_end(merge);
+                }
+                TCleanup::Drop(place) => {
+                    self.drop_places(env, std::slice::from_ref(place))?;
+                }
+                TCleanup::Deferred(deferred) if !deferred.on_error => {
+                    self.stmt(env, loops, &deferred.call)?;
+                    always_consumed.extend(deferred.consumes.iter().cloned());
+                }
+                TCleanup::Deferred(deferred) => {
+                    let Some(error) = error else {
+                        continue;
+                    };
+                    let function = self.current_function();
+                    let run = self.context.append_basic_block(function, "defer_error");
+                    let skip = self.context.append_basic_block(function, "defer_skip");
+                    let merge = self.context.append_basic_block(function, "defer_merge");
+                    self.builder
+                        .build_conditional_branch(error, run, skip)
+                        .map_err(|err| err.to_string())?;
+                    self.builder.position_at_end(run);
+                    self.stmt(env, loops, &deferred.call)?;
+                    self.builder
+                        .build_unconditional_branch(merge)
+                        .map_err(|err| err.to_string())?;
+                    self.builder.position_at_end(skip);
+                    self.builder
+                        .build_unconditional_branch(merge)
+                        .map_err(|err| err.to_string())?;
+                    self.builder.position_at_end(merge);
+                    error_consumed.extend(deferred.consumes.iter().cloned());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn result_error_condition(
+        &self,
+        value: BasicValueEnum<'ctx>,
+        result: Option<Ty>,
+    ) -> Result<Option<IntValue<'ctx>>, String> {
+        let Some(Ty::Sum(sum)) = result else {
+            return Ok(None);
+        };
+        let Some(error_index) = self
+            .program
+            .types
+            .iter()
+            .position(|def| def.name() == "Error")
+        else {
+            return Err(internal("the predeclared Error type is missing"));
+        };
+        let error_ty = Ty::User(TypeId(error_index as u32));
+        let Some(error_tag) = self.program.sums[sum.index()]
+            .iter()
+            .position(|member| *member == error_ty)
+        else {
+            return Ok(None);
+        };
+        let tag = self
+            .builder
+            .build_extract_value(as_struct(value)?, 0, "return_tag")
+            .map_err(|err| err.to_string())?
+            .into_int_value();
+        let is_error = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                tag,
+                self.context.i32_type().const_int(error_tag as u64, false),
+                "return_is_error",
+            )
+            .map_err(|err| err.to_string())?;
+        Ok(Some(is_error))
     }
 
     /// Returns whether this statement terminated the current basic block.
@@ -1094,8 +1566,280 @@ impl<'ctx> Codegen<'ctx, '_> {
                     .map_err(|error| error.to_string())?;
                 Ok(false)
             }
+            TStmt::SequenceIndexAssign {
+                receiver,
+                index,
+                value,
+                elem,
+            } => {
+                // The value is completely evaluated before the destination
+                // collection is touched, matching ordinary assignment and
+                // preventing a replacement from invalidating its source.
+                let index = self.expr(env, loops, index)?.into_int_value();
+                let value = self.expr(env, loops, value)?;
+                let Some((collection_ptr, _)) = self.place_ptr(env, receiver)? else {
+                    return Err(internal(
+                        "sequence indexed assignment reached a place with no storage",
+                    ));
+                };
+                let descriptor = self
+                    .builder
+                    .build_load(
+                        self.collection_type(),
+                        collection_ptr,
+                        "sequence_descriptor",
+                    )
+                    .map_err(|error| error.to_string())?
+                    .into_struct_value();
+                let data = self
+                    .builder
+                    .build_extract_value(descriptor, 0, "sequence_data")
+                    .map_err(|error| error.to_string())?
+                    .into_pointer_value();
+                let len = self
+                    .builder
+                    .build_extract_value(descriptor, 1, "sequence_length")
+                    .map_err(|error| error.to_string())?
+                    .into_int_value();
+                let nonnegative = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::SGE,
+                        index,
+                        self.context.i64_type().const_zero(),
+                        "assignment_index_nonnegative",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let in_range = self
+                    .builder
+                    .build_int_compare(IntPredicate::ULT, index, len, "assignment_index_in_range")
+                    .map_err(|error| error.to_string())?;
+                let valid = self
+                    .builder
+                    .build_and(nonnegative, in_range, "assignment_index_valid")
+                    .map_err(|error| error.to_string())?;
+                let function = self.current_function();
+                let valid_block = self
+                    .context
+                    .append_basic_block(function, "index_assign_valid");
+                let invalid_block = self
+                    .context
+                    .append_basic_block(function, "index_assign_invalid");
+                self.builder
+                    .build_conditional_branch(valid, valid_block, invalid_block)
+                    .map_err(|error| error.to_string())?;
+                self.builder.position_at_end(invalid_block);
+                self.invoke(self.collection_bounds_fail_import(), &[])?;
+                self.builder
+                    .build_unreachable()
+                    .map_err(|error| error.to_string())?;
+                self.builder.position_at_end(valid_block);
+                // Safety: the checker restricts this statement to an owning
+                // array/list and the preceding branch proves the index range.
+                let element_ptr = unsafe {
+                    self.builder
+                        .build_gep(self.ty(*elem), data, &[index], "assigned_element")
+                }
+                .map_err(|error| error.to_string())?;
+                if is_move_only(self.program, *elem) {
+                    let old = self
+                        .builder
+                        .build_load(self.ty(*elem), element_ptr, "replaced_element")
+                        .map_err(|error| error.to_string())?;
+                    self.drop_value(*elem, old)?;
+                }
+                self.builder
+                    .build_store(element_ptr, value)
+                    .map_err(|error| error.to_string())?;
+                Ok(false)
+            }
             TStmt::MethodCall(call) => {
                 self.method_call(env, loops, call)?;
+                Ok(false)
+            }
+            TStmt::ListPush {
+                receiver,
+                value,
+                elem,
+            } => {
+                // Evaluate the argument before taking the receiver address,
+                // matching assignment's left-to-right effect ordering.
+                let value = self.expr(env, loops, value)?;
+                let Some((ptr, _)) = self.place_ptr(env, receiver)? else {
+                    return Err(internal("List.push reached a place with no storage"));
+                };
+                if is_scalar_collection_element(*elem) {
+                    let function = self.list_push_import(*elem)?;
+                    self.invoke(function, &[ptr.into(), value.into()])?;
+                } else {
+                    let slot = self.entry_alloca(self.ty(*elem), "list_push_value")?;
+                    self.builder
+                        .build_store(slot, value)
+                        .map_err(|error| error.to_string())?;
+                    let (size, align) = self.size_align(*elem);
+                    self.invoke(
+                        self.list_raw_import("push"),
+                        &[
+                            ptr.into(),
+                            slot.into(),
+                            self.usize_ty().const_int(size, false).into(),
+                            self.usize_ty().const_int(align, false).into(),
+                        ],
+                    )?;
+                }
+                Ok(false)
+            }
+            TStmt::ListClear { receiver, elem } => {
+                let Some((ptr, _)) = self.place_ptr(env, receiver)? else {
+                    return Err(internal("List.clear reached a place with no storage"));
+                };
+                if is_move_only(self.program, *elem) {
+                    let descriptor = self
+                        .builder
+                        .build_load(self.collection_type(), ptr, "list_descriptor")
+                        .map_err(|error| error.to_string())?
+                        .into_struct_value();
+                    let data = self
+                        .builder
+                        .build_extract_value(descriptor, 0, "list_data")
+                        .map_err(|error| error.to_string())?
+                        .into_pointer_value();
+                    let len = self
+                        .builder
+                        .build_extract_value(descriptor, 1, "list_length")
+                        .map_err(|error| error.to_string())?
+                        .into_int_value();
+                    self.drop_sequence_elements(data, len, *elem)?;
+                }
+                if is_scalar_collection_element(*elem) {
+                    self.invoke(self.list_clear_import(), &[ptr.into()])?;
+                } else {
+                    self.invoke(self.list_raw_import("clear"), &[ptr.into()])?;
+                }
+                Ok(false)
+            }
+            TStmt::ListInsert {
+                receiver,
+                index,
+                value,
+                elem,
+            } => {
+                let index = self.expr(env, loops, index)?;
+                let value = self.expr(env, loops, value)?;
+                let Some((ptr, _)) = self.place_ptr(env, receiver)? else {
+                    return Err(internal("List.insert reached a place with no storage"));
+                };
+                if is_scalar_collection_element(*elem) {
+                    self.invoke(
+                        self.list_insert_import(*elem)?,
+                        &[ptr.into(), index.into(), value.into()],
+                    )?;
+                } else {
+                    let slot = self.entry_alloca(self.ty(*elem), "list_insert_value")?;
+                    self.builder
+                        .build_store(slot, value)
+                        .map_err(|error| error.to_string())?;
+                    let (size, align) = self.size_align(*elem);
+                    self.invoke(
+                        self.list_raw_import("insert"),
+                        &[
+                            ptr.into(),
+                            index.into(),
+                            slot.into(),
+                            self.usize_ty().const_int(size, false).into(),
+                            self.usize_ty().const_int(align, false).into(),
+                        ],
+                    )?;
+                }
+                Ok(false)
+            }
+            TStmt::ListReserve {
+                receiver,
+                minimum,
+                elem,
+            } => {
+                let minimum = self.expr(env, loops, minimum)?;
+                let Some((ptr, _)) = self.place_ptr(env, receiver)? else {
+                    return Err(internal("List.reserve reached a place with no storage"));
+                };
+                let (size, align) = self.size_align(*elem);
+                self.invoke(
+                    self.list_reserve_import(),
+                    &[
+                        ptr.into(),
+                        minimum.into(),
+                        self.usize_ty().const_int(size, false).into(),
+                        self.usize_ty().const_int(align, false).into(),
+                    ],
+                )?;
+                Ok(false)
+            }
+            TStmt::MapClear {
+                receiver,
+                key_ty,
+                value_ty,
+            } => {
+                let Some((ptr, _)) = self.place_ptr(env, receiver)? else {
+                    return Err(internal("Map.clear reached a place with no storage"));
+                };
+                let descriptor = self
+                    .builder
+                    .build_load(self.collection_type(), ptr, "map_clear_descriptor")
+                    .map_err(|error| error.to_string())?
+                    .into_struct_value();
+                if self.map_uses_raw_value(*value_ty) {
+                    self.drop_map_values(*key_ty, *value_ty, descriptor)?;
+                }
+                if self.map_uses_raw_value(*value_ty) {
+                    self.invoke(self.map_raw_clear_import(*key_ty)?, &[ptr.into()])?;
+                } else {
+                    self.invoke(self.map_clear_import(*key_ty, *value_ty)?, &[ptr.into()])?;
+                }
+                Ok(false)
+            }
+            TStmt::MapReserve {
+                receiver,
+                minimum,
+                key_ty,
+                value_ty,
+            } => {
+                let minimum = self.expr(env, loops, minimum)?;
+                let Some((ptr, _)) = self.place_ptr(env, receiver)? else {
+                    return Err(internal("Map.reserve reached a place with no storage"));
+                };
+                if self.map_uses_raw_value(*value_ty) {
+                    self.invoke(
+                        self.map_raw_reserve_import(*key_ty)?,
+                        &[ptr.into(), minimum.into()],
+                    )?;
+                } else {
+                    self.invoke(
+                        self.map_reserve_import(*key_ty, *value_ty)?,
+                        &[ptr.into(), minimum.into()],
+                    )?;
+                }
+                Ok(false)
+            }
+            TStmt::SetClear { receiver, elem } => {
+                let Some((ptr, _)) = self.place_ptr(env, receiver)? else {
+                    return Err(internal("Set.clear reached a place with no storage"));
+                };
+                self.invoke(self.set_clear_import(*elem)?, &[ptr.into()])?;
+                Ok(false)
+            }
+            TStmt::SetReserve {
+                receiver,
+                minimum,
+                elem,
+            } => {
+                let minimum = self.expr(env, loops, minimum)?;
+                let Some((ptr, _)) = self.place_ptr(env, receiver)? else {
+                    return Err(internal("Set.reserve reached a place with no storage"));
+                };
+                self.invoke(
+                    self.set_reserve_import(*elem)?,
+                    &[ptr.into(), minimum.into()],
+                )?;
                 Ok(false)
             }
             TStmt::While { condition, body } => {
@@ -1128,7 +1872,275 @@ impl<'ctx> Codegen<'ctx, '_> {
                 self.builder.position_at_end(exit_block);
                 Ok(false)
             }
-            TStmt::Break => {
+            TStmt::For {
+                value_name,
+                value_ty,
+                key_name,
+                key_ty,
+                iterable,
+                collection_ty,
+                body,
+            } => {
+                let collection = self.expr(env, loops, iterable)?.into_struct_value();
+                let is_map = matches!(collection_ty, Ty::Map(_));
+                let is_set = matches!(collection_ty, Ty::Set(_));
+                let collection_slot = if is_map || is_set {
+                    let slot = self.entry_alloca(self.collection_type().into(), "for_map")?;
+                    self.builder
+                        .build_store(slot, collection)
+                        .map_err(|error| error.to_string())?;
+                    Some(slot)
+                } else {
+                    None
+                };
+                let ptr = if !is_map && !is_set {
+                    Some(
+                        self.builder
+                            .build_extract_value(collection, 0, "for_ptr")
+                            .map_err(|error| error.to_string())?
+                            .into_pointer_value(),
+                    )
+                } else {
+                    None
+                };
+                let len = if *collection_ty == Ty::ViewUnicode {
+                    let view = self.descriptor_ptr(
+                        collection.into(),
+                        self.view_type().into(),
+                        "for_view",
+                    )?;
+                    self.invoke(self.view_length_import(true), &[view.into()])?
+                        .try_as_basic_value()
+                        .expect_basic("Unicode view length returns an integer")
+                        .into_int_value()
+                } else {
+                    self.builder
+                        .build_extract_value(collection, 1, "for_len")
+                        .map_err(|error| error.to_string())?
+                        .into_int_value()
+                };
+                let function = self.current_function();
+                let condition_block = self.context.append_basic_block(function, "for_condition");
+                let body_block = self.context.append_basic_block(function, "for_body");
+                let exit_block = self.context.append_basic_block(function, "for_exit");
+                let entry = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| internal("for loop has no insertion block"))?;
+                self.builder
+                    .build_unconditional_branch(condition_block)
+                    .map_err(|error| error.to_string())?;
+                self.builder.position_at_end(condition_block);
+                let index = self
+                    .builder
+                    .build_phi(self.context.i64_type(), "for_index")
+                    .map_err(|error| error.to_string())?;
+                let zero = self.context.i64_type().const_zero();
+                index.add_incoming(&[(&zero, entry)]);
+                let current = index.as_basic_value().into_int_value();
+                let more = self
+                    .builder
+                    .build_int_compare(IntPredicate::ULT, current, len, "for_more")
+                    .map_err(|error| error.to_string())?;
+                self.builder
+                    .build_conditional_branch(more, body_block, exit_block)
+                    .map_err(|error| error.to_string())?;
+                self.builder.position_at_end(body_block);
+                let item_slot = if is_map {
+                    let key_ty = key_ty.ok_or_else(|| internal("map loop has no key type"))?;
+                    if self.map_uses_raw_value(*value_ty) {
+                        let out = self.entry_alloca(self.ty(*value_ty), "map_loop_value")?;
+                        self.invoke(
+                            self.map_raw_read_import("value_at", key_ty, false)?,
+                            &[
+                                collection_slot
+                                    .ok_or_else(|| internal("map loop has no descriptor slot"))?
+                                    .into(),
+                                current.into(),
+                                out.into(),
+                                self.usize_ty()
+                                    .const_int(self.size_align(*value_ty).0, false)
+                                    .into(),
+                            ],
+                        )?;
+                        Slot::Mutable(out)
+                    } else {
+                        let item = self
+                            .invoke(
+                                self.map_iteration_import("value_at", key_ty, *value_ty)?,
+                                &[
+                                    collection_slot
+                                        .ok_or_else(|| internal("map loop has no descriptor slot"))?
+                                        .into(),
+                                    current.into(),
+                                ],
+                            )?
+                            .try_as_basic_value()
+                            .expect_basic("map iteration value lookup returns the map value");
+                        Slot::Value(item)
+                    }
+                } else if is_set {
+                    if *value_ty == Ty::String {
+                        let out = self.entry_alloca(self.string_type().into(), "set_loop_value")?;
+                        self.invoke(
+                            self.set_iteration_import(*value_ty)?,
+                            &[
+                                out.into(),
+                                collection_slot
+                                    .ok_or_else(|| internal("set loop has no descriptor slot"))?
+                                    .into(),
+                                current.into(),
+                            ],
+                        )?;
+                        Slot::Value(
+                            self.builder
+                                .build_load(self.string_type(), out, "set_loop_value")
+                                .map_err(|error| error.to_string())?,
+                        )
+                    } else {
+                        let item = self
+                            .invoke(
+                                self.set_iteration_import(*value_ty)?,
+                                &[
+                                    collection_slot
+                                        .ok_or_else(|| internal("set loop has no descriptor slot"))?
+                                        .into(),
+                                    current.into(),
+                                ],
+                            )?
+                            .try_as_basic_value()
+                            .expect_basic("set iteration lookup returns the set element");
+                        Slot::Value(item)
+                    }
+                } else if *collection_ty == Ty::ViewUnicode {
+                    let scalar = self
+                        .invoke(
+                            self.view_at_import(true),
+                            &[
+                                self.descriptor_ptr(
+                                    collection.into(),
+                                    self.view_type().into(),
+                                    "for_view_at",
+                                )?
+                                .into(),
+                                current.into(),
+                            ],
+                        )?
+                        .try_as_basic_value()
+                        .expect_basic("Unicode view lookup returns an integer")
+                        .into_int_value();
+                    let item = self
+                        .builder
+                        .build_int_truncate(scalar, self.context.i32_type(), "for_unicode_item")
+                        .map_err(|error| error.to_string())?;
+                    Slot::Value(item.into())
+                } else {
+                    let item_ptr = unsafe {
+                        self.builder.build_gep(
+                            self.ty(*value_ty),
+                            ptr.ok_or_else(|| internal("sequence loop has no storage"))?,
+                            &[current],
+                            "for_item_ptr",
+                        )
+                    }
+                    .map_err(|error| error.to_string())?;
+                    if is_move_only(self.program, *value_ty) {
+                        Slot::Mutable(item_ptr)
+                    } else {
+                        Slot::Value(
+                            self.builder
+                                .build_load(self.ty(*value_ty), item_ptr, "for_item")
+                                .map_err(|error| error.to_string())?,
+                        )
+                    }
+                };
+                let scope = env.len();
+                if is_map {
+                    let key_ty = key_ty.ok_or_else(|| internal("map loop has no key type"))?;
+                    let key = if self.map_uses_raw_value(*value_ty) && key_ty == Ty::String {
+                        let out = self.entry_alloca(self.string_type().into(), "map_loop_key")?;
+                        self.invoke(
+                            self.map_raw_read_import("key_at", key_ty, false)?,
+                            &[
+                                out.into(),
+                                collection_slot
+                                    .ok_or_else(|| internal("raw map loop has no descriptor slot"))?
+                                    .into(),
+                                current.into(),
+                            ],
+                        )?;
+                        self.builder
+                            .build_load(self.string_type(), out, "map_loop_key")
+                            .map_err(|error| error.to_string())?
+                    } else if self.map_uses_raw_value(*value_ty) {
+                        self.invoke(
+                            self.map_raw_read_import("key_at", key_ty, false)?,
+                            &[
+                                collection_slot
+                                    .ok_or_else(|| internal("raw map loop has no descriptor slot"))?
+                                    .into(),
+                                current.into(),
+                            ],
+                        )?
+                        .try_as_basic_value()
+                        .expect_basic("raw map iteration key lookup returns the map key")
+                    } else if key_ty == Ty::String {
+                        let out = self.entry_alloca(self.string_type().into(), "map_loop_key")?;
+                        self.invoke(
+                            self.map_iteration_import("key_at", key_ty, *value_ty)?,
+                            &[
+                                out.into(),
+                                collection_slot
+                                    .ok_or_else(|| internal("map loop has no descriptor slot"))?
+                                    .into(),
+                                current.into(),
+                            ],
+                        )?;
+                        self.builder
+                            .build_load(self.string_type(), out, "map_loop_key")
+                            .map_err(|error| error.to_string())?
+                    } else {
+                        self.invoke(
+                            self.map_iteration_import("key_at", key_ty, *value_ty)?,
+                            &[
+                                collection_slot
+                                    .ok_or_else(|| internal("map loop has no descriptor slot"))?
+                                    .into(),
+                                current.into(),
+                            ],
+                        )?
+                        .try_as_basic_value()
+                        .expect_basic("map iteration key lookup returns the map key")
+                    };
+                    env.push((
+                        key_name
+                            .clone()
+                            .ok_or_else(|| internal("map loop has no key binding"))?,
+                        Slot::Value(key),
+                    ));
+                }
+                env.push((value_name.clone(), item_slot));
+                let (_, terminated) = self.block(env, loops, body)?;
+                env.truncate(scope);
+                if !terminated {
+                    let next = self
+                        .builder
+                        .build_int_add(
+                            current,
+                            self.context.i64_type().const_int(1, false),
+                            "for_next",
+                        )
+                        .map_err(|error| error.to_string())?;
+                    self.builder
+                        .build_unconditional_branch(condition_block)
+                        .map_err(|error| error.to_string())?;
+                    index.add_incoming(&[(&next, self.builder.get_insert_block().unwrap())]);
+                }
+                self.builder.position_at_end(exit_block);
+                Ok(false)
+            }
+            TStmt::Break { cleanup } => {
+                self.cleanup(env, loops, cleanup, None)?;
                 let exit = *loops
                     .last()
                     .ok_or("checker allowed a 'break' outside every loop")?;
@@ -1198,6 +2210,46 @@ impl<'ctx> Codegen<'ctx, '_> {
             }
             TStmt::Call(name, args) => {
                 self.call(env, loops, name, args)?;
+                Ok(false)
+            }
+            // Specification 026 section 10: the result -- if any -- is
+            // evaluated and materialized before the checked cleanup plan
+            // runs, so a moved-out local is read for its value here before
+            // (not being) destroyed below; `drops` already excludes any root
+            // the checker transferred to the caller. Shares no lowering path
+            // with `body`'s own implicit-fallthrough exit beyond `drop_places`
+            // itself, but produces the exact same instructions that path
+            // would for the same result and cleanup facts.
+            TStmt::Return {
+                value,
+                result,
+                cleanup,
+            } => {
+                let value = match value {
+                    Some(expression) => Some(self.expr(env, loops, expression)?),
+                    None => None,
+                };
+                let error = match (value, *result) {
+                    (Some(value), Some(result)) => {
+                        self.result_error_condition(value, Some(result))?
+                    }
+                    _ => None,
+                };
+                self.cleanup(env, loops, cleanup, error)?;
+                match &value {
+                    Some(value) => self.builder.build_return(Some(value)),
+                    None => self.builder.build_return(None),
+                }
+                .map_err(|error| error.to_string())?;
+                Ok(true)
+            }
+            TStmt::ReturnOnError {
+                value,
+                sum,
+                result,
+                cleanup,
+            } => {
+                self.lower_return_on_error(env, loops, value, *sum, Ty::Nil, *result, cleanup)?;
                 Ok(false)
             }
             TStmt::Expr(expression) => {
@@ -1295,6 +2347,104 @@ impl<'ctx> Codegen<'ctx, '_> {
         }
     }
 
+    /// Lowers Specification 021 truthiness without changing the value's
+    /// representation. Only `Bool(false)` and an active `Nil` are falsey;
+    /// numeric zeroes, aggregates, boxes, strings, and views are truthy.
+    fn truthiness_value(
+        &self,
+        ty: Ty,
+        value: BasicValueEnum<'ctx>,
+    ) -> Result<IntValue<'ctx>, String> {
+        match ty {
+            Ty::Bool => {
+                let compared = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::NE,
+                        value.into_int_value(),
+                        self.context.i8_type().const_zero(),
+                        "truthy_bool",
+                    )
+                    .map_err(|error| error.to_string())?;
+                self.builder
+                    .build_int_z_extend(compared, self.context.i8_type(), "truthy_bool_byte")
+                    .map_err(|error| error.to_string())
+            }
+            Ty::Nil => Ok(self.context.i8_type().const_zero()),
+            Ty::User(id) => match self.def(id) {
+                TypeDef::Represented { target, .. } => self.truthiness_value(*target, value),
+                TypeDef::Union { members, .. } => {
+                    let aggregate = as_struct(value)?;
+                    let tag = self
+                        .builder
+                        .build_extract_value(aggregate, 0, "truthy_tag")
+                        .map_err(|error| error.to_string())?
+                        .into_int_value();
+                    let mut result = self.context.i8_type().const_zero();
+                    for (index, member) in members.iter().enumerate().rev() {
+                        let member_truth = match self.def(*member) {
+                            TypeDef::UnionMember { nil: true, .. } => {
+                                self.context.i8_type().const_zero()
+                            }
+                            _ => self.context.i8_type().const_int(1, false),
+                        };
+                        let selected = self
+                            .builder
+                            .build_int_compare(
+                                IntPredicate::EQ,
+                                tag,
+                                self.context.i32_type().const_int(index as u64, false),
+                                "truthy_member_tag",
+                            )
+                            .map_err(|error| error.to_string())?;
+                        result = self
+                            .builder
+                            .build_select(selected, member_truth, result, "truthy_union")
+                            .map_err(|error| error.to_string())?
+                            .into_int_value();
+                    }
+                    Ok(result)
+                }
+                TypeDef::UnionMember { nil, .. } => {
+                    Ok(self.context.i8_type().const_int((!nil) as u64, false))
+                }
+                TypeDef::Struct { .. } => Ok(self.context.i8_type().const_int(1, false)),
+            },
+            Ty::Sum(id) => {
+                let aggregate = as_struct(value)?;
+                let tag = self
+                    .builder
+                    .build_extract_value(aggregate, 0, "truthy_tag")
+                    .map_err(|error| error.to_string())?
+                    .into_int_value();
+                let mut result = self.context.i8_type().const_zero();
+                for (index, member) in self.program.sums[id.index()].iter().enumerate().rev() {
+                    let member_value = self
+                        .builder
+                        .build_extract_value(aggregate, (index + 1) as u32, "truthy_member")
+                        .map_err(|error| error.to_string())?;
+                    let member_truth = self.truthiness_value(*member, member_value)?;
+                    let selected = self
+                        .builder
+                        .build_int_compare(
+                            IntPredicate::EQ,
+                            tag,
+                            self.context.i32_type().const_int(index as u64, false),
+                            "truthy_member_tag",
+                        )
+                        .map_err(|error| error.to_string())?;
+                    result = self
+                        .builder
+                        .build_select(selected, member_truth, result, "truthy_sum")
+                        .map_err(|error| error.to_string())?
+                        .into_int_value();
+                }
+                Ok(result)
+            }
+            _ => Ok(self.context.i8_type().const_int(1, false)),
+        }
+    }
+
     fn condition(
         &self,
         env: &mut Env<'ctx>,
@@ -1320,10 +2470,58 @@ impl<'ctx> Codegen<'ctx, '_> {
         args: &[TArg],
     ) -> Result<inkwell::values::CallSiteValue<'ctx>, String> {
         let mut llvm_args = Vec::new();
-        for arg in args {
-            llvm_args.push(self.argument(env, loops, arg)?);
+        let extern_decl = self.program.externs.get(name);
+        for (index, arg) in args.iter().enumerate() {
+            let bridge_view = extern_decl
+                .and_then(|declaration| declaration.params.get(index))
+                .is_some_and(|param| param.mode == ParamMode::Value && is_bridge_view_ty(param.ty));
+            if bridge_view {
+                let TArg::Value(value) = arg else {
+                    return Err(internal(
+                        "a view bridge parameter reached lowering by reference",
+                    ));
+                };
+                let descriptor = self.expr(env, loops, value)?.into_struct_value();
+                llvm_args.push(
+                    self.builder
+                        .build_extract_value(descriptor, 0, "bridge_view_ptr")
+                        .map_err(|error| error.to_string())?
+                        .into(),
+                );
+                llvm_args.push(
+                    self.builder
+                        .build_extract_value(descriptor, 1, "bridge_view_len")
+                        .map_err(|error| error.to_string())?
+                        .into(),
+                );
+            } else {
+                llvm_args.push(self.argument(env, loops, arg)?);
+            }
         }
-        self.invoke(self.functions[name], &llvm_args)
+        let call = self.invoke(self.functions[name], &llvm_args)?;
+        if let Some(extern_decl) = extern_decl {
+            for (param, arg) in extern_decl.params.iter().zip(args) {
+                if matches!(param.ty, Ty::Float32 | Ty::Float64)
+                    && matches!(param.mode, ParamMode::Reference)
+                {
+                    let TArg::Reference(place) = arg else {
+                        return Err(internal(
+                            "a reference bridge parameter was lowered as a value",
+                        ));
+                    };
+                    let Some((ptr, _)) = self.place_ptr(env, place)? else {
+                        return Err(internal("a bridge reference has no storage"));
+                    };
+                    let value = self
+                        .builder
+                        .build_load(self.ty(param.ty), ptr, "bridge_float_ref")
+                        .map_err(|error| error.to_string())?
+                        .into_float_value();
+                    self.validate_float(value, "bridge_float_ref_nan")?;
+                }
+            }
+        }
+        Ok(call)
     }
 
     /// Specification 011 section 11: a reference argument passes the address of
@@ -1450,6 +2648,47 @@ impl<'ctx> Codegen<'ctx, '_> {
         Ok(call)
     }
 
+    fn descriptor_ptr(
+        &self,
+        value: BasicValueEnum<'ctx>,
+        ty: BasicTypeEnum<'ctx>,
+        name: &str,
+    ) -> Result<PointerValue<'ctx>, String> {
+        let slot = self.entry_alloca(ty, name)?;
+        self.builder
+            .build_store(slot, value)
+            .map_err(|error| error.to_string())?;
+        Ok(slot)
+    }
+
+    fn string_out_call(
+        &self,
+        function: FunctionValue<'ctx>,
+        mut args: Vec<BasicMetadataValueEnum<'ctx>>,
+        name: &str,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let out = self.entry_alloca(self.string_type().into(), name)?;
+        args.insert(0, out.into());
+        self.invoke(function, &args)?;
+        self.builder
+            .build_load(self.string_type(), out, name)
+            .map_err(|error| error.to_string())
+    }
+
+    fn view_out_call(
+        &self,
+        function: FunctionValue<'ctx>,
+        mut args: Vec<BasicMetadataValueEnum<'ctx>>,
+        name: &str,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let out = self.entry_alloca(self.view_type().into(), name)?;
+        args.insert(0, out.into());
+        self.invoke(function, &args)?;
+        self.builder
+            .build_load(self.view_type(), out, name)
+            .map_err(|error| error.to_string())
+    }
+
     /// Declares the runtime print import for `ty` on first use.
     fn print_import(&self, ty: Ty) -> Result<FunctionValue<'ctx>, String> {
         let (symbol, params) = print_import(self.context, ty)?;
@@ -1462,6 +2701,1137 @@ impl<'ctx> Codegen<'ctx, '_> {
                 None,
             )
         }))
+    }
+
+    fn string_type(&self) -> StructType<'ctx> {
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        self.context.struct_type(
+            &[ptr.into(), self.usize_ty().into(), self.usize_ty().into()],
+            false,
+        )
+    }
+
+    fn unsigned_to_i64(&self, value: IntValue<'ctx>, name: &str) -> Result<IntValue<'ctx>, String> {
+        let width = value.get_type().get_bit_width();
+        match width.cmp(&64) {
+            std::cmp::Ordering::Less => self
+                .builder
+                .build_int_z_extend(value, self.context.i64_type(), name)
+                .map_err(|error| error.to_string()),
+            std::cmp::Ordering::Equal => Ok(value),
+            std::cmp::Ordering::Greater => self
+                .builder
+                .build_int_truncate(value, self.context.i64_type(), name)
+                .map_err(|error| error.to_string()),
+        }
+    }
+
+    fn concat_scalar_bits(
+        &self,
+        value: BasicValueEnum<'ctx>,
+        ty: Ty,
+    ) -> Result<IntValue<'ctx>, String> {
+        match ty {
+            Ty::Float32 => {
+                let bits = self
+                    .builder
+                    .build_bit_cast(value, self.context.i32_type(), "concat_f32_bits")
+                    .map_err(|error| error.to_string())?
+                    .into_int_value();
+                self.unsigned_to_i64(bits, "concat_f32_bits64")
+            }
+            Ty::Float64 => Ok(self
+                .builder
+                .build_bit_cast(value, self.context.i64_type(), "concat_f64_bits")
+                .map_err(|error| error.to_string())?
+                .into_int_value()),
+            Ty::Int64 | Ty::UInt64 => Ok(value.into_int_value()),
+            Ty::Byte | Ty::UInt16 | Ty::UInt32 | Ty::Bool | Ty::Unicode => {
+                self.unsigned_to_i64(value.into_int_value(), "concat_scalar_bits")
+            }
+            _ => Err(internal("unsupported scalar concatenation value")),
+        }
+    }
+
+    fn view_type(&self) -> StructType<'ctx> {
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        self.context
+            .struct_type(&[ptr.into(), self.usize_ty().into()], false)
+    }
+
+    fn collection_type(&self) -> StructType<'ctx> {
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        self.context.struct_type(
+            &[ptr.into(), self.usize_ty().into(), self.usize_ty().into()],
+            false,
+        )
+    }
+
+    fn string_view_import(&self, unicode: bool) -> FunctionValue<'ctx> {
+        let symbol = if unicode {
+            "snacc_string_unicode_out"
+        } else {
+            "snacc_string_bytes_out"
+        };
+        self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.void_type().fn_type(
+                    &[
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                    ],
+                    false,
+                ),
+                None,
+            )
+        })
+    }
+
+    fn string_from_view_import(&self, utf8: bool) -> FunctionValue<'ctx> {
+        let symbol = if utf8 {
+            "snacc_string_from_utf8_out"
+        } else {
+            "snacc_string_from_view_out"
+        };
+        self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.void_type().fn_type(
+                    &[
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                    ],
+                    false,
+                ),
+                None,
+            )
+        })
+    }
+
+    fn view_length_import(&self, unicode: bool) -> FunctionValue<'ctx> {
+        let symbol = if unicode {
+            "snacc_view_unicode_length"
+        } else {
+            "snacc_view_byte_length"
+        };
+        self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.i64_type().fn_type(
+                    &[self.context.ptr_type(AddressSpace::default()).into()],
+                    false,
+                ),
+                None,
+            )
+        })
+    }
+
+    fn view_equal_import(&self) -> FunctionValue<'ctx> {
+        self.module
+            .get_function("snacc_view_equal")
+            .unwrap_or_else(|| {
+                declare(
+                    self.context,
+                    self.module,
+                    "snacc_view_equal_ptr",
+                    self.context.i8_type().fn_type(
+                        &[
+                            self.context.ptr_type(AddressSpace::default()).into(),
+                            self.context.ptr_type(AddressSpace::default()).into(),
+                        ],
+                        false,
+                    ),
+                    None,
+                )
+            })
+    }
+
+    fn view_at_import(&self, unicode: bool) -> FunctionValue<'ctx> {
+        let symbol = if unicode {
+            "snacc_view_unicode_at_ptr"
+        } else {
+            "snacc_view_byte_at_ptr"
+        };
+        self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.i64_type().fn_type(
+                    &[
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.context.i64_type().into(),
+                    ],
+                    false,
+                ),
+                None,
+            )
+        })
+    }
+
+    fn view_slice_import(&self, unicode: bool) -> FunctionValue<'ctx> {
+        let symbol = if unicode {
+            "snacc_view_unicode_slice_out"
+        } else {
+            "snacc_view_byte_slice_out"
+        };
+        self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.void_type().fn_type(
+                    &[
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.context.i64_type().into(),
+                        self.context.i64_type().into(),
+                    ],
+                    false,
+                ),
+                None,
+            )
+        })
+    }
+
+    fn collection_bounds_fail_import(&self) -> FunctionValue<'ctx> {
+        self.module
+            .get_function("snacc_collection_bounds_fail")
+            .unwrap_or_else(|| {
+                declare(
+                    self.context,
+                    self.module,
+                    "snacc_collection_bounds_fail",
+                    self.context.void_type().fn_type(&[], false),
+                    None,
+                )
+            })
+    }
+
+    fn map_symbol(&self, operation: &str, key_ty: Ty) -> Result<&'static str, String> {
+        let symbol = match key_ty {
+            Ty::String | Ty::ViewByte => match operation {
+                "contains" => "snacc_map_string_i64_contains",
+                "insert" => "snacc_map_string_i64_insert",
+                "delete" => "snacc_map_string_i64_delete",
+                "index" => "snacc_map_string_i64_index",
+                "take" => "snacc_map_string_i64_take",
+                "reserve" => "snacc_map_string_i64_reserve",
+                "key_at" => "snacc_map_string_i64_key_at",
+                "value_at" => "snacc_map_string_i64_value_at",
+                "clear" => "snacc_map_string_i64_clear",
+                "drop" => "snacc_map_string_i64_drop",
+                _ => return Err(internal("unsupported map operation reached lowering")),
+            },
+            Ty::Byte => scalar_map_symbol("u8", operation),
+            Ty::UInt16 => scalar_map_symbol("u16", operation),
+            Ty::UInt32 => scalar_map_symbol("u32", operation),
+            Ty::UInt64 => scalar_map_symbol("u64", operation),
+            Ty::Int64 => scalar_map_symbol("i64", operation),
+            Ty::Bool => scalar_map_symbol("bool", operation),
+            Ty::Unicode => scalar_map_symbol("unicode", operation),
+            _ => return Err(internal("unsupported map key type reached lowering")),
+        };
+        Ok(symbol)
+    }
+
+    fn map_raw_symbol(&self, operation: &str, key_ty: Ty) -> Result<&'static str, String> {
+        if matches!(key_ty, Ty::String | Ty::ViewByte) {
+            return Ok(match operation {
+                "contains" => "snacc_map_string_raw_contains",
+                "insert" => "snacc_map_string_raw_insert",
+                "delete" => "snacc_map_string_raw_delete",
+                "index" => "snacc_map_string_raw_index",
+                "take" => "snacc_map_string_raw_take",
+                "reserve" => "snacc_map_string_raw_reserve",
+                "key_at" => "snacc_map_string_raw_key_at",
+                "value_at" => "snacc_map_string_raw_value_at",
+                "clear" => "snacc_map_string_raw_clear",
+                "drop" => "snacc_map_string_raw_drop",
+                _ => return Err(internal("unsupported raw map operation reached lowering")),
+            });
+        }
+        let prefix = match key_ty {
+            Ty::Byte => "u8",
+            Ty::UInt16 => "u16",
+            Ty::UInt32 => "u32",
+            Ty::UInt64 => "u64",
+            Ty::Int64 => "i64",
+            Ty::Bool => "bool",
+            Ty::Unicode => "unicode",
+            _ => return Err(internal("unsupported raw map key type reached lowering")),
+        };
+        Ok(scalar_map_raw_symbol(prefix, operation))
+    }
+
+    fn map_uses_raw_value(&self, value_ty: Ty) -> bool {
+        value_ty != Ty::Int64
+    }
+
+    fn map_contains_import(
+        &self,
+        key_ty: Ty,
+        _value_ty: Ty,
+    ) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.map_symbol("contains", key_ty)?;
+        let query = if matches!(key_ty, Ty::ViewByte) {
+            self.context.ptr_type(AddressSpace::default()).into()
+        } else {
+            self.ty(key_ty).into()
+        };
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.i8_type().fn_type(
+                    &[self.context.ptr_type(AddressSpace::default()).into(), query],
+                    false,
+                ),
+                None,
+            )
+        }))
+    }
+
+    fn map_insert_import(&self, key_ty: Ty, value_ty: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.map_symbol("insert", key_ty)?;
+        let key = if key_ty == Ty::String {
+            self.context.ptr_type(AddressSpace::default()).into()
+        } else {
+            self.ty(key_ty).into()
+        };
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.i8_type().fn_type(
+                    &[
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        key,
+                        self.ty(value_ty).into(),
+                    ],
+                    false,
+                ),
+                None,
+            )
+        }))
+    }
+
+    fn map_delete_import(&self, key_ty: Ty, _value_ty: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.map_symbol("delete", key_ty)?;
+        let query = if matches!(key_ty, Ty::ViewByte) {
+            self.context.ptr_type(AddressSpace::default()).into()
+        } else {
+            self.ty(key_ty).into()
+        };
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.i8_type().fn_type(
+                    &[self.context.ptr_type(AddressSpace::default()).into(), query],
+                    false,
+                ),
+                None,
+            )
+        }))
+    }
+
+    fn map_index_import(&self, key_ty: Ty, value_ty: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.map_symbol("index", key_ty)?;
+        let query = if matches!(key_ty, Ty::ViewByte) {
+            self.context.ptr_type(AddressSpace::default()).into()
+        } else {
+            self.ty(key_ty).into()
+        };
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.ty(value_ty).fn_type(
+                    &[self.context.ptr_type(AddressSpace::default()).into(), query],
+                    false,
+                ),
+                None,
+            )
+        }))
+    }
+
+    fn map_take_import(&self, key_ty: Ty, value_ty: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.map_symbol("take", key_ty)?;
+        let query = if matches!(key_ty, Ty::ViewByte) {
+            self.context.ptr_type(AddressSpace::default()).into()
+        } else {
+            self.ty(key_ty).into()
+        };
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.ty(value_ty).fn_type(
+                    &[self.context.ptr_type(AddressSpace::default()).into(), query],
+                    false,
+                ),
+                None,
+            )
+        }))
+    }
+
+    fn map_iteration_import(
+        &self,
+        operation: &str,
+        key_ty: Ty,
+        value_ty: Ty,
+    ) -> Result<FunctionValue<'ctx>, String> {
+        let string_key = operation == "key_at" && key_ty == Ty::String;
+        let symbol = if string_key {
+            "snacc_map_string_i64_key_at_out"
+        } else {
+            self.map_symbol(operation, key_ty)?
+        };
+        let result = if operation == "key_at" {
+            key_ty
+        } else {
+            value_ty
+        };
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                if string_key {
+                    self.context.void_type().fn_type(
+                        &[
+                            self.context.ptr_type(AddressSpace::default()).into(),
+                            self.context.ptr_type(AddressSpace::default()).into(),
+                            self.context.i64_type().into(),
+                        ],
+                        false,
+                    )
+                } else {
+                    self.ty(result).fn_type(
+                        &[
+                            self.context.ptr_type(AddressSpace::default()).into(),
+                            self.context.i64_type().into(),
+                        ],
+                        false,
+                    )
+                },
+                None,
+            )
+        }))
+    }
+
+    fn map_clear_import(&self, key_ty: Ty, value_ty: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.map_symbol("clear", key_ty)?;
+        let _ = value_ty;
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.void_type().fn_type(
+                    &[self.context.ptr_type(AddressSpace::default()).into()],
+                    false,
+                ),
+                None,
+            )
+        }))
+    }
+
+    fn map_reserve_import(&self, key_ty: Ty, value_ty: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.map_symbol("reserve", key_ty)?;
+        let _ = value_ty;
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.void_type().fn_type(
+                    &[
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.context.i64_type().into(),
+                    ],
+                    false,
+                ),
+                None,
+            )
+        }))
+    }
+
+    fn map_drop_import(&self, key_ty: Ty, value_ty: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.map_symbol("drop", key_ty)?;
+        let _ = value_ty;
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.void_type().fn_type(
+                    &[self.context.ptr_type(AddressSpace::default()).into()],
+                    false,
+                ),
+                None,
+            )
+        }))
+    }
+
+    fn map_raw_insert_import(&self, key_ty: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.map_raw_symbol("insert", key_ty)?;
+        let key: BasicMetadataTypeEnum<'ctx> = if key_ty == Ty::String {
+            self.context.ptr_type(AddressSpace::default()).into()
+        } else {
+            self.ty(key_ty).into()
+        };
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.i8_type().fn_type(
+                    &[
+                        ptr.into(),
+                        key,
+                        ptr.into(),
+                        self.usize_ty().into(),
+                        ptr.into(),
+                    ],
+                    false,
+                ),
+                None,
+            )
+        }))
+    }
+
+    fn map_raw_delete_import(&self, key_ty: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.map_raw_symbol("delete", key_ty)?;
+        let key: BasicMetadataTypeEnum<'ctx> = if key_ty == Ty::ViewByte {
+            self.context.ptr_type(AddressSpace::default()).into()
+        } else {
+            self.ty(key_ty).into()
+        };
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.i8_type().fn_type(
+                    &[ptr.into(), key, ptr.into(), self.usize_ty().into()],
+                    false,
+                ),
+                None,
+            )
+        }))
+    }
+
+    fn map_raw_contains_import(&self, key_ty: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.map_raw_symbol("contains", key_ty)?;
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        let key: BasicMetadataTypeEnum<'ctx> = if key_ty == Ty::ViewByte {
+            ptr.into()
+        } else {
+            self.ty(key_ty).into()
+        };
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.i8_type().fn_type(&[ptr.into(), key], false),
+                None,
+            )
+        }))
+    }
+
+    fn map_raw_read_import(
+        &self,
+        operation: &str,
+        key_ty: Ty,
+        result_is_index: bool,
+    ) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.map_raw_symbol(operation, key_ty)?;
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        let signature = if operation == "key_at" {
+            if key_ty == Ty::String {
+                self.context.void_type().fn_type(
+                    &[ptr.into(), ptr.into(), self.context.i64_type().into()],
+                    false,
+                )
+            } else {
+                self.ty(key_ty)
+                    .fn_type(&[ptr.into(), self.context.i64_type().into()], false)
+            }
+        } else if result_is_index {
+            let key: BasicMetadataTypeEnum<'ctx> = if key_ty == Ty::ViewByte {
+                ptr.into()
+            } else {
+                self.ty(key_ty).into()
+            };
+            let params: Vec<BasicMetadataTypeEnum<'ctx>> =
+                vec![ptr.into(), key, ptr.into(), self.usize_ty().into()];
+            self.context.void_type().fn_type(&params, false)
+        } else if operation == "value_at" {
+            let params: Vec<BasicMetadataTypeEnum<'ctx>> = vec![
+                self.context.ptr_type(AddressSpace::default()).into(),
+                self.context.i64_type().into(),
+                ptr.into(),
+                self.usize_ty().into(),
+            ];
+            self.context.void_type().fn_type(&params, false)
+        } else {
+            let key: BasicMetadataTypeEnum<'ctx> = if key_ty == Ty::ViewByte {
+                ptr.into()
+            } else {
+                self.ty(key_ty).into()
+            };
+            let params: Vec<BasicMetadataTypeEnum<'ctx>> =
+                vec![ptr.into(), key, ptr.into(), self.usize_ty().into()];
+            self.context.void_type().fn_type(&params, false)
+        };
+        Ok(self
+            .module
+            .get_function(symbol)
+            .unwrap_or_else(|| declare(self.context, self.module, symbol, signature, None)))
+    }
+
+    fn map_raw_clear_import(&self, key_ty: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.map_raw_symbol("clear", key_ty)?;
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.void_type().fn_type(
+                    &[self.context.ptr_type(AddressSpace::default()).into()],
+                    false,
+                ),
+                None,
+            )
+        }))
+    }
+
+    fn map_raw_reserve_import(&self, key_ty: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.map_raw_symbol("reserve", key_ty)?;
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context
+                    .void_type()
+                    .fn_type(&[ptr.into(), self.context.i64_type().into()], false),
+                None,
+            )
+        }))
+    }
+
+    fn map_raw_drop_import(&self, key_ty: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.map_raw_symbol("drop", key_ty)?;
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.void_type().fn_type(
+                    &[self.context.ptr_type(AddressSpace::default()).into()],
+                    false,
+                ),
+                None,
+            )
+        }))
+    }
+
+    fn set_symbol(&self, operation: &str, elem: Ty) -> Result<&'static str, String> {
+        let string_elem = elem == Ty::String || elem == Ty::ViewByte;
+        let scalar_elem = matches!(
+            elem,
+            Ty::Byte | Ty::UInt16 | Ty::UInt32 | Ty::UInt64 | Ty::Int64 | Ty::Bool | Ty::Unicode
+        );
+        if !string_elem && !scalar_elem {
+            return Err(internal("unsupported set element type reached lowering"));
+        }
+        if scalar_elem && elem != Ty::Int64 {
+            let prefix = match elem {
+                Ty::Byte => "u8",
+                Ty::UInt16 => "u16",
+                Ty::UInt32 => "u32",
+                Ty::UInt64 => "u64",
+                Ty::Bool => "bool",
+                Ty::Unicode => "unicode",
+                _ => unreachable!("set scalar element was validated above"),
+            };
+            return Ok(scalar_set_symbol(prefix, operation));
+        }
+        Ok(match (string_elem, operation) {
+            (true, "contains") => "snacc_set_string_contains",
+            (true, "insert") => "snacc_set_string_insert",
+            (true, "delete") => "snacc_set_string_delete",
+            (true, "at") => "snacc_set_string_at",
+            (true, "reserve") => "snacc_set_string_reserve",
+            (true, "clear") => "snacc_set_string_clear",
+            (true, "drop") => "snacc_set_string_drop",
+            (false, "contains") => "snacc_set_i64_contains",
+            (false, "at") => "snacc_set_i64_at",
+            (false, "insert") => "snacc_set_i64_insert",
+            (false, "delete") => "snacc_set_i64_delete",
+            (false, "reserve") => "snacc_set_i64_reserve",
+            (false, "clear") => "snacc_set_i64_clear",
+            (false, "drop") => "snacc_set_i64_drop",
+            _ => return Err(internal("unsupported set operation reached lowering")),
+        })
+    }
+
+    fn set_contains_import(&self, elem: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.set_symbol("contains", elem)?;
+        let value = if elem == Ty::String || elem == Ty::ViewByte {
+            self.context.ptr_type(AddressSpace::default()).into()
+        } else {
+            self.ty(elem).into()
+        };
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.i8_type().fn_type(
+                    &[self.context.ptr_type(AddressSpace::default()).into(), value],
+                    false,
+                ),
+                None,
+            )
+        }))
+    }
+
+    fn set_insert_import(&self, elem: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.set_symbol("insert", elem)?;
+        let value = if elem == Ty::String {
+            self.context.ptr_type(AddressSpace::default()).into()
+        } else {
+            self.ty(elem).into()
+        };
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.i8_type().fn_type(
+                    &[self.context.ptr_type(AddressSpace::default()).into(), value],
+                    false,
+                ),
+                None,
+            )
+        }))
+    }
+
+    fn set_delete_import(&self, elem: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.set_symbol("delete", elem)?;
+        let value = if elem == Ty::String || elem == Ty::ViewByte {
+            self.context.ptr_type(AddressSpace::default()).into()
+        } else {
+            self.ty(elem).into()
+        };
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.i8_type().fn_type(
+                    &[self.context.ptr_type(AddressSpace::default()).into(), value],
+                    false,
+                ),
+                None,
+            )
+        }))
+    }
+
+    fn set_iteration_import(&self, elem: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = if elem == Ty::String {
+            "snacc_set_string_at_out"
+        } else {
+            self.set_symbol("at", elem)?
+        };
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                if elem == Ty::String {
+                    self.context.void_type().fn_type(
+                        &[
+                            self.context.ptr_type(AddressSpace::default()).into(),
+                            self.context.ptr_type(AddressSpace::default()).into(),
+                            self.context.i64_type().into(),
+                        ],
+                        false,
+                    )
+                } else {
+                    self.ty(elem).fn_type(
+                        &[
+                            self.context.ptr_type(AddressSpace::default()).into(),
+                            self.context.i64_type().into(),
+                        ],
+                        false,
+                    )
+                },
+                None,
+            )
+        }))
+    }
+
+    fn set_clear_import(&self, elem: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.set_symbol("clear", elem)?;
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.void_type().fn_type(
+                    &[self.context.ptr_type(AddressSpace::default()).into()],
+                    false,
+                ),
+                None,
+            )
+        }))
+    }
+
+    fn set_reserve_import(&self, elem: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.set_symbol("reserve", elem)?;
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.void_type().fn_type(
+                    &[
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.context.i64_type().into(),
+                    ],
+                    false,
+                ),
+                None,
+            )
+        }))
+    }
+
+    fn set_drop_import(&self, elem: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.set_symbol("drop", elem)?;
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.void_type().fn_type(
+                    &[self.context.ptr_type(AddressSpace::default()).into()],
+                    false,
+                ),
+                None,
+            )
+        }))
+    }
+
+    fn list_push_import(&self, elem: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = match elem {
+            Ty::Int64 => "snacc_list_push_i64",
+            Ty::Byte => "snacc_list_push_u8",
+            Ty::UInt16 => "snacc_list_push_u16",
+            Ty::UInt32 => "snacc_list_push_u32",
+            Ty::UInt64 => "snacc_list_push_u64",
+            Ty::Float32 => "snacc_list_push_f32",
+            Ty::Float64 => "snacc_list_push_f64",
+            Ty::Bool => "snacc_list_push_bool",
+            Ty::Unicode => "snacc_list_push_unicode",
+            _ => return Err(internal("unsupported List.push element type")),
+        };
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context
+                    .void_type()
+                    .fn_type(&[ptr.into(), self.ty(elem).into()], false),
+                None,
+            )
+        }))
+    }
+
+    fn list_clear_import(&self) -> FunctionValue<'ctx> {
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        self.module
+            .get_function("snacc_list_clear")
+            .unwrap_or_else(|| {
+                declare(
+                    self.context,
+                    self.module,
+                    "snacc_list_clear",
+                    self.context.void_type().fn_type(&[ptr.into()], false),
+                    None,
+                )
+            })
+    }
+
+    fn list_scalar_symbol(&self, operation: &str, elem: Ty) -> Result<&'static str, String> {
+        let symbol = match (operation, elem) {
+            ("pop", Ty::Int64) => "snacc_list_pop_i64",
+            ("pop", Ty::Byte) => "snacc_list_pop_u8",
+            ("pop", Ty::UInt16) => "snacc_list_pop_u16",
+            ("pop", Ty::UInt32) => "snacc_list_pop_u32",
+            ("pop", Ty::UInt64) => "snacc_list_pop_u64",
+            ("pop", Ty::Float32) => "snacc_list_pop_f32",
+            ("pop", Ty::Float64) => "snacc_list_pop_f64",
+            ("pop", Ty::Bool) => "snacc_list_pop_bool",
+            ("pop", Ty::Unicode) => "snacc_list_pop_unicode",
+            ("insert", Ty::Int64) => "snacc_list_insert_i64",
+            ("insert", Ty::Byte) => "snacc_list_insert_u8",
+            ("insert", Ty::UInt16) => "snacc_list_insert_u16",
+            ("insert", Ty::UInt32) => "snacc_list_insert_u32",
+            ("insert", Ty::UInt64) => "snacc_list_insert_u64",
+            ("insert", Ty::Float32) => "snacc_list_insert_f32",
+            ("insert", Ty::Float64) => "snacc_list_insert_f64",
+            ("insert", Ty::Bool) => "snacc_list_insert_bool",
+            ("insert", Ty::Unicode) => "snacc_list_insert_unicode",
+            ("remove", Ty::Int64) => "snacc_list_remove_i64",
+            ("remove", Ty::Byte) => "snacc_list_remove_u8",
+            ("remove", Ty::UInt16) => "snacc_list_remove_u16",
+            ("remove", Ty::UInt32) => "snacc_list_remove_u32",
+            ("remove", Ty::UInt64) => "snacc_list_remove_u64",
+            ("remove", Ty::Float32) => "snacc_list_remove_f32",
+            ("remove", Ty::Float64) => "snacc_list_remove_f64",
+            ("remove", Ty::Bool) => "snacc_list_remove_bool",
+            ("remove", Ty::Unicode) => "snacc_list_remove_unicode",
+            _ => return Err(internal("unsupported scalar list operation")),
+        };
+        Ok(symbol)
+    }
+
+    fn list_pop_import(&self, elem: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.list_scalar_symbol("pop", elem)?;
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.ty(elem).fn_type(&[ptr.into()], false),
+                None,
+            )
+        }))
+    }
+
+    fn list_insert_import(&self, elem: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.list_scalar_symbol("insert", elem)?;
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.context.void_type().fn_type(
+                    &[
+                        ptr.into(),
+                        self.context.i64_type().into(),
+                        self.ty(elem).into(),
+                    ],
+                    false,
+                ),
+                None,
+            )
+        }))
+    }
+
+    fn list_remove_import(&self, elem: Ty) -> Result<FunctionValue<'ctx>, String> {
+        let symbol = self.list_scalar_symbol("remove", elem)?;
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        Ok(self.module.get_function(symbol).unwrap_or_else(|| {
+            declare(
+                self.context,
+                self.module,
+                symbol,
+                self.ty(elem)
+                    .fn_type(&[ptr.into(), self.context.i64_type().into()], false),
+                None,
+            )
+        }))
+    }
+
+    fn list_reserve_import(&self) -> FunctionValue<'ctx> {
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        self.module
+            .get_function("snacc_list_reserve")
+            .unwrap_or_else(|| {
+                declare(
+                    self.context,
+                    self.module,
+                    "snacc_list_reserve",
+                    self.context.void_type().fn_type(
+                        &[
+                            ptr.into(),
+                            self.context.i64_type().into(),
+                            self.usize_ty().into(),
+                            self.usize_ty().into(),
+                        ],
+                        false,
+                    ),
+                    None,
+                )
+            })
+    }
+
+    fn list_raw_import(&self, operation: &str) -> FunctionValue<'ctx> {
+        let symbol = match operation {
+            "push" => "snacc_list_push_raw",
+            "pop" => "snacc_list_pop_raw",
+            "insert" => "snacc_list_insert_raw",
+            "remove" => "snacc_list_remove_raw",
+            "clear" => "snacc_list_clear_raw",
+            _ => unreachable!("unsupported raw list operation"),
+        };
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        let signature = match operation {
+            "push" => self.context.void_type().fn_type(
+                &[
+                    ptr.into(),
+                    ptr.into(),
+                    self.usize_ty().into(),
+                    self.usize_ty().into(),
+                ],
+                false,
+            ),
+            "pop" => self
+                .context
+                .void_type()
+                .fn_type(&[ptr.into(), ptr.into(), self.usize_ty().into()], false),
+            "remove" => self.context.void_type().fn_type(
+                &[
+                    ptr.into(),
+                    self.context.i64_type().into(),
+                    ptr.into(),
+                    self.usize_ty().into(),
+                ],
+                false,
+            ),
+            "insert" => self.context.void_type().fn_type(
+                &[
+                    ptr.into(),
+                    self.context.i64_type().into(),
+                    ptr.into(),
+                    self.usize_ty().into(),
+                    self.usize_ty().into(),
+                ],
+                false,
+            ),
+            "clear" => self.context.void_type().fn_type(&[ptr.into()], false),
+            _ => unreachable!(),
+        };
+        self.module
+            .get_function(symbol)
+            .unwrap_or_else(|| declare(self.context, self.module, symbol, signature, None))
+    }
+
+    fn string_equal_import(&self) -> FunctionValue<'ctx> {
+        self.module
+            .get_function("snacc_string_equal_ptr")
+            .unwrap_or_else(|| {
+                declare(
+                    self.context,
+                    self.module,
+                    "snacc_string_equal_ptr",
+                    self.context.i8_type().fn_type(
+                        &[
+                            self.context.ptr_type(AddressSpace::default()).into(),
+                            self.context.ptr_type(AddressSpace::default()).into(),
+                        ],
+                        false,
+                    ),
+                    None,
+                )
+            })
+    }
+
+    fn string_new_import(&self) -> FunctionValue<'ctx> {
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        self.module
+            .get_function("snacc_string_new_out")
+            .unwrap_or_else(|| {
+                declare(
+                    self.context,
+                    self.module,
+                    "snacc_string_new_out",
+                    self.context
+                        .void_type()
+                        .fn_type(&[ptr.into(), ptr.into(), self.usize_ty().into()], false),
+                    None,
+                )
+            })
+    }
+
+    fn string_concat_parts_import(&self) -> FunctionValue<'ctx> {
+        let ptr = self.context.ptr_type(AddressSpace::default());
+        self.module
+            .get_function("snacc_string_concat_parts_out")
+            .unwrap_or_else(|| {
+                declare(
+                    self.context,
+                    self.module,
+                    "snacc_string_concat_parts_out",
+                    self.context
+                        .void_type()
+                        .fn_type(&[ptr.into(), ptr.into(), self.usize_ty().into()], false),
+                    None,
+                )
+            })
+    }
+
+    fn string_clone_import(&self) -> FunctionValue<'ctx> {
+        self.module
+            .get_function("snacc_string_clone_out")
+            .unwrap_or_else(|| {
+                declare(
+                    self.context,
+                    self.module,
+                    "snacc_string_clone_out",
+                    self.context.void_type().fn_type(
+                        &[
+                            self.context.ptr_type(AddressSpace::default()).into(),
+                            self.context.ptr_type(AddressSpace::default()).into(),
+                        ],
+                        false,
+                    ),
+                    None,
+                )
+            })
+    }
+
+    fn string_drop_import(&self) -> FunctionValue<'ctx> {
+        self.module
+            .get_function("snacc_string_drop_ptr")
+            .unwrap_or_else(|| {
+                declare(
+                    self.context,
+                    self.module,
+                    "snacc_string_drop_ptr",
+                    self.context.void_type().fn_type(
+                        &[self.context.ptr_type(AddressSpace::default()).into()],
+                        false,
+                    ),
+                    None,
+                )
+            })
     }
 
     fn value_if(
@@ -1562,6 +3932,43 @@ impl<'ctx> Codegen<'ctx, '_> {
                 TypeDef::Union { members, .. } => self.equal_union(members, left, right),
             },
             Ty::Sum(id) => self.equal_sum(&self.program.sums[id.index()], left, right),
+            Ty::Array(id) | Ty::List(id) | Ty::View(id) => {
+                let elem = match &self.program.collections[id.index()] {
+                    crate::semantics::types::CollectionDef::Array { elem, .. }
+                    | crate::semantics::types::CollectionDef::List { elem }
+                    | crate::semantics::types::CollectionDef::View { elem } => *elem,
+                    _ => return Err(internal("collection equality has non-sequence metadata")),
+                };
+                self.equal_collection(elem, left, right)
+            }
+            Ty::String | Ty::ViewByte | Ty::ViewUnicode => {
+                let descriptor_ty = if ty == Ty::String {
+                    self.string_type().into()
+                } else {
+                    self.view_type().into()
+                };
+                let left = self.descriptor_ptr(left, descriptor_ty, "equal_left")?;
+                let right = self.descriptor_ptr(right, descriptor_ty, "equal_right")?;
+                let equal = if ty == Ty::String {
+                    self.invoke(self.string_equal_import(), &[left.into(), right.into()])?
+                        .try_as_basic_value()
+                        .expect_basic("string equality returns a byte")
+                        .into_int_value()
+                } else {
+                    self.invoke(self.view_equal_import(), &[left.into(), right.into()])?
+                        .try_as_basic_value()
+                        .expect_basic("view equality returns a byte")
+                        .into_int_value()
+                };
+                self.builder
+                    .build_int_compare(
+                        IntPredicate::NE,
+                        equal,
+                        self.context.i8_type().const_zero(),
+                        "equal",
+                    )
+                    .map_err(|error| error.to_string())
+            }
             _ if is_float(ty) => self
                 .builder
                 .build_float_compare(
@@ -1581,6 +3988,154 @@ impl<'ctx> Codegen<'ctx, '_> {
                 )
                 .map_err(|error| error.to_string()),
         }
+    }
+
+    /// Compares two same-typed sequence descriptors by length and then by
+    /// increasing element index. The descriptor's third field is intentionally
+    /// ignored: capacity is storage state, not sequence content.
+    fn equal_collection(
+        &self,
+        elem: Ty,
+        left: BasicValueEnum<'ctx>,
+        right: BasicValueEnum<'ctx>,
+    ) -> Result<IntValue<'ctx>, String> {
+        let left = as_struct(left)?;
+        let right = as_struct(right)?;
+        let left_ptr = self
+            .builder
+            .build_extract_value(left, 0, "left_collection_ptr")
+            .map_err(|error| error.to_string())?
+            .into_pointer_value();
+        let right_ptr = self
+            .builder
+            .build_extract_value(right, 0, "right_collection_ptr")
+            .map_err(|error| error.to_string())?
+            .into_pointer_value();
+        let left_len = self
+            .builder
+            .build_extract_value(left, 1, "left_collection_len")
+            .map_err(|error| error.to_string())?
+            .into_int_value();
+        let right_len = self
+            .builder
+            .build_extract_value(right, 1, "right_collection_len")
+            .map_err(|error| error.to_string())?
+            .into_int_value();
+
+        let function = self.current_function();
+        let length_match = self
+            .context
+            .append_basic_block(function, "collection_eq_length_match");
+        let loop_block = self
+            .context
+            .append_basic_block(function, "collection_eq_loop");
+        let element_block = self
+            .context
+            .append_basic_block(function, "collection_eq_element");
+        let all_equal = self
+            .context
+            .append_basic_block(function, "collection_eq_all_equal");
+        let done = self
+            .context
+            .append_basic_block(function, "collection_eq_done");
+        let entry = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| internal("collection equality has no insertion block"))?;
+        let lengths_equal = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, left_len, right_len, "lengths_equal")
+            .map_err(|error| error.to_string())?;
+        self.builder
+            .build_conditional_branch(lengths_equal, length_match, done)
+            .map_err(|error| error.to_string())?;
+
+        self.builder.position_at_end(length_match);
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .map_err(|error| error.to_string())?;
+
+        self.builder.position_at_end(loop_block);
+        let index = self
+            .builder
+            .build_phi(self.context.i64_type(), "collection_eq_index")
+            .map_err(|error| error.to_string())?;
+        let zero = self.context.i64_type().const_zero();
+        index.add_incoming(&[(&zero, length_match)]);
+        let index_value = index.as_basic_value().into_int_value();
+        let more = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, index_value, left_len, "more_elements")
+            .map_err(|error| error.to_string())?;
+        self.builder
+            .build_conditional_branch(more, element_block, all_equal)
+            .map_err(|error| error.to_string())?;
+
+        self.builder.position_at_end(element_block);
+        let left_element_ptr = unsafe {
+            self.builder
+                .build_gep(self.ty(elem), left_ptr, &[index_value], "left_element_ptr")
+        }
+        .map_err(|error| error.to_string())?;
+        let right_element_ptr = unsafe {
+            self.builder.build_gep(
+                self.ty(elem),
+                right_ptr,
+                &[index_value],
+                "right_element_ptr",
+            )
+        }
+        .map_err(|error| error.to_string())?;
+        let left_element = self
+            .builder
+            .build_load(self.ty(elem), left_element_ptr, "left_element")
+            .map_err(|error| error.to_string())?;
+        let right_element = self
+            .builder
+            .build_load(self.ty(elem), right_element_ptr, "right_element")
+            .map_err(|error| error.to_string())?;
+        let equal = self.equal(elem, left_element, right_element)?;
+        let mismatch = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| internal("collection element equality has no block"))?;
+        let next = self
+            .context
+            .append_basic_block(function, "collection_eq_next");
+        self.builder
+            .build_conditional_branch(equal, next, done)
+            .map_err(|error| error.to_string())?;
+        self.builder.position_at_end(next);
+        let next_index = self
+            .builder
+            .build_int_add(
+                index_value,
+                self.context.i64_type().const_int(1, false),
+                "next_index",
+            )
+            .map_err(|error| error.to_string())?;
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .map_err(|error| error.to_string())?;
+        index.add_incoming(&[(&next_index, next)]);
+
+        self.builder.position_at_end(all_equal);
+        let all_equal_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| internal("collection equality completion has no block"))?;
+        self.builder
+            .build_unconditional_branch(done)
+            .map_err(|error| error.to_string())?;
+
+        self.builder.position_at_end(done);
+        let false_value = self.context.bool_type().const_zero();
+        let true_value = self.context.bool_type().const_all_ones();
+        self.phi_bool(&[
+            (false_value, entry),
+            (false_value, mismatch),
+            (true_value, all_equal_end),
+        ])
     }
 
     /// Fields compare in declaration order with short-circuiting. All values of
@@ -1813,6 +4368,200 @@ impl<'ctx> Codegen<'ctx, '_> {
         Ok(phi.as_basic_value().into_int_value())
     }
 
+    /// Lowers the shared control-flow operation used by expression- and
+    /// statement-form `return_on_error`. The source and enclosing result sums
+    /// may differ; the error payload is therefore re-tagged into the declared
+    /// result before the checked cleanup plan runs.
+    fn lower_return_on_error(
+        &self,
+        env: &mut Env<'ctx>,
+        loops: &mut Loops<'ctx>,
+        value_expr: &TExpr,
+        sum: SumId,
+        success: Ty,
+        result: Ty,
+        cleanup: &[TCleanup],
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let value = self.expr(env, loops, value_expr)?;
+        let aggregate = as_struct(value)?;
+        let tag = self
+            .builder
+            .build_extract_value(aggregate, 0, "error_tag")
+            .map_err(|error| error.to_string())?
+            .into_int_value();
+        let error_ty = self
+            .program
+            .types
+            .iter()
+            .position(|def| def.name() == "Error")
+            .map(|index| Ty::User(TypeId(index as u32)))
+            .ok_or_else(|| internal("the predeclared Error type is missing"))?;
+        let error_tag = self.sum_member_tag(sum, error_ty)?;
+        let function = self.current_function();
+        let error_block = self.context.append_basic_block(function, "return_error");
+        let success_block = self.context.append_basic_block(function, "return_success");
+        let merge = self.context.append_basic_block(function, "return_ok");
+        let is_error = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                tag,
+                self.context
+                    .i32_type()
+                    .const_int(u64::from(error_tag), false),
+                "is_error",
+            )
+            .map_err(|error| error.to_string())?;
+        self.builder
+            .build_conditional_branch(is_error, error_block, success_block)
+            .map_err(|error| error.to_string())?;
+
+        self.builder.position_at_end(error_block);
+        let error_value = if result == Ty::Sum(sum) {
+            value
+        } else {
+            let Ty::Sum(result_sum) = result else {
+                return Err(internal("return_on_error result is not an inline sum"));
+            };
+            let payload = self
+                .builder
+                .build_extract_value(aggregate, error_tag + 1, "error_payload")
+                .map_err(|error| error.to_string())?;
+            let zeroed = self.struct_ty(result)?.const_zero();
+            let result_tag = self.sum_member_tag(result_sum, error_ty)?;
+            let tagged = self
+                .builder
+                .build_insert_value(
+                    zeroed,
+                    self.context
+                        .i32_type()
+                        .const_int(u64::from(result_tag), false),
+                    0,
+                    "error_result_tag",
+                )
+                .map_err(|error| error.to_string())?
+                .into_struct_value();
+            self.builder
+                .build_insert_value(tagged, payload, result_tag + 1, "error_result_payload")
+                .map_err(|error| error.to_string())?
+                .into_struct_value()
+                .into()
+        };
+        self.cleanup(
+            env,
+            loops,
+            cleanup,
+            Some(self.context.bool_type().const_int(1, false)),
+        )?;
+        self.builder
+            .build_return(Some(&error_value))
+            .map_err(|error| error.to_string())?;
+
+        self.builder.position_at_end(success_block);
+        let success_value = match success {
+            Ty::Nil => self.context.i8_type().const_zero().into(),
+            Ty::Sum(reduced_sum) => {
+                let reduced_members = self.program.sums[reduced_sum.index()].clone();
+                let done = self.context.append_basic_block(function, "return_ok_sum");
+                let unknown = self
+                    .context
+                    .append_basic_block(function, "return_ok_unknown");
+                let cases: Vec<_> = reduced_members
+                    .iter()
+                    .map(|member| {
+                        (
+                            self.context.i32_type().const_int(
+                                u64::from(
+                                    self.sum_member_tag(sum, *member)
+                                        .expect("checker selected a sum member"),
+                                ),
+                                false,
+                            ),
+                            self.context
+                                .append_basic_block(function, "return_ok_member"),
+                        )
+                    })
+                    .collect();
+                self.builder
+                    .build_switch(tag, unknown, &cases)
+                    .map_err(|error| error.to_string())?;
+                self.builder.position_at_end(unknown);
+                self.exhausted()?;
+                let zeroed = self.struct_ty(Ty::Sum(reduced_sum))?.const_zero();
+                let mut incoming = Vec::with_capacity(cases.len());
+                for (member, (_, member_block)) in reduced_members.iter().zip(cases) {
+                    self.builder.position_at_end(member_block);
+                    let source_tag = self.sum_member_tag(sum, *member)?;
+                    let payload = if *member == Ty::Nil {
+                        self.context.i8_type().const_zero().into()
+                    } else {
+                        self.builder
+                            .build_extract_value(aggregate, source_tag + 1, "success")
+                            .map_err(|error| error.to_string())?
+                    };
+                    let reduced_tag = self.sum_member_tag(reduced_sum, *member)?;
+                    let tagged = self
+                        .builder
+                        .build_insert_value(
+                            zeroed,
+                            self.context
+                                .i32_type()
+                                .const_int(u64::from(reduced_tag), false),
+                            0,
+                            "success_tag",
+                        )
+                        .map_err(|error| error.to_string())?
+                        .into_struct_value();
+                    let injected = self
+                        .builder
+                        .build_insert_value(tagged, payload, reduced_tag + 1, "success_payload")
+                        .map_err(|error| error.to_string())?;
+                    let current = self
+                        .builder
+                        .get_insert_block()
+                        .ok_or_else(|| internal("return_on_error sum arm has no block"))?;
+                    self.builder
+                        .build_unconditional_branch(done)
+                        .map_err(|error| error.to_string())?;
+                    incoming.push((injected.into_struct_value(), current));
+                }
+                self.builder.position_at_end(done);
+                let phi = self
+                    .builder
+                    .build_phi(self.struct_ty(Ty::Sum(reduced_sum))?, "success_sum")
+                    .map_err(|error| error.to_string())?;
+                let incoming: Vec<(&dyn BasicValue<'ctx>, BasicBlock<'ctx>)> = incoming
+                    .iter()
+                    .map(|(value, block)| (value as &dyn BasicValue<'ctx>, *block))
+                    .collect();
+                phi.add_incoming(&incoming);
+                phi.as_basic_value()
+            }
+            _ => self
+                .builder
+                .build_extract_value(
+                    aggregate,
+                    self.sum_member_tag(sum, success)? + 1,
+                    "success_value",
+                )
+                .map_err(|error| error.to_string())?,
+        };
+        self.builder
+            .build_unconditional_branch(merge)
+            .map_err(|error| error.to_string())?;
+        let success_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| internal("return_on_error success block has no end"))?;
+        self.builder.position_at_end(merge);
+        let phi = self
+            .builder
+            .build_phi(self.ty(success), "success_value")
+            .map_err(|error| error.to_string())?;
+        phi.add_incoming(&[(&success_value, success_end)]);
+        Ok(phi.as_basic_value())
+    }
+
     fn expr(
         &self,
         env: &mut Env<'ctx>,
@@ -1824,7 +4573,7 @@ impl<'ctx> Codegen<'ctx, '_> {
             // here re-parses or re-rounds it. `f32 as f64` is exact, so the
             // already-rounded binary32 value reaches `const_float` unchanged.
             TExpr::Num(literal) => Ok(match literal {
-                NumLiteral::Dec(value) => self.context.f64_type().const_float(*value).into(),
+                NumLiteral::F64(value) => self.context.f64_type().const_float(*value).into(),
                 NumLiteral::F32(value) => self
                     .context
                     .f32_type()
@@ -1858,7 +4607,1179 @@ impl<'ctx> Codegen<'ctx, '_> {
                 .const_int(*value as u64, false)
                 .into()),
             TExpr::Nil => Ok(self.context.i8_type().const_zero().into()),
-            TExpr::Cast(value, Ty::Dec64) => {
+            TExpr::Unicode(value) => Ok(self
+                .context
+                .i32_type()
+                .const_int(u64::from(*value), false)
+                .into()),
+            TExpr::StringLiteral(value) => {
+                let global = self
+                    .builder
+                    .build_global_string_ptr(value, "string_literal")
+                    .map_err(|error| error.to_string())?;
+                let out = self.entry_alloca(self.string_type().into(), "string_literal_value")?;
+                self.invoke(
+                    self.string_new_import(),
+                    &[
+                        out.into(),
+                        global.as_pointer_value().into(),
+                        self.usize_ty().const_int(value.len() as u64, false).into(),
+                    ],
+                )?;
+                Ok(self
+                    .builder
+                    .build_load(self.string_type(), out, "string_literal_value")
+                    .map_err(|error| error.to_string())?)
+            }
+            TExpr::StringClone(value) => {
+                let value = self.expr(env, loops, value)?;
+                let value =
+                    self.descriptor_ptr(value, self.string_type().into(), "string_clone")?;
+                self.string_out_call(
+                    self.string_clone_import(),
+                    vec![value.into()],
+                    "string_clone_value",
+                )
+            }
+            TExpr::StringConcat(parts) => {
+                if parts.is_empty() {
+                    let empty = self
+                        .builder
+                        .build_global_string_ptr("", "empty_interpolation")
+                        .map_err(|error| error.to_string())?;
+                    return self.string_out_call(
+                        self.string_new_import(),
+                        vec![
+                            empty.as_pointer_value().into(),
+                            self.usize_ty().const_zero().into(),
+                        ],
+                        "empty_interpolation_value",
+                    );
+                }
+                let i64_type = self.context.i64_type();
+                let erased_type = self
+                    .context
+                    .struct_type(&[i64_type.into(), i64_type.into(), i64_type.into()], false);
+                let array_type = erased_type.array_type(parts.len() as u32);
+                let storage = self.entry_alloca(array_type.into(), "string_concat_parts")?;
+                let zero = self.context.i32_type().const_zero();
+                let mut owned_temporaries = Vec::new();
+
+                for (index, part) in parts.iter().enumerate() {
+                    let (tag, first, second) = if let TExpr::StringLiteral(text) = &part.value {
+                        let global = self
+                            .builder
+                            .build_global_string_ptr(text, "string_concat_literal")
+                            .map_err(|error| error.to_string())?;
+                        let pointer = self
+                            .builder
+                            .build_ptr_to_int(
+                                global.as_pointer_value(),
+                                i64_type,
+                                "string_concat_literal_ptr",
+                            )
+                            .map_err(|error| error.to_string())?;
+                        (0, pointer, i64_type.const_int(text.len() as u64, false))
+                    } else {
+                        let value = self.expr(env, loops, &part.value)?;
+                        match part.ty {
+                            Ty::String => {
+                                if !matches!(&part.value, TExpr::Place(_, _)) {
+                                    owned_temporaries.push(value);
+                                }
+                                let descriptor = value.into_struct_value();
+                                let pointer = self
+                                    .builder
+                                    .build_extract_value(descriptor, 0, "string_concat_text_ptr")
+                                    .map_err(|error| error.to_string())?
+                                    .into_pointer_value();
+                                let length = self
+                                    .builder
+                                    .build_extract_value(descriptor, 1, "string_concat_text_len")
+                                    .map_err(|error| error.to_string())?
+                                    .into_int_value();
+                                let pointer = self
+                                    .builder
+                                    .build_ptr_to_int(pointer, i64_type, "string_concat_text_bits")
+                                    .map_err(|error| error.to_string())?;
+                                let length =
+                                    self.unsigned_to_i64(length, "string_concat_text_len64")?;
+                                (0, pointer, length)
+                            }
+                            Ty::ViewUnicode => {
+                                let descriptor = value.into_struct_value();
+                                let pointer = self
+                                    .builder
+                                    .build_extract_value(descriptor, 0, "string_concat_view_ptr")
+                                    .map_err(|error| error.to_string())?
+                                    .into_pointer_value();
+                                let length = self
+                                    .builder
+                                    .build_extract_value(descriptor, 1, "string_concat_view_len")
+                                    .map_err(|error| error.to_string())?
+                                    .into_int_value();
+                                let pointer = self
+                                    .builder
+                                    .build_ptr_to_int(pointer, i64_type, "string_concat_view_bits")
+                                    .map_err(|error| error.to_string())?;
+                                let length =
+                                    self.unsigned_to_i64(length, "string_concat_view_len64")?;
+                                (0, pointer, length)
+                            }
+                            ty => (
+                                concat_part_tag(ty)?,
+                                self.concat_scalar_bits(value, ty)?,
+                                i64_type.const_zero(),
+                            ),
+                        }
+                    };
+                    let mut erased = erased_type.const_zero();
+                    erased = self
+                        .builder
+                        .build_insert_value(
+                            erased,
+                            i64_type.const_int(tag, false),
+                            0,
+                            "string_concat_tag",
+                        )
+                        .map_err(|error| error.to_string())?
+                        .into_struct_value();
+                    erased = self
+                        .builder
+                        .build_insert_value(erased, first, 1, "string_concat_first")
+                        .map_err(|error| error.to_string())?
+                        .into_struct_value();
+                    erased = self
+                        .builder
+                        .build_insert_value(erased, second, 2, "string_concat_second")
+                        .map_err(|error| error.to_string())?
+                        .into_struct_value();
+                    let slot = unsafe {
+                        self.builder.build_in_bounds_gep(
+                            array_type,
+                            storage,
+                            &[zero, self.context.i32_type().const_int(index as u64, false)],
+                            "string_concat_part",
+                        )
+                    }
+                    .map_err(|error| error.to_string())?;
+                    self.builder
+                        .build_store(slot, erased)
+                        .map_err(|error| error.to_string())?;
+                }
+
+                let result = self.string_out_call(
+                    self.string_concat_parts_import(),
+                    vec![
+                        storage.into(),
+                        self.usize_ty().const_int(parts.len() as u64, false).into(),
+                    ],
+                    "string_concat_value",
+                )?;
+                for temporary in owned_temporaries {
+                    self.drop_value(Ty::String, temporary)?;
+                }
+                Ok(result)
+            }
+            TExpr::StringFromUnicode(value) => {
+                let value = self.expr(env, loops, value)?;
+                let value =
+                    self.descriptor_ptr(value, self.view_type().into(), "string_from_view")?;
+                self.string_out_call(
+                    self.string_from_view_import(false),
+                    vec![value.into()],
+                    "string_from_view_value",
+                )
+            }
+            TExpr::StringFromUtf8(value, sum) => {
+                let value = self.expr(env, loops, value)?;
+                let value =
+                    self.descriptor_ptr(value, self.view_type().into(), "string_from_utf8")?;
+                let string = self
+                    .string_out_call(
+                        self.string_from_view_import(true),
+                        vec![value.into()],
+                        "string_from_utf8_value",
+                    )?
+                    .into_struct_value();
+                let valid = self
+                    .builder
+                    .build_is_not_null(
+                        self.builder
+                            .build_extract_value(string, 0, "utf8_ptr")
+                            .map_err(|error| error.to_string())?
+                            .into_pointer_value(),
+                        "utf8_valid",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let nil_tag = self.sum_member_tag(*sum, Ty::Nil)?;
+                let string_tag = self.sum_member_tag(*sum, Ty::String)?;
+                let zeroed = self.struct_ty(Ty::Sum(*sum))?.const_zero();
+                let nil = self
+                    .builder
+                    .build_insert_value(
+                        zeroed,
+                        self.context.i32_type().const_int(u64::from(nil_tag), false),
+                        0,
+                        "utf8_nil",
+                    )
+                    .map_err(|error| error.to_string())?
+                    .into_struct_value();
+                let tagged = self
+                    .builder
+                    .build_insert_value(
+                        zeroed,
+                        self.context
+                            .i32_type()
+                            .const_int(u64::from(string_tag), false),
+                        0,
+                        "utf8_string",
+                    )
+                    .map_err(|error| error.to_string())?
+                    .into_struct_value();
+                let valid_value = self
+                    .builder
+                    .build_insert_value(tagged, string, string_tag + 1, "utf8_payload")
+                    .map_err(|error| error.to_string())?
+                    .into_struct_value();
+                Ok(self
+                    .builder
+                    .build_select(valid, valid_value, nil, "utf8_result")
+                    .map_err(|error| error.to_string())?
+                    .into())
+            }
+            TExpr::ViewFromString(value, ty) => {
+                let value = self.expr(env, loops, value)?;
+                let value =
+                    self.descriptor_ptr(value, self.string_type().into(), "string_view_input")?;
+                Ok(self.view_out_call(
+                    self.string_view_import(*ty == Ty::ViewUnicode),
+                    vec![value.into()],
+                    "string_view_value",
+                )?)
+            }
+            TExpr::ViewLength(value, ty) => {
+                let value = self.expr(env, loops, value)?;
+                let value =
+                    self.descriptor_ptr(value, self.view_type().into(), "view_length_input")?;
+                let call = self.invoke(
+                    self.view_length_import(*ty == Ty::ViewUnicode),
+                    &[value.into()],
+                )?;
+                Ok(call
+                    .try_as_basic_value()
+                    .expect_basic("view length returns Int64"))
+            }
+            TExpr::ViewAt(value, index, view_ty, sum) => {
+                let value = self.expr(env, loops, value)?;
+                let index = self.expr(env, loops, index)?;
+                let value = self.descriptor_ptr(value, self.view_type().into(), "view_at_input")?;
+                let raw = self
+                    .invoke(
+                        self.view_at_import(*view_ty == Ty::ViewUnicode),
+                        &[value.into(), index.into()],
+                    )?
+                    .try_as_basic_value()
+                    .expect_basic("view lookup returns a signed sentinel")
+                    .into_int_value();
+                let nil = self.context.i64_type().const_int(u64::MAX, true);
+                let is_nil = self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, raw, nil, "view_at_nil")
+                    .map_err(|error| error.to_string())?;
+                let members = self.program.sums[sum.index()].clone();
+                let success = if *view_ty == Ty::ViewUnicode {
+                    Ty::Unicode
+                } else {
+                    Ty::Byte
+                };
+                let success_tag = self.sum_member_tag(*sum, success)?;
+                let nil_tag = self.sum_member_tag(*sum, Ty::Nil)?;
+                let zeroed = self.struct_ty(Ty::Sum(*sum))?.const_zero();
+                let nil_value = self
+                    .builder
+                    .build_insert_value(
+                        zeroed,
+                        self.context.i32_type().const_int(u64::from(nil_tag), false),
+                        0,
+                        "nil_tag",
+                    )
+                    .map_err(|error| error.to_string())?
+                    .into_struct_value();
+                let payload: BasicValueEnum<'ctx> = if *view_ty == Ty::ViewUnicode {
+                    self.builder
+                        .build_int_truncate(raw, self.context.i32_type(), "unicode_at")
+                        .map_err(|error| error.to_string())?
+                        .into()
+                } else {
+                    self.builder
+                        .build_int_truncate(raw, self.context.i8_type(), "byte_at")
+                        .map_err(|error| error.to_string())?
+                        .into()
+                };
+                let success_value = self
+                    .builder
+                    .build_insert_value(
+                        zeroed,
+                        self.context
+                            .i32_type()
+                            .const_int(u64::from(success_tag), false),
+                        0,
+                        "value_tag",
+                    )
+                    .map_err(|error| error.to_string())?
+                    .into_struct_value();
+                let success_value = self
+                    .builder
+                    .build_insert_value(success_value, payload, success_tag + 1, "value_payload")
+                    .map_err(|error| error.to_string())?;
+                let _ = members;
+                Ok(self
+                    .builder
+                    .build_select(
+                        is_nil,
+                        nil_value,
+                        success_value.into_struct_value(),
+                        "view_at",
+                    )
+                    .map_err(|error| error.to_string())?)
+            }
+            TExpr::MapContains {
+                receiver,
+                key,
+                key_ty,
+                value_ty,
+            } => {
+                let receiver = self.expr(env, loops, receiver)?;
+                let key = self.expr(env, loops, key)?;
+                let receiver = self.descriptor_ptr(
+                    receiver,
+                    self.collection_type().into(),
+                    "map_contains_map",
+                )?;
+                let key = if *key_ty == Ty::ViewByte {
+                    self.descriptor_ptr(key, self.view_type().into(), "map_contains_key")?
+                        .into()
+                } else {
+                    key.into()
+                };
+                if self.map_uses_raw_value(*value_ty) {
+                    return Ok(self
+                        .invoke(
+                            self.map_raw_contains_import(*key_ty)?,
+                            &[receiver.into(), key],
+                        )?
+                        .try_as_basic_value()
+                        .expect_basic("raw Map.contains returns Bool"));
+                }
+                Ok(self
+                    .invoke(
+                        self.map_contains_import(*key_ty, Ty::Int64)?,
+                        &[receiver.into(), key],
+                    )?
+                    .try_as_basic_value()
+                    .expect_basic("Map.contains returns Bool"))
+            }
+            TExpr::MapInsert {
+                receiver,
+                key,
+                value,
+                key_ty,
+                value_ty,
+                require_existing,
+            } => {
+                let key = self.expr(env, loops, key)?;
+                let value = self.expr(env, loops, value)?;
+                let key = if *key_ty == Ty::String {
+                    self.descriptor_ptr(key, self.string_type().into(), "map_insert_key")?
+                        .into()
+                } else {
+                    key.into()
+                };
+                let Some((ptr, _)) = self.place_ptr(env, receiver)? else {
+                    return Err(internal("Map.insert reached a place with no storage"));
+                };
+                if self.map_uses_raw_value(*value_ty) {
+                    let value_slot = self.entry_alloca(self.ty(*value_ty), "map_value")?;
+                    let old_slot = self.entry_alloca(self.ty(*value_ty), "map_old_value")?;
+                    self.builder
+                        .build_store(value_slot, value)
+                        .map_err(|error| error.to_string())?;
+                    let size = self.size_align(*value_ty).0;
+                    let inserted = self
+                        .invoke(
+                            self.map_raw_insert_import(*key_ty)?,
+                            &[
+                                ptr.into(),
+                                key,
+                                value_slot.into(),
+                                self.usize_ty().const_int(size, false).into(),
+                                old_slot.into(),
+                            ],
+                        )?
+                        .try_as_basic_value()
+                        .expect_basic("raw Map.insert returns Bool")
+                        .into_int_value();
+                    if *require_existing {
+                        let fresh = self
+                            .builder
+                            .build_int_compare(
+                                IntPredicate::NE,
+                                inserted,
+                                self.context.i8_type().const_zero(),
+                                "map_assignment_missing",
+                            )
+                            .map_err(|error| error.to_string())?;
+                        let fail = self
+                            .context
+                            .append_basic_block(self.current_function(), "map_assignment_fail");
+                        let continue_block = self
+                            .context
+                            .append_basic_block(self.current_function(), "map_assignment_done");
+                        self.builder
+                            .build_conditional_branch(fresh, fail, continue_block)
+                            .map_err(|error| error.to_string())?;
+                        self.builder.position_at_end(fail);
+                        self.invoke(self.collection_bounds_fail_import(), &[])?;
+                        self.builder
+                            .build_unreachable()
+                            .map_err(|error| error.to_string())?;
+                        self.builder.position_at_end(continue_block);
+                    }
+                    if is_move_only(self.program, *value_ty) {
+                        let replaced = self
+                            .builder
+                            .build_int_compare(
+                                IntPredicate::EQ,
+                                inserted,
+                                self.context.i8_type().const_zero(),
+                                "map_replaced",
+                            )
+                            .map_err(|error| error.to_string())?;
+                        let drop_block = self
+                            .context
+                            .append_basic_block(self.current_function(), "map_drop_replaced");
+                        let continue_block = self
+                            .context
+                            .append_basic_block(self.current_function(), "map_insert_done");
+                        self.builder
+                            .build_conditional_branch(replaced, drop_block, continue_block)
+                            .map_err(|error| error.to_string())?;
+                        self.builder.position_at_end(drop_block);
+                        let old = self
+                            .builder
+                            .build_load(self.ty(*value_ty), old_slot, "map_replaced_value")
+                            .map_err(|error| error.to_string())?;
+                        self.drop_value(*value_ty, old)?;
+                        self.builder
+                            .build_unconditional_branch(continue_block)
+                            .map_err(|error| error.to_string())?;
+                        self.builder.position_at_end(continue_block);
+                    }
+                    return Ok(inserted.into());
+                }
+                let inserted = self
+                    .invoke(
+                        self.map_insert_import(*key_ty, *value_ty)?,
+                        &[ptr.into(), key, value.into()],
+                    )?
+                    .try_as_basic_value()
+                    .expect_basic("Map.insert returns Bool")
+                    .into_int_value();
+                if *require_existing {
+                    let fresh = self
+                        .builder
+                        .build_int_compare(
+                            IntPredicate::NE,
+                            inserted,
+                            self.context.i8_type().const_zero(),
+                            "map_assignment_missing",
+                        )
+                        .map_err(|error| error.to_string())?;
+                    let fail = self
+                        .context
+                        .append_basic_block(self.current_function(), "map_assignment_fail");
+                    let continue_block = self
+                        .context
+                        .append_basic_block(self.current_function(), "map_assignment_done");
+                    self.builder
+                        .build_conditional_branch(fresh, fail, continue_block)
+                        .map_err(|error| error.to_string())?;
+                    self.builder.position_at_end(fail);
+                    self.invoke(self.collection_bounds_fail_import(), &[])?;
+                    self.builder
+                        .build_unreachable()
+                        .map_err(|error| error.to_string())?;
+                    self.builder.position_at_end(continue_block);
+                }
+                Ok(inserted.into())
+            }
+            TExpr::MapDelete {
+                receiver,
+                key,
+                key_ty,
+                value_ty,
+            } => {
+                let key = self.expr(env, loops, key)?;
+                let key = if *key_ty == Ty::ViewByte {
+                    self.descriptor_ptr(key, self.view_type().into(), "map_delete_key")?
+                        .into()
+                } else {
+                    key.into()
+                };
+                let Some((ptr, _)) = self.place_ptr(env, receiver)? else {
+                    return Err(internal("Map.delete reached a place with no storage"));
+                };
+                if self.map_uses_raw_value(*value_ty) {
+                    let old_slot = self.entry_alloca(self.ty(*value_ty), "map_deleted_value")?;
+                    let existed = self
+                        .invoke(
+                            self.map_raw_delete_import(*key_ty)?,
+                            &[
+                                ptr.into(),
+                                key,
+                                old_slot.into(),
+                                self.usize_ty()
+                                    .const_int(self.size_align(*value_ty).0, false)
+                                    .into(),
+                            ],
+                        )?
+                        .try_as_basic_value()
+                        .expect_basic("raw Map.delete returns Bool")
+                        .into_int_value();
+                    if is_move_only(self.program, *value_ty) {
+                        let found = self
+                            .builder
+                            .build_int_compare(
+                                IntPredicate::NE,
+                                existed,
+                                self.context.i8_type().const_zero(),
+                                "map_delete_found",
+                            )
+                            .map_err(|error| error.to_string())?;
+                        let drop_block = self
+                            .context
+                            .append_basic_block(self.current_function(), "map_drop_deleted");
+                        let continue_block = self
+                            .context
+                            .append_basic_block(self.current_function(), "map_delete_done");
+                        self.builder
+                            .build_conditional_branch(found, drop_block, continue_block)
+                            .map_err(|error| error.to_string())?;
+                        self.builder.position_at_end(drop_block);
+                        let old = self
+                            .builder
+                            .build_load(self.ty(*value_ty), old_slot, "map_deleted_value")
+                            .map_err(|error| error.to_string())?;
+                        self.drop_value(*value_ty, old)?;
+                        self.builder
+                            .build_unconditional_branch(continue_block)
+                            .map_err(|error| error.to_string())?;
+                        self.builder.position_at_end(continue_block);
+                    }
+                    return Ok(existed.into());
+                }
+                Ok(self
+                    .invoke(
+                        self.map_delete_import(*key_ty, Ty::Int64)?,
+                        &[ptr.into(), key],
+                    )?
+                    .try_as_basic_value()
+                    .expect_basic("Map.delete returns Bool"))
+            }
+            TExpr::MapIndex {
+                receiver,
+                key,
+                key_ty,
+                value_ty,
+            } => {
+                let receiver = self.expr(env, loops, receiver)?;
+                let key = self.expr(env, loops, key)?;
+                let receiver =
+                    self.descriptor_ptr(receiver, self.collection_type().into(), "map_index_map")?;
+                let key = if *key_ty == Ty::ViewByte {
+                    self.descriptor_ptr(key, self.view_type().into(), "map_index_key")?
+                        .into()
+                } else {
+                    key.into()
+                };
+                if self.map_uses_raw_value(*value_ty) {
+                    let out = self.entry_alloca(self.ty(*value_ty), "map_index_value")?;
+                    self.invoke(
+                        self.map_raw_read_import("index", *key_ty, true)?,
+                        &[
+                            receiver.into(),
+                            key,
+                            out.into(),
+                            self.usize_ty()
+                                .const_int(self.size_align(*value_ty).0, false)
+                                .into(),
+                        ],
+                    )?;
+                    return Ok(self
+                        .builder
+                        .build_load(self.ty(*value_ty), out, "map_index_value")
+                        .map_err(|error| error.to_string())?);
+                }
+                Ok(self
+                    .invoke(
+                        self.map_index_import(*key_ty, *value_ty)?,
+                        &[receiver.into(), key],
+                    )?
+                    .try_as_basic_value()
+                    .expect_basic("Map indexing returns its value"))
+            }
+            TExpr::MapTake {
+                receiver,
+                key,
+                key_ty,
+                value_ty,
+            } => {
+                let key = self.expr(env, loops, key)?;
+                let key = if *key_ty == Ty::ViewByte {
+                    self.descriptor_ptr(key, self.view_type().into(), "map_take_key")?
+                        .into()
+                } else {
+                    key.into()
+                };
+                let Some((ptr, _)) = self.place_ptr(env, receiver)? else {
+                    return Err(internal("Map.take reached a place with no storage"));
+                };
+                if self.map_uses_raw_value(*value_ty) {
+                    let out = self.entry_alloca(self.ty(*value_ty), "map_take_value")?;
+                    self.invoke(
+                        self.map_raw_read_import("take", *key_ty, false)?,
+                        &[
+                            ptr.into(),
+                            key,
+                            out.into(),
+                            self.usize_ty()
+                                .const_int(self.size_align(*value_ty).0, false)
+                                .into(),
+                        ],
+                    )?;
+                    return Ok(self
+                        .builder
+                        .build_load(self.ty(*value_ty), out, "map_take_value")
+                        .map_err(|error| error.to_string())?);
+                }
+                Ok(self
+                    .invoke(
+                        self.map_take_import(*key_ty, *value_ty)?,
+                        &[ptr.into(), key],
+                    )?
+                    .try_as_basic_value()
+                    .expect_basic("Map.take returns its value"))
+            }
+            TExpr::SetContains {
+                receiver,
+                value,
+                elem,
+            } => {
+                let receiver = self.expr(env, loops, receiver)?;
+                let value = self.expr(env, loops, value)?;
+                let receiver = self.descriptor_ptr(
+                    receiver,
+                    self.collection_type().into(),
+                    "set_contains_set",
+                )?;
+                let value = if *elem == Ty::String || *elem == Ty::ViewByte {
+                    self.descriptor_ptr(value, self.view_type().into(), "set_contains_value")?
+                        .into()
+                } else {
+                    value.into()
+                };
+                Ok(self
+                    .invoke(self.set_contains_import(*elem)?, &[receiver.into(), value])?
+                    .try_as_basic_value()
+                    .expect_basic("Set.contains returns Bool"))
+            }
+            TExpr::SetInsert {
+                receiver,
+                value,
+                elem,
+            } => {
+                let value = self.expr(env, loops, value)?;
+                let value = if *elem == Ty::String {
+                    self.descriptor_ptr(value, self.string_type().into(), "set_insert_value")?
+                        .into()
+                } else {
+                    value.into()
+                };
+                let Some((ptr, _)) = self.place_ptr(env, receiver)? else {
+                    return Err(internal("Set.insert reached a place with no storage"));
+                };
+                Ok(self
+                    .invoke(self.set_insert_import(*elem)?, &[ptr.into(), value])?
+                    .try_as_basic_value()
+                    .expect_basic("Set.insert returns Bool"))
+            }
+            TExpr::SetDelete {
+                receiver,
+                value,
+                elem,
+            } => {
+                let value = self.expr(env, loops, value)?;
+                let value = if *elem == Ty::String || *elem == Ty::ViewByte {
+                    self.descriptor_ptr(value, self.view_type().into(), "set_delete_value")?
+                        .into()
+                } else {
+                    value.into()
+                };
+                let Some((ptr, _)) = self.place_ptr(env, receiver)? else {
+                    return Err(internal("Set.delete reached a place with no storage"));
+                };
+                Ok(self
+                    .invoke(self.set_delete_import(*elem)?, &[ptr.into(), value])?
+                    .try_as_basic_value()
+                    .expect_basic("Set.delete returns Bool"))
+            }
+            TExpr::CollectionLiteral { ty, items } => {
+                let collection_id = match *ty {
+                    Ty::Array(id) | Ty::List(id) => id,
+                    _ => return Err(internal("only arrays and lists have collection literals")),
+                };
+                let elem = match &self.program.collections[collection_id.index()] {
+                    crate::semantics::types::CollectionDef::Array { elem, .. }
+                    | crate::semantics::types::CollectionDef::List { elem } => *elem,
+                    _ => return Err(internal("collection literal metadata is not a sequence")),
+                };
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.expr(env, loops, item)?);
+                }
+                let ptr = if values.is_empty() {
+                    self.context.ptr_type(AddressSpace::default()).const_null()
+                } else {
+                    let (element_size, element_align) = self.size_align(elem);
+                    let count = self.usize_ty().const_int(values.len() as u64, false);
+                    let size = self
+                        .builder
+                        .build_int_mul(
+                            count,
+                            self.usize_ty().const_int(element_size, false),
+                            "collection_size",
+                        )
+                        .map_err(|error| error.to_string())?;
+                    let ptr = self
+                        .invoke(
+                            self.alloc_import(),
+                            &[
+                                size.into(),
+                                self.usize_ty().const_int(element_align, false).into(),
+                            ],
+                        )?
+                        .try_as_basic_value()
+                        .expect_basic("collection allocation returns a pointer")
+                        .into_pointer_value();
+                    for (index, value) in values.iter().enumerate() {
+                        // Safety: `ptr` is the allocation returned above and
+                        // every index is within the exact number of elements.
+                        let slot = unsafe {
+                            self.builder.build_gep(
+                                self.ty(elem),
+                                ptr,
+                                &[self.context.i64_type().const_int(index as u64, false)],
+                                "collection_element",
+                            )
+                        }
+                        .map_err(|error| error.to_string())?;
+                        self.builder
+                            .build_store(slot, *value)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    ptr
+                };
+                let len = self
+                    .context
+                    .i64_type()
+                    .const_int(values.len() as u64, false);
+                let mut descriptor = self.ty(*ty).into_struct_type().const_zero();
+                descriptor = self
+                    .builder
+                    .build_insert_value(descriptor, ptr, 0, "collection_ptr")
+                    .map_err(|error| error.to_string())?
+                    .into_struct_value();
+                descriptor = self
+                    .builder
+                    .build_insert_value(descriptor, len, 1, "collection_len")
+                    .map_err(|error| error.to_string())?
+                    .into_struct_value();
+                descriptor = self
+                    .builder
+                    .build_insert_value(descriptor, len, 2, "collection_cap")
+                    .map_err(|error| error.to_string())?
+                    .into_struct_value();
+                Ok(descriptor.into())
+            }
+            TExpr::CollectionNew(ty) => {
+                let mut descriptor = self.ty(*ty).into_struct_type().const_zero();
+                descriptor = self
+                    .builder
+                    .build_insert_value(
+                        descriptor,
+                        self.context.ptr_type(AddressSpace::default()).const_null(),
+                        0,
+                        "collection_ptr",
+                    )
+                    .map_err(|error| error.to_string())?
+                    .into_struct_value();
+                Ok(descriptor.into())
+            }
+            TExpr::CollectionLength(value) => {
+                let value = self.expr(env, loops, value)?;
+                Ok(self
+                    .builder
+                    .build_extract_value(as_struct(value)?, 1, "collection_len")
+                    .map_err(|error| error.to_string())?)
+            }
+            TExpr::CollectionIsEmpty(value) => {
+                let value = self.expr(env, loops, value)?;
+                let length = self
+                    .builder
+                    .build_extract_value(as_struct(value)?, 1, "collection_len")
+                    .map_err(|error| error.to_string())?
+                    .into_int_value();
+                let empty = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        length,
+                        self.context.i64_type().const_zero(),
+                        "collection_empty",
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(self
+                    .builder
+                    .build_int_z_extend(empty, self.context.i8_type(), "collection_empty_byte")
+                    .map_err(|error| error.to_string())?
+                    .into())
+            }
+            TExpr::ViewSlice {
+                value,
+                start,
+                end,
+                view_ty,
+                sum,
+            } => {
+                let value = self.expr(env, loops, value)?;
+                let start = self.expr(env, loops, start)?;
+                let end = self.expr(env, loops, end)?;
+                let value =
+                    self.descriptor_ptr(value, self.view_type().into(), "view_slice_input")?;
+                let slice = self
+                    .view_out_call(
+                        self.view_slice_import(*view_ty == Ty::ViewUnicode),
+                        vec![value.into(), start.into(), end.into()],
+                        "view_slice_value",
+                    )?
+                    .into_struct_value();
+                let valid = self
+                    .builder
+                    .build_is_not_null(
+                        self.builder
+                            .build_extract_value(slice, 0, "slice_ptr")
+                            .map_err(|error| error.to_string())?
+                            .into_pointer_value(),
+                        "slice_valid",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let nil_tag = self.sum_member_tag(*sum, Ty::Nil)?;
+                let view_tag = self.sum_member_tag(*sum, *view_ty)?;
+                let zeroed = self.struct_ty(Ty::Sum(*sum))?.const_zero();
+                let nil = self
+                    .builder
+                    .build_insert_value(
+                        zeroed,
+                        self.context.i32_type().const_int(u64::from(nil_tag), false),
+                        0,
+                        "slice_nil",
+                    )
+                    .map_err(|error| error.to_string())?
+                    .into_struct_value();
+                let tagged = self
+                    .builder
+                    .build_insert_value(
+                        zeroed,
+                        self.context
+                            .i32_type()
+                            .const_int(u64::from(view_tag), false),
+                        0,
+                        "slice_view",
+                    )
+                    .map_err(|error| error.to_string())?
+                    .into_struct_value();
+                let view = self
+                    .builder
+                    .build_insert_value(tagged, slice, view_tag + 1, "slice_payload")
+                    .map_err(|error| error.to_string())?
+                    .into_struct_value();
+                Ok(self
+                    .builder
+                    .build_select(valid, view, nil, "slice_result")
+                    .map_err(|error| error.to_string())?
+                    .into())
+            }
+            TExpr::CollectionCapacity(value) => {
+                let value = self.expr(env, loops, value)?;
+                Ok(self
+                    .builder
+                    .build_extract_value(as_struct(value)?, 2, "collection_cap")
+                    .map_err(|error| error.to_string())?)
+            }
+            TExpr::CollectionView(value, _) => self.expr(env, loops, value),
+            TExpr::CollectionSlice {
+                value,
+                start,
+                end,
+                view_ty,
+                sum,
+                elem,
+            } => {
+                let value = self.expr(env, loops, value)?.into_struct_value();
+                let start = self.expr(env, loops, start)?.into_int_value();
+                let end = self.expr(env, loops, end)?.into_int_value();
+                let ptr = self
+                    .builder
+                    .build_extract_value(value, 0, "view_ptr")
+                    .map_err(|error| error.to_string())?
+                    .into_pointer_value();
+                let length = self
+                    .builder
+                    .build_extract_value(value, 1, "view_len")
+                    .map_err(|error| error.to_string())?
+                    .into_int_value();
+                let zero = self.context.i64_type().const_zero();
+                let start_nonnegative = self
+                    .builder
+                    .build_int_compare(IntPredicate::SGE, start, zero, "slice_start_nonnegative")
+                    .map_err(|error| error.to_string())?;
+                let end_nonnegative = self
+                    .builder
+                    .build_int_compare(IntPredicate::SGE, end, zero, "slice_end_nonnegative")
+                    .map_err(|error| error.to_string())?;
+                let ordered = self
+                    .builder
+                    .build_int_compare(IntPredicate::ULE, start, end, "slice_ordered")
+                    .map_err(|error| error.to_string())?;
+                let end_in_range = self
+                    .builder
+                    .build_int_compare(IntPredicate::ULE, end, length, "slice_end_in_range")
+                    .map_err(|error| error.to_string())?;
+                let valid = self
+                    .builder
+                    .build_and(start_nonnegative, end_nonnegative, "slice_nonnegative")
+                    .map_err(|error| error.to_string())?;
+                let valid = self
+                    .builder
+                    .build_and(valid, ordered, "slice_ordered_valid")
+                    .map_err(|error| error.to_string())?;
+                let valid = self
+                    .builder
+                    .build_and(valid, end_in_range, "slice_range_valid")
+                    .map_err(|error| error.to_string())?;
+                let function = self.current_function();
+                let valid_block = self.context.append_basic_block(function, "slice_valid");
+                let invalid_block = self.context.append_basic_block(function, "slice_invalid");
+                let join_block = self.context.append_basic_block(function, "slice_join");
+                self.builder
+                    .build_conditional_branch(valid, valid_block, invalid_block)
+                    .map_err(|error| error.to_string())?;
+
+                self.builder.position_at_end(invalid_block);
+                let nil_tag = self.sum_member_tag(*sum, Ty::Nil)?;
+                let zeroed = self.struct_ty(Ty::Sum(*sum))?.const_zero();
+                let nil = self
+                    .builder
+                    .build_insert_value(
+                        zeroed,
+                        self.context.i32_type().const_int(u64::from(nil_tag), false),
+                        0,
+                        "slice_nil_tag",
+                    )
+                    .map_err(|error| error.to_string())?
+                    .into_struct_value();
+                self.builder
+                    .build_unconditional_branch(join_block)
+                    .map_err(|error| error.to_string())?;
+                let invalid_end = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| internal("slice invalid block has no insertion block"))?;
+
+                self.builder.position_at_end(valid_block);
+                // Safety: the checker establishes the half-open range and the
+                // source descriptor owns aligned storage for `elem` values.
+                let sliced_ptr = unsafe {
+                    self.builder
+                        .build_gep(self.ty(*elem), ptr, &[start], "slice_ptr")
+                }
+                .map_err(|error| error.to_string())?;
+                let sliced_length = self
+                    .builder
+                    .build_int_sub(end, start, "slice_len")
+                    .map_err(|error| error.to_string())?;
+                let view_zero = self.ty(*view_ty).into_struct_type().const_zero();
+                let view = self
+                    .builder
+                    .build_insert_value(view_zero, sliced_ptr, 0, "slice_view_ptr")
+                    .map_err(|error| error.to_string())?
+                    .into_struct_value();
+                let view = self
+                    .builder
+                    .build_insert_value(view, sliced_length, 1, "slice_view_len")
+                    .map_err(|error| error.to_string())?
+                    .into_struct_value();
+                let view_tag = self.sum_member_tag(*sum, *view_ty)?;
+                let tagged = self
+                    .builder
+                    .build_insert_value(
+                        zeroed,
+                        self.context
+                            .i32_type()
+                            .const_int(u64::from(view_tag), false),
+                        0,
+                        "slice_view_tag",
+                    )
+                    .map_err(|error| error.to_string())?
+                    .into_struct_value();
+                let tagged = self
+                    .builder
+                    .build_insert_value(tagged, view, view_tag + 1, "slice_view_payload")
+                    .map_err(|error| error.to_string())?
+                    .into_struct_value();
+                self.builder
+                    .build_unconditional_branch(join_block)
+                    .map_err(|error| error.to_string())?;
+                let valid_end = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| internal("slice valid block has no insertion block"))?;
+
+                self.builder.position_at_end(join_block);
+                let phi = self
+                    .builder
+                    .build_phi(self.struct_ty(Ty::Sum(*sum))?, "slice_result")
+                    .map_err(|error| error.to_string())?;
+                phi.add_incoming(&[(&nil, invalid_end), (&tagged, valid_end)]);
+                Ok(phi.as_basic_value())
+            }
+            TExpr::CollectionIndex {
+                collection,
+                index,
+                collection_ty,
+                elem,
+            } => {
+                let collection = self.expr(env, loops, collection)?.into_struct_value();
+                let index = self.expr(env, loops, index)?.into_int_value();
+                let ptr = self
+                    .builder
+                    .build_extract_value(collection, 0, "collection_ptr")
+                    .map_err(|error| error.to_string())?
+                    .into_pointer_value();
+                let len = self
+                    .builder
+                    .build_extract_value(collection, 1, "collection_len")
+                    .map_err(|error| error.to_string())?
+                    .into_int_value();
+                let nonnegative = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::SGE,
+                        index,
+                        self.context.i64_type().const_zero(),
+                        "index_nonnegative",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let in_range = self
+                    .builder
+                    .build_int_compare(IntPredicate::ULT, index, len, "index_in_range")
+                    .map_err(|error| error.to_string())?;
+                let valid = self
+                    .builder
+                    .build_and(nonnegative, in_range, "index_valid")
+                    .map_err(|error| error.to_string())?;
+                let function = self.current_function();
+                let valid_block = self.context.append_basic_block(function, "index_valid");
+                let invalid_block = self.context.append_basic_block(function, "index_invalid");
+                self.builder
+                    .build_conditional_branch(valid, valid_block, invalid_block)
+                    .map_err(|error| error.to_string())?;
+                self.builder.position_at_end(invalid_block);
+                self.invoke(self.collection_bounds_fail_import(), &[])?;
+                self.builder
+                    .build_unreachable()
+                    .map_err(|error| error.to_string())?;
+                self.builder.position_at_end(valid_block);
+                let _ = collection_ty;
+                // Safety: the checker enforces the range predicate above and
+                // the descriptor points at storage for this element type.
+                let element_ptr = unsafe {
+                    self.builder
+                        .build_gep(self.ty(*elem), ptr, &[index], "indexed_element")
+                }
+                .map_err(|error| error.to_string())?;
+                self.builder
+                    .build_load(self.ty(*elem), element_ptr, "indexed_value")
+                    .map_err(|error| error.to_string())
+            }
+            TExpr::ListPop { receiver, elem } => {
+                let Some((ptr, _)) = self.place_ptr(env, receiver)? else {
+                    return Err(internal("List.pop reached a place with no storage"));
+                };
+                if is_scalar_collection_element(*elem) {
+                    Ok(self
+                        .invoke(self.list_pop_import(*elem)?, &[ptr.into()])?
+                        .try_as_basic_value()
+                        .expect_basic("List.pop returns an element"))
+                } else {
+                    let slot = self.entry_alloca(self.ty(*elem), "list_pop_value")?;
+                    let (size, _) = self.size_align(*elem);
+                    self.invoke(
+                        self.list_raw_import("pop"),
+                        &[
+                            ptr.into(),
+                            slot.into(),
+                            self.usize_ty().const_int(size, false).into(),
+                        ],
+                    )?;
+                    self.builder
+                        .build_load(self.ty(*elem), slot, "list_pop_value")
+                        .map_err(|error| error.to_string())
+                }
+            }
+            TExpr::ListRemove {
+                receiver,
+                index,
+                elem,
+            } => {
+                let index = self.expr(env, loops, index)?;
+                let Some((ptr, _)) = self.place_ptr(env, receiver)? else {
+                    return Err(internal("List.remove reached a place with no storage"));
+                };
+                if is_scalar_collection_element(*elem) {
+                    Ok(self
+                        .invoke(self.list_remove_import(*elem)?, &[ptr.into(), index.into()])?
+                        .try_as_basic_value()
+                        .expect_basic("List.remove returns an element"))
+                } else {
+                    let slot = self.entry_alloca(self.ty(*elem), "list_remove_value")?;
+                    let (size, _) = self.size_align(*elem);
+                    self.invoke(
+                        self.list_raw_import("remove"),
+                        &[
+                            ptr.into(),
+                            index.into(),
+                            slot.into(),
+                            self.usize_ty().const_int(size, false).into(),
+                        ],
+                    )?;
+                    self.builder
+                        .build_load(self.ty(*elem), slot, "list_remove_value")
+                        .map_err(|error| error.to_string())
+                }
+            }
+            TExpr::Cast(value, Ty::Float64) => {
                 let value = self.expr(env, loops, value)?.into_int_value();
                 Ok(self
                     .builder
@@ -1981,6 +5902,171 @@ impl<'ctx> Codegen<'ctx, '_> {
                     .map_err(|error| error.to_string())?;
                 Ok(injected.into_struct_value().into())
             }
+            TExpr::LiftSum { value, from, to } => {
+                let value = self.expr(env, loops, value)?;
+                let source = as_struct(value)?;
+                let source_tag = self
+                    .builder
+                    .build_extract_value(source, 0, "source_tag")
+                    .map_err(|error| error.to_string())?
+                    .into_int_value();
+                let source_members = self.program.sums[from.index()].clone();
+                let function = self.current_function();
+                let done = self.context.append_basic_block(function, "lift_done");
+                let unknown = self.context.append_basic_block(function, "lift_unknown");
+                let cases: Vec<_> = source_members
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| {
+                        (
+                            self.context.i32_type().const_int(index as u64, false),
+                            self.context.append_basic_block(function, "lift_member"),
+                        )
+                    })
+                    .collect();
+                self.builder
+                    .build_switch(source_tag, unknown, &cases)
+                    .map_err(|error| error.to_string())?;
+                self.builder.position_at_end(unknown);
+                self.exhausted()?;
+                let target_ty = self.struct_ty(Ty::Sum(*to))?;
+                let zeroed = target_ty.const_zero();
+                let mut incoming = Vec::with_capacity(source_members.len());
+                for (member, (_, block)) in source_members.iter().zip(cases) {
+                    self.builder.position_at_end(block);
+                    let target_tag = self.sum_member_tag(*to, *member)?;
+                    let tagged = self
+                        .builder
+                        .build_insert_value(
+                            zeroed,
+                            self.context
+                                .i32_type()
+                                .const_int(u64::from(target_tag), false),
+                            0,
+                            "lift_tag",
+                        )
+                        .map_err(|error| error.to_string())?
+                        .into_struct_value();
+                    let payload = if *member == Ty::Nil {
+                        self.context.i8_type().const_zero().into()
+                    } else {
+                        let source_tag = self.sum_member_tag(*from, *member)?;
+                        self.builder
+                            .build_extract_value(source, source_tag + 1, "lift_payload")
+                            .map_err(|error| error.to_string())?
+                    };
+                    let lifted = self
+                        .builder
+                        .build_insert_value(tagged, payload, target_tag + 1, "lift_payload")
+                        .map_err(|error| error.to_string())?
+                        .into_struct_value();
+                    let current = self
+                        .builder
+                        .get_insert_block()
+                        .ok_or_else(|| internal("sum lift arm has no block"))?;
+                    self.builder
+                        .build_unconditional_branch(done)
+                        .map_err(|error| error.to_string())?;
+                    incoming.push((lifted, current));
+                }
+                self.builder.position_at_end(done);
+                let phi = self
+                    .builder
+                    .build_phi(target_ty, "lifted_sum")
+                    .map_err(|error| error.to_string())?;
+                let incoming: Vec<(&dyn BasicValue<'ctx>, BasicBlock<'ctx>)> = incoming
+                    .iter()
+                    .map(|(value, block)| (value as &dyn BasicValue<'ctx>, *block))
+                    .collect();
+                phi.add_incoming(&incoming);
+                Ok(phi.as_basic_value())
+            }
+            TExpr::Not(value) => {
+                let value = self.expr(env, loops, value)?.into_int_value();
+                let result = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        value,
+                        self.context.i8_type().const_zero(),
+                        "not",
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(self
+                    .builder
+                    .build_int_z_extend(result, self.context.i8_type(), "bool")
+                    .map_err(|error| error.to_string())?
+                    .into())
+            }
+            TExpr::Logical(left, op, right) => {
+                let left = self.expr(env, loops, left)?.into_int_value();
+                let function = self.current_function();
+                let right_block = self.context.append_basic_block(function, "logical_right");
+                let short_block = self.context.append_basic_block(function, "logical_short");
+                let merge = self.context.append_basic_block(function, "logical_merge");
+                let left_true = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::NE,
+                        left,
+                        self.context.i8_type().const_zero(),
+                        "logical_test",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let (when_true, when_false, short_value) = match op {
+                    LogicalOp::And => (
+                        right_block,
+                        short_block,
+                        self.context.i8_type().const_zero(),
+                    ),
+                    LogicalOp::Or => (
+                        short_block,
+                        right_block,
+                        self.context.i8_type().const_int(1, false),
+                    ),
+                };
+                self.builder
+                    .build_conditional_branch(left_true, when_true, when_false)
+                    .map_err(|error| error.to_string())?;
+
+                self.builder.position_at_end(short_block);
+                self.builder
+                    .build_unconditional_branch(merge)
+                    .map_err(|error| error.to_string())?;
+                let short_end = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| internal("logical short-circuit block has no end"))?;
+
+                self.builder.position_at_end(right_block);
+                let right = self.expr(env, loops, right)?.into_int_value();
+                self.builder
+                    .build_unconditional_branch(merge)
+                    .map_err(|error| error.to_string())?;
+                let right_end = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| internal("logical right-hand block has no end"))?;
+
+                self.builder.position_at_end(merge);
+                let phi = self
+                    .builder
+                    .build_phi(self.context.i8_type(), "logical_value")
+                    .map_err(|error| error.to_string())?;
+                phi.add_incoming(&[(&short_value, short_end), (&right, right_end)]);
+                Ok(phi.as_basic_value())
+            }
+            TExpr::Truthiness(value, ty) => {
+                let value = self.expr(env, loops, value)?;
+                Ok(self.truthiness_value(*ty, value)?.into())
+            }
+            TExpr::ReturnOnError {
+                value,
+                sum,
+                success,
+                result,
+                cleanup,
+            } => self.lower_return_on_error(env, loops, value, *sum, *success, *result, cleanup),
             TExpr::Arith(left, op, right, ty) => {
                 let ty = *ty;
                 let left = self.expr(env, loops, left)?;
@@ -1997,6 +6083,7 @@ impl<'ctx> Codegen<'ctx, '_> {
                         ArithOp::Div => builder.build_float_div(left, right, "div"),
                     }
                     .map_err(|e| e.to_string())?;
+                    self.validate_float(value, "arithmetic_nan")?;
                     return Ok(value.into());
                 }
                 if matches!(ty, Ty::Bool | Ty::Nil | Ty::User(_) | Ty::Sum(_)) {
@@ -2032,7 +6119,50 @@ impl<'ctx> Codegen<'ctx, '_> {
                         "checker allowed an ordered non-numeric comparison",
                     ));
                 }
-                let comparison = if matches!(operand_ty, Ty::User(_) | Ty::Sum(_)) {
+                let comparison = if matches!(operand_ty, Ty::String) {
+                    let left =
+                        self.descriptor_ptr(left, self.string_type().into(), "equal_left")?;
+                    let right =
+                        self.descriptor_ptr(right, self.string_type().into(), "equal_right")?;
+                    let call =
+                        self.invoke(self.string_equal_import(), &[left.into(), right.into()])?;
+                    let equal = call
+                        .try_as_basic_value()
+                        .expect_basic("string equality returns a byte")
+                        .into_int_value();
+                    match op {
+                        CmpOp::Eq => equal,
+                        CmpOp::NotEq => builder
+                            .build_xor(equal, self.context.i8_type().const_int(1, false), "ne")
+                            .map_err(|error| error.to_string())?,
+                        _ => return Err(internal("checker allowed ordered string comparison")),
+                    }
+                } else if matches!(operand_ty, Ty::ViewByte | Ty::ViewUnicode) {
+                    let left = self.descriptor_ptr(left, self.view_type().into(), "equal_left")?;
+                    let right =
+                        self.descriptor_ptr(right, self.view_type().into(), "equal_right")?;
+                    let equal = self
+                        .invoke(self.view_equal_import(), &[left.into(), right.into()])?
+                        .try_as_basic_value()
+                        .expect_basic("view equality returns a byte")
+                        .into_int_value();
+                    match op {
+                        CmpOp::Eq => equal,
+                        CmpOp::NotEq => builder
+                            .build_xor(equal, self.context.i8_type().const_int(1, false), "ne")
+                            .map_err(|error| error.to_string())?,
+                        _ => return Err(internal("checker allowed ordered view comparison")),
+                    }
+                } else if matches!(operand_ty, Ty::Array(_) | Ty::List(_) | Ty::View(_)) {
+                    let equal = self.equal(operand_ty, left, right)?;
+                    match op {
+                        CmpOp::Eq => equal,
+                        CmpOp::NotEq => builder
+                            .build_not(equal, "ne")
+                            .map_err(|error| error.to_string())?,
+                        _ => return Err(internal("checker allowed ordered collection comparison")),
+                    }
+                } else if matches!(operand_ty, Ty::User(_) | Ty::Sum(_)) {
                     // Recursive, type-directed equality; `!=` is its negation.
                     let equal = self.equal(operand_ty, left, right)?;
                     match op {
@@ -2042,7 +6172,7 @@ impl<'ctx> Codegen<'ctx, '_> {
                             .map_err(|error| error.to_string())?,
                     }
                 } else if is_float(operand_ty) {
-                    // `Float32` reuses the `Dec64` rule: every predicate but
+                    // `Float32` reuses the `Float64` rule: every predicate but
                     // `!=` is ordered, so a NaN operand makes it false.
                     let predicate = match op {
                         CmpOp::Eq => FloatPredicate::OEQ,
@@ -2090,21 +6220,50 @@ impl<'ctx> Codegen<'ctx, '_> {
             }
             TExpr::Call(name, args) => {
                 let call = self.call(env, loops, name, args)?;
-                Ok(call
+                let value = call
                     .try_as_basic_value()
-                    .expect_basic("a checked call expression always returns a value"))
+                    .expect_basic("a checked call expression always returns a value");
+                let result_ty = self
+                    .program
+                    .externs
+                    .get(name)
+                    .and_then(|function| function.result)
+                    .or_else(|| {
+                        self.program
+                            .funcs
+                            .get(name)
+                            .and_then(|function| function.result)
+                    });
+                if matches!(result_ty, Some(Ty::Float32 | Ty::Float64)) {
+                    self.validate_float(value.into_float_value(), "bridge_float_result_nan")?;
+                }
+                Ok(value)
             }
             TExpr::MethodCall(call) => {
-                let call = self.method_call(env, loops, call)?;
-                Ok(call
+                let method_id = call.method;
+                let call_value = self.method_call(env, loops, call)?;
+                let value = call_value
                     .try_as_basic_value()
-                    .expect_basic("a checked method call expression always returns a value"))
+                    .expect_basic("a checked method call expression always returns a value");
+                if matches!(
+                    self.program.methods[method_id.index()].result,
+                    Some(Ty::Float32 | Ty::Float64)
+                ) {
+                    self.validate_float(value.into_float_value(), "method_float_result_nan")?;
+                }
+                Ok(value)
             }
             TExpr::If(form) => self.value_if(env, loops, form),
             TExpr::Print(value, ty) => {
                 let value = self.expr(env, loops, value)?;
                 let function = self.print_import(*ty)?;
-                self.invoke(function, &[value.into()])?;
+                if *ty == Ty::String {
+                    let value =
+                        self.descriptor_ptr(value, self.string_type().into(), "print_string")?;
+                    self.invoke(function, &[value.into()])?;
+                } else {
+                    self.invoke(function, &[value.into()])?;
+                }
                 Ok(value)
             }
             // Specification 016 section 4.2 and 8.2: the operand evaluates
@@ -2145,6 +6304,162 @@ impl<'ctx> Codegen<'ctx, '_> {
         }
     }
 
+    fn drop_sequence_elements(
+        &self,
+        ptr: PointerValue<'ctx>,
+        len: IntValue<'ctx>,
+        elem: Ty,
+    ) -> Result<(), String> {
+        let function = self.current_function();
+        let loop_block = self
+            .context
+            .append_basic_block(function, "list_clear_drop_loop");
+        let done = self
+            .context
+            .append_basic_block(function, "list_clear_drop_done");
+        let entry = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| internal("list clear has no insertion block"))?;
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .map_err(|error| error.to_string())?;
+        self.builder.position_at_end(loop_block);
+        let index = self
+            .builder
+            .build_phi(self.context.i64_type(), "list_clear_drop_index")
+            .map_err(|error| error.to_string())?;
+        let zero = self.context.i64_type().const_zero();
+        index.add_incoming(&[(&zero, entry)]);
+        let current = index.as_basic_value().into_int_value();
+        let more = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, current, len, "list_clear_drop_more")
+            .map_err(|error| error.to_string())?;
+        let body = self
+            .context
+            .append_basic_block(function, "list_clear_drop_item");
+        self.builder
+            .build_conditional_branch(more, body, done)
+            .map_err(|error| error.to_string())?;
+        self.builder.position_at_end(body);
+        // Safety: `current < len` and the descriptor points at initialized
+        // storage for one value of the checked element type.
+        let item_ptr = unsafe {
+            self.builder
+                .build_gep(self.ty(elem), ptr, &[current], "list_clear_drop_ptr")
+        }
+        .map_err(|error| error.to_string())?;
+        let item = self
+            .builder
+            .build_load(self.ty(elem), item_ptr, "list_clear_drop_value")
+            .map_err(|error| error.to_string())?;
+        self.drop_value(elem, item)?;
+        let next = self
+            .builder
+            .build_int_add(
+                current,
+                self.context.i64_type().const_int(1, false),
+                "list_clear_drop_next",
+            )
+            .map_err(|error| error.to_string())?;
+        let body_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| internal("list clear drop body has no block"))?;
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .map_err(|error| error.to_string())?;
+        index.add_incoming(&[(&next, body_end)]);
+        self.builder.position_at_end(done);
+        Ok(())
+    }
+
+    /// Drops every opaque value still held by a raw map. The runtime stores
+    /// only bytes, so typed destruction must happen before the runtime erases
+    /// the entries or releases the map allocation.
+    fn drop_map_values(
+        &self,
+        key_ty: Ty,
+        value_ty: Ty,
+        descriptor: StructValue<'ctx>,
+    ) -> Result<(), String> {
+        if !is_move_only(self.program, value_ty) {
+            return Ok(());
+        }
+        let len = self
+            .builder
+            .build_extract_value(descriptor, 1, "map_drop_len")
+            .map_err(|error| error.to_string())?
+            .into_int_value();
+        let function = self.current_function();
+        let loop_block = self.context.append_basic_block(function, "map_drop_loop");
+        let done = self.context.append_basic_block(function, "map_drop_done");
+        let body = self.context.append_basic_block(function, "map_drop_item");
+        let entry = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| internal("map drop has no insertion block"))?;
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .map_err(|error| error.to_string())?;
+        self.builder.position_at_end(loop_block);
+        let index = self
+            .builder
+            .build_phi(self.context.i64_type(), "map_drop_index")
+            .map_err(|error| error.to_string())?;
+        let zero = self.context.i64_type().const_zero();
+        index.add_incoming(&[(&zero, entry)]);
+        let current = index.as_basic_value().into_int_value();
+        let more = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, current, len, "map_drop_more")
+            .map_err(|error| error.to_string())?;
+        self.builder
+            .build_conditional_branch(more, body, done)
+            .map_err(|error| error.to_string())?;
+        self.builder.position_at_end(body);
+        let out = self.entry_alloca(self.ty(value_ty), "map_drop_value")?;
+        let map_slot = self.entry_alloca(self.collection_type().into(), "map_drop_map")?;
+        self.builder
+            .build_store(map_slot, descriptor)
+            .map_err(|error| error.to_string())?;
+        self.invoke(
+            self.map_raw_read_import("value_at", key_ty, false)?,
+            &[
+                map_slot.into(),
+                current.into(),
+                out.into(),
+                self.usize_ty()
+                    .const_int(self.size_align(value_ty).0, false)
+                    .into(),
+            ],
+        )?;
+        let item = self
+            .builder
+            .build_load(self.ty(value_ty), out, "map_drop_item_value")
+            .map_err(|error| error.to_string())?;
+        self.drop_value(value_ty, item)?;
+        let next = self
+            .builder
+            .build_int_add(
+                current,
+                self.context.i64_type().const_int(1, false),
+                "map_drop_next",
+            )
+            .map_err(|error| error.to_string())?;
+        let body_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| internal("map drop body has no block"))?;
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .map_err(|error| error.to_string())?;
+        index.add_incoming(&[(&next, body_end)]);
+        self.builder.position_at_end(done);
+        Ok(())
+    }
+
     /// Recursively destroys one owned value of `ty` (Specification 016
     /// section 8.1). Only ever called where the checked cleanup plan already
     /// decided `ty` is move-only -- a copyable value is never dropped -- so
@@ -2153,6 +6468,14 @@ impl<'ctx> Codegen<'ctx, '_> {
     /// re-deriving that fact from scratch at each level.
     fn drop_value(&self, ty: Ty, value: BasicValueEnum<'ctx>) -> Result<(), String> {
         match ty {
+            Ty::String => {
+                let slot = self.entry_alloca(self.string_type().into(), "string_drop_value")?;
+                self.builder
+                    .build_store(slot, value)
+                    .map_err(|error| error.to_string())?;
+                self.invoke(self.string_drop_import(), &[slot.into()])?;
+                Ok(())
+            }
             Ty::Box(id) => {
                 let pointee = self.box_pointee(id);
                 let ptr = value.into_pointer_value();
@@ -2187,6 +6510,157 @@ impl<'ctx> Codegen<'ctx, '_> {
             Ty::Sum(id) => {
                 let members = self.program.sums[id.index()].clone();
                 self.drop_sum(&members, value)
+            }
+            Ty::Map(id) => {
+                let descriptor = as_struct(value)?;
+                let (key_ty, value_ty) = match &self.program.collections[id.index()] {
+                    crate::semantics::types::CollectionDef::Map { key, value } => (*key, *value),
+                    _ => return Err(internal("map drop has non-map metadata")),
+                };
+                if self.map_uses_raw_value(value_ty) {
+                    self.drop_map_values(key_ty, value_ty, descriptor)?;
+                    let map_slot =
+                        self.entry_alloca(self.collection_type().into(), "map_drop_map")?;
+                    self.builder
+                        .build_store(map_slot, descriptor)
+                        .map_err(|error| error.to_string())?;
+                    self.invoke(self.map_raw_drop_import(key_ty)?, &[map_slot.into()])?;
+                } else {
+                    let slot = self.entry_alloca(self.collection_type().into(), "map_drop_map")?;
+                    self.builder
+                        .build_store(slot, descriptor)
+                        .map_err(|error| error.to_string())?;
+                    self.invoke(self.map_drop_import(key_ty, value_ty)?, &[slot.into()])?;
+                }
+                Ok(())
+            }
+            Ty::Set(id) => {
+                let descriptor = as_struct(value)?;
+                let elem = match &self.program.collections[id.index()] {
+                    crate::semantics::types::CollectionDef::Set { elem } => *elem,
+                    _ => return Err(internal("set drop has non-set metadata")),
+                };
+                let slot = self.entry_alloca(self.collection_type().into(), "set_drop_set")?;
+                self.builder
+                    .build_store(slot, descriptor)
+                    .map_err(|error| error.to_string())?;
+                self.invoke(self.set_drop_import(elem)?, &[slot.into()])?;
+                Ok(())
+            }
+            Ty::Array(id) | Ty::List(id) => {
+                let descriptor = as_struct(value)?;
+                let ptr = self
+                    .builder
+                    .build_extract_value(descriptor, 0, "collection_ptr")
+                    .map_err(|error| error.to_string())?
+                    .into_pointer_value();
+                let len = self
+                    .builder
+                    .build_extract_value(descriptor, 1, "collection_len")
+                    .map_err(|error| error.to_string())?
+                    .into_int_value();
+                let cap = self
+                    .builder
+                    .build_extract_value(descriptor, 2, "collection_cap")
+                    .map_err(|error| error.to_string())?
+                    .into_int_value();
+                let elem = match &self.program.collections[id.index()] {
+                    crate::semantics::types::CollectionDef::Array { elem, .. }
+                    | crate::semantics::types::CollectionDef::List { elem } => *elem,
+                    _ => return Err(internal("sequence drop has non-sequence metadata")),
+                };
+                let function = self.current_function();
+                let loop_block = self
+                    .context
+                    .append_basic_block(function, "collection_drop_loop");
+                let done = self
+                    .context
+                    .append_basic_block(function, "collection_drop_done");
+                let entry_block = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| internal("collection drop has no insertion block"))?;
+                self.builder
+                    .build_unconditional_branch(loop_block)
+                    .map_err(|error| error.to_string())?;
+                self.builder.position_at_end(loop_block);
+                let index = self
+                    .builder
+                    .build_phi(self.context.i64_type(), "collection_drop_index")
+                    .map_err(|error| error.to_string())?;
+                let zero = self.context.i64_type().const_zero();
+                index.add_incoming(&[(&zero, entry_block)]);
+                let current = index.as_basic_value().into_int_value();
+                let more = self
+                    .builder
+                    .build_int_compare(IntPredicate::ULT, current, len, "collection_drop_more")
+                    .map_err(|error| error.to_string())?;
+                let body = self
+                    .context
+                    .append_basic_block(function, "collection_drop_item");
+                self.builder
+                    .build_conditional_branch(more, body, done)
+                    .map_err(|error| error.to_string())?;
+                self.builder.position_at_end(body);
+                if is_move_only(self.program, elem) {
+                    let item_ptr = unsafe {
+                        self.builder.build_gep(
+                            self.ty(elem),
+                            ptr,
+                            &[current],
+                            "collection_drop_item_ptr",
+                        )
+                    }
+                    .map_err(|error| error.to_string())?;
+                    let item = self
+                        .builder
+                        .build_load(self.ty(elem), item_ptr, "collection_drop_item")
+                        .map_err(|error| error.to_string())?;
+                    self.drop_value(elem, item)?;
+                }
+                let next = self
+                    .builder
+                    .build_int_add(
+                        current,
+                        self.context.i64_type().const_int(1, false),
+                        "collection_drop_next",
+                    )
+                    .map_err(|error| error.to_string())?;
+                self.builder
+                    .build_unconditional_branch(loop_block)
+                    .map_err(|error| error.to_string())?;
+                index.add_incoming(&[(&next, self.builder.get_insert_block().unwrap())]);
+                self.builder.position_at_end(done);
+                let elem_size = self.size_align(elem).0;
+                let size = self
+                    .builder
+                    .build_int_mul(
+                        cap,
+                        self.usize_ty().const_int(elem_size, false),
+                        "collection_drop_size",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let align = self.usize_ty().const_int(self.size_align(elem).1, false);
+                let nonnull = self
+                    .builder
+                    .build_is_not_null(ptr, "collection_drop_allocated")
+                    .map_err(|error| error.to_string())?;
+                let free = self
+                    .context
+                    .append_basic_block(function, "collection_drop_free");
+                let after_free = self
+                    .context
+                    .append_basic_block(function, "collection_drop_after_free");
+                self.builder
+                    .build_conditional_branch(nonnull, free, after_free)
+                    .map_err(|error| error.to_string())?;
+                self.builder.position_at_end(free);
+                self.call_raw_dealloc(ptr, size, align)?;
+                self.builder
+                    .build_unconditional_branch(after_free)
+                    .map_err(|error| error.to_string())?;
+                self.builder.position_at_end(after_free);
+                Ok(())
             }
             // A caller only ever reaches this function for a move-only type
             // (Specification 016 section 5.3 composes structurally, so a
@@ -2316,7 +6790,13 @@ impl<'ctx> Codegen<'ctx, '_> {
 /// `Types::is_move_only` itself relies on.
 fn is_move_only(program: &Program, ty: Ty) -> bool {
     match ty {
-        Ty::Box(_) => true,
+        Ty::Box(_) | Ty::String | Ty::List(_) | Ty::Map(_) | Ty::Set(_) => true,
+        Ty::Array(id) => match &program.collections[id.index()] {
+            crate::semantics::types::CollectionDef::Array { elem, .. } => {
+                is_move_only(program, *elem)
+            }
+            _ => false,
+        },
         Ty::User(id) => match &program.types[id.index()] {
             TypeDef::Represented { target, .. } => is_move_only(program, *target),
             TypeDef::Struct { fields, .. } | TypeDef::UnionMember { fields, .. } => {

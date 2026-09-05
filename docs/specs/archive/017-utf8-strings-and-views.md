@@ -1,6 +1,6 @@
 # RFC 017: UTF-8 Strings, Byte Views, and Unicode Views
 
-Status: Proposed
+Status: Closed
 
 Document kind: Language semantics (ISO/IEC-style specification)
 
@@ -10,9 +10,8 @@ This implementation-ready specification defines immutable owned UTF-8 strings, b
 scalar types, zero-copy borrowed views, inline sum results, concatenation,
 interpolation, and raw string literals.
 
-`LANGUAGE.md` remains authoritative. Until this specification is accepted,
-implemented, and incorporated there, the syntax and semantics below are not
-part of Snacc.
+This specification is implemented and incorporated into `LANGUAGE.md`, which
+remains the authoritative language contract.
 
 Section 16 fixes the implementation order and phase boundaries.
 
@@ -50,9 +49,9 @@ strings, or string-bearing Rust bridge signatures.
 ## 3. Dependencies and terminology
 
 This specification assumes the ownership and cleanup analysis established by
-[RFC 016](archive/016-box-indirection-and-recursive-data.md). `String` is a move-only
+[RFC 016](016-box-indirection-and-recursive-data.md). `String` is a move-only
 owned value, while views are non-owning borrows. It also assumes the inline sum
-types established by [Specification 018](archive/018-inline-sum-types.md), which must be
+types established by [Specification 018](018-inline-sum-types.md), which must be
 implemented before the fallible operations in this specification.
 The canonical `Float64` spelling used by concatenation and printing follows
 [Specification 020](020-literal-cleanup-and-numeric-radices.md).
@@ -816,7 +815,7 @@ and belongs with this specification's successor rather than with I/O.
 
 ## 21. References
 
-- [`LANGUAGE.md`](../../LANGUAGE.md)
-- [RFC 016: Box Indirection and Recursive Data Structures](archive/016-box-indirection-and-recursive-data.md)
-- [Specification 018: Inline Sum Types](archive/018-inline-sum-types.md)
+- [`LANGUAGE.md`](../../../LANGUAGE.md)
+- [RFC 016: Box Indirection and Recursive Data Structures](016-box-indirection-and-recursive-data.md)
+- [Specification 018: Inline Sum Types](018-inline-sum-types.md)
 - [Specification 020: Literal Cleanup and Numeric Radices](020-literal-cleanup-and-numeric-radices.md)

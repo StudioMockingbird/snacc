@@ -42,6 +42,7 @@ code generation; the influences are not compatibility targets.
 
 ## Implementation
 
+- Always edit source files with the bundled Edit/Write tools, never sed -i or shell redirection through Bash. A file-mutating Bash command can stall a background subagent for hours on an unanswered permission prompt; the dedicated file tools do not hit that gate.
 - Treat `snacc-workbench` as a temporary, internal debugging aid for compiler
   development, not as an external product. As long as it remains functional,
   skip workbench optimization and feature work unless it is strictly required
@@ -59,7 +60,6 @@ code generation; the influences are not compatibility targets.
   features.
 - Prefer LLVM 22 capabilities when they reduce compiler complexity or size.
 - Before implementing anything, ask in order:
-
   1. Does this need to exist? If not, skip it (YAGNI).
   2. Does the codebase already provide it? Reuse it.
   3. Does the standard library or native platform provide it? Use that.

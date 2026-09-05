@@ -1,4 +1,4 @@
-fun f(value: UInt8 | Nil): Int64 do
+fun f(value: Byte | Nil): Int64 do
     if value is Bool(b) then
         1
     elseif value is Nil then

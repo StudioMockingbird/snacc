@@ -14,7 +14,7 @@ type Shape is union
 end
 
 type CacheEntry is struct
-    value: UInt8 | Nil,
+    value: Byte | Nil,
 end
 
 fun classify(value: Shape | Nil): Int64 do
@@ -29,13 +29,13 @@ fun classify(value: Shape | Nil): Int64 do
     end
 end
 
-fun maybe_byte(found: Bool, byte: UInt8): UInt8 | Nil do
+fun maybe_byte(found: Bool, byte: Byte): Byte | Nil do
     if found then byte else nil end
 end
 
-let narrow: UInt8 | Nil = nil
-let same_members_different_order: Nil | UInt8 = narrow
-let grouped: (UInt8 | Bool) | Nil = nil
+let narrow: Byte | Nil = nil
+let same_members_different_order: Nil | Byte = narrow
+let grouped: (Byte | Bool) | Nil = nil
 
 let entry: CacheEntry = CacheEntry(value: nil)
 let filled: CacheEntry = CacheEntry(value: 7u8)

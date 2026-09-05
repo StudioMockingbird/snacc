@@ -4,7 +4,7 @@ fun ratio(numerator: Float32, denominator: Float32): Float32 do
     numerator / denominator
 end
 
-let byte: UInt8 = 255u8
+let byte: Byte = 255u8
 let word: UInt16 = 65535u16
 let wide: UInt64 = 18446744073709551615u64
 

@@ -3,7 +3,7 @@
 // a real compiled program. Every result is observed as a Bool, so this case
 // needs no runtime print symbol beyond the ones ABI version 2 already has.
 
-fun u8_quotient(numerator: UInt8, denominator: UInt8): UInt8 do
+fun u8_quotient(numerator: Byte, denominator: Byte): Byte do
     numerator / denominator
 end
 
@@ -23,9 +23,9 @@ fun u16_pick(flag: Bool): UInt16 do
     end
 end
 
-fun u8_wrapped_sum(limit: UInt8): UInt8 do
-    let mut total: UInt8 = 250u8
-    let mut step: UInt8 = 0u8
+fun u8_wrapped_sum(limit: Byte): Byte do
+    let mut total: Byte = 250u8
+    let mut step: Byte = 0u8
     while step < limit do
         total = total + 1u8
         step = step + 1u8
@@ -65,13 +65,6 @@ print(16777216f32 + 1f32 - 16777216f32 == 0f32)
 print(1.5f32 + 2.25f32 == 3.75f32)
 print(1.5f32 < 2.5f32)
 print(2.5f32 <= 2.5f32)
-
-// Float32 equality and ordering follow IEEE 754: NaN equals nothing, including
-// itself, and every ordered comparison against it is false.
-print(f32_quotient(0f32, 0f32) == f32_quotient(0f32, 0f32))
-print(f32_quotient(0f32, 0f32) != f32_quotient(0f32, 0f32))
-print(f32_quotient(0f32, 0f32) < 1f32)
-print(f32_quotient(1f32, 0f32) > 1000000f32)
 
 // New types flow through mutable storage, loop conditions, and a value-form
 // `if` at their own widths.

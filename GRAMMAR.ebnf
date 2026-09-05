@@ -4,18 +4,24 @@ top-level-declaration
                      = function-declaration
                      | rust-declaration
                      | type-declaration
-                     | method-declaration ;
+                     | method-declaration
+                     | static-declaration ;
 
-function-declaration = "fun", identifier, parameters, [ ":", type ], "do",
+function-declaration = "fun", identifier, [ generic-parameters ], parameters, [ ":", type ], "do",
                        block, "end" ;
 rust-declaration     = "extern", "rust", string-literal, "fun", identifier,
                        parameters, [ ":", type ] ;
 method-declaration   = "method", qualified-name, parameters, [ ":", type ],
                        "do", block, "end" ;
+static-declaration   = "static", associated-name, parameters, [ ":", type ],
+                       "do", block, "end" ;
+associated-name      = ( builtin-value-type, ".", identifier )
+                     | identifier, ".", identifier
+                     | identifier, ".", identifier, ".", identifier ;
 parameters           = "(", [ parameter, { ",", parameter }, [ "," ] ], ")" ;
 parameter            = identifier, ":", type ;
 
-type-declaration     = "type", identifier, "is", type-body ;
+type-declaration     = "type", identifier, [ generic-parameters ], "is", type-body ;
 type-body            = type
                      | struct-body
                      | union-body ;
@@ -32,20 +38,34 @@ reference-parameter-type
 sum-type             = primary-value-type, { "|", primary-value-type } ;
 primary-value-type   = builtin-value-type
                      | qualified-name
+                     | type-application
                      | parameterized-value-type
                      | "(", sum-type, ")" ;
+generic-parameters   = "<", identifier, { ",", identifier }, ">" ;
+type-arguments       = "<", type, { ",", type }, ">" ;
+type-application     = identifier, type-arguments ;
 parameterized-value-type
-                     = "Box", "<", sum-type, ">" ;
-unsigned-type        = "UInt8" | "UInt16" | "UInt32" | "UInt64" ;
-builtin-value-type   = "Int64" | "Dec64" | "Bool" | "Nil"
-                     | unsigned-type
+                     = "Box", "<", sum-type, ">"
+                     | "View", "<", sum-type, ">"
+                     | "Array", "<", sum-type, ",", integer-literal, ">"
+                     | "List", "<", sum-type, ">"
+                     | "Map", "<", sum-type, ",", sum-type, ">"
+                     | "Set", "<", sum-type, ">" ;
+unsigned-type        = "Byte" | "UInt16" | "UInt32" | "UInt64" ;
+builtin-value-type   = "Int64" | "Float64" | "Bool" | "Nil"
+                     | "String" | "Unicode" | unsigned-type
                      | "Float32" ;
 
 block                = { block-element } ;
 block-element        = variable-declaration
                      | assignment
+                     | indexed-assignment
                      | while-statement
+                     | for-statement
                      | break-statement
+                     | defer-statement
+                     | defer-on-error-statement
+                     | return-statement
                      | if-form
                      | expression ;
 
@@ -53,9 +73,16 @@ variable-declaration = "let", [ "mut" ], identifier, ":", type,
                        "=", expression ;
 place                = ( identifier | "self" ), { ".", identifier } ;
 assignment           = place, "=", expression ;
+indexed-assignment   = expression, "[", expression, "]", "=", expression ;
 
 while-statement      = "while", expression, "do", block, "end" ;
+for-statement        = "for", identifier, [ ",", identifier ], "in",
+                       expression, "do", block, "end" ;
 break-statement      = "break" ;
+return-statement     = "return", [ expression ] ;
+defer-statement      = "defer", postfix ;
+defer-on-error-statement
+                     = "defer_on_error", postfix ;
 if-form              = "if", condition, "then", block,
                        { "elseif", condition, "then", block },
                        [ "else", block ], "end" ;
@@ -64,13 +91,18 @@ type-test            = place, "is", member-path, [ "(", identifier, ")" ] ;
 member-path          = member-segment, { ".", member-segment } ;
 member-segment       = identifier | builtin-value-type ;
 
-expression           = comparison ;
-comparison           = additive, { comparison-operator, additive } ;
+expression           = logical-or ;
+logical-or           = logical-and, { "or", logical-and } ;
+logical-and          = comparison, { "and", comparison } ;
+comparison           = additive, [ comparison-operator, additive ] ;
 comparison-operator  = "==" | "!=" | "<" | "<=" | ">" | ">=" ;
 additive             = multiplicative, { ( "+" | "-" ), multiplicative } ;
-multiplicative       = postfix, { ( "*" | "/" ), postfix } ;
-postfix              = atom, { arguments | member-suffix } ;
+multiplicative       = unary, { ( "*" | "/" ), unary } ;
+unary                = "!", unary | "return_on_error", postfix | postfix ;
+postfix              = atom, { generic-call-suffix | arguments | member-suffix | index-suffix } ;
+generic-call-suffix  = type-arguments, arguments ;
 member-suffix        = ".", identifier, [ arguments ] ;
+index-suffix         = "[", expression, "]" ;
 arguments            = "(", [ argument, { ",", argument }, [ "," ] ], ")" ;
 argument             = [ identifier, ":" ], expression ;
 
@@ -79,31 +111,66 @@ atom                 = literal
                      | "self"
                      | builtin-value-type
                      | list-literal
+                     | map-constructor
+                     | set-constructor
                      | box-expression
                      | print-expression
                      | "(", expression, ")" ;
 box-expression       = "box", "(", expression, ")" ;
 print-expression     = "print", "(", expression, ")" ;
 list-literal         = "[", [ expression, { ",", expression }, [ "," ] ], "]" ;
-literal              = float32-literal | unsigned-literal | decimal-literal
-                     | integer-literal | boolean-literal | nil-literal
-                     | string-literal ;
+map-constructor      = "Map", "<", sum-type, ",", sum-type, ">", "(", ")" ;
+set-constructor      = "Set", "<", sum-type, ">", "(", ")" ;
+literal              = float32-literal | float64-literal | integer-literal
+                     | boolean-literal | nil-literal | string-literal
+                     | unicode-literal ;
 boolean-literal      = "true" | "false" ;
-nil-literal          = "nil" | "null" ;
+nil-literal          = "nil" ;
 
-float32-literal      = digit, { digit }, [ ".", digit, { digit } ], "f32" ;
-unsigned-literal     = digit, { digit }, unsigned-suffix ;
+integer-literal      = integer-magnitude, [ unsigned-suffix ] ;
+integer-magnitude    = decimal-digits
+                     | "0b", binary-digits
+                     | "0o", octal-digits
+                     | "0x", hexadecimal-digits ;
+
+float64-literal      = decimal-digits, ".", decimal-digits, [ exponent ]
+                     | decimal-digits, exponent ;
+float32-literal      = decimal-digits, [ ".", decimal-digits ],
+                       [ exponent ], "f32" ;
+exponent             = "e", [ "+" | "-" ], decimal-digits ;
+
 unsigned-suffix      = "u8" | "u16" | "u32" | "u64" ;
-decimal-literal      = digit, { digit }, ".", digit, { digit } ;
-integer-literal      = digit, { digit } ;
-string-literal       = '"', { string-character }, '"' ;
+decimal-digits       = decimal-digit, { [ "_" ], decimal-digit } ;
+binary-digits        = binary-digit, { [ "_" ], binary-digit } ;
+octal-digits         = octal-digit, { [ "_" ], octal-digit } ;
+hexadecimal-digits   = hexadecimal-digit,
+                       { [ "_" ], hexadecimal-digit } ;
+binary-digit         = "0" | "1" ;
+octal-digit          = "0" | "1" | "2" | "3"
+                     | "4" | "5" | "6" | "7" ;
+decimal-digit        = octal-digit | "8" | "9" ;
+hexadecimal-digit    = decimal-digit
+                     | "a" | "b" | "c" | "d" | "e" | "f"
+                     | "A" | "B" | "C" | "D" | "E" | "F" ;
+string-literal       = interpreted-string-literal | raw-string-literal ;
+interpreted-string-literal
+                     = '"', { string-character | interpolation }, '"' ;
+interpolation        = "{{", interpolation-expression, "}}" ;
+raw-string-literal  = 'r', { "#" }, '"', { raw-character }, '"', { "#" } ;
+unicode-literal      = "'", unicode-character, "'" ;
 identifier           = identifier-start, { identifier-continue } ;
 identifier-start     = ASCII-letter | "_" ;
-identifier-continue  = identifier-start | digit ;
-digit                = "0" | "1" | "2" | "3" | "4"
-                     | "5" | "6" | "7" | "8" | "9" ;
+identifier-continue  = identifier-start | decimal-digit ;
 
-(* ASCII-letter is A-Z or a-z. string-character is any character except '"'.
+(* ASCII-letter is A-Z or a-z. string-character is any character except '"'
+   or an unescaped line break; interpolation-expression is the balanced token
+   sequence accepted by expression. It is lexed once and parsed by the normal
+   expression grammar.
+   raw-character is any source scalar; the opening and closing raw-string
+   delimiters contain the same number of '#' characters. String escapes are
+   decoded by the lexer only in interpreted strings; raw strings preserve
+   their contents. unicode-character is one scalar
+   or a supported escaped scalar. 
    Whitespace, including line breaks, separates tokens but has no other
    grammatical meaning. A comment begins with // and ends immediately before
    the next line feed or at end of input. Keywords are reserved and cannot be
@@ -111,8 +178,15 @@ digit                = "0" | "1" | "2" | "3" | "4"
    semicolon token. Numeric tokens use maximal munch: a digit-led token
    immediately followed by an ASCII letter, digit, or underscore that does not
    complete one of the literal forms above is one invalid token, not a valid
-   number followed by an identifier; thus `1u8` and `1.0f32` are valid, while
-   `1u9`, `1u8x`, `1f64`, and `1.0u8` are lexical errors. A `builtin-value-type`
+   number followed by an identifier; thus `1u8`, `1.0f32`, `0x2A`, and `1e6`
+   are valid, while `1u9`, `1u8x`, `0X2A`, `1E6`, and `1.0u8` are lexical
+   errors. A radix prefix (`0b`/`0o`/`0x`) and the exponent marker `e` are
+   lowercase; hexadecimal digits may use either case. `_` may appear only
+   between two digits of one `decimal-digits`/`binary-digits`/`octal-digits`/
+   `hexadecimal-digits` run, never leading, trailing, doubled, or adjacent to a
+   prefix, decimal point, exponent marker or sign, or suffix; it is discarded
+   before the literal's value is computed and never changes its type, value,
+   or range. A `builtin-value-type`
    is an atom only as a call head, where it removes one represented-type layer
    (`Int64(id)`); a type name alone is never a value. The grammar admits a named
    type wherever a `type` appears, including a Rust bridge signature; that a
@@ -133,4 +207,9 @@ digit                = "0" | "1" | "2" | "3" | "4"
    are semantic rules, also diagnosed by the checker. A `member-path` in a
    `type-test` may mix `identifier` and `builtin-value-type` segments; that it
    names exactly one direct member of the tested union or inline sum is a
-   semantic rule as well. *)
+   semantic rule as well. A `return-statement`'s optional expression is bare
+   only when the next token closes the current block (`end`, `elseif`, or
+   `else`) or ends the program; otherwise the following tokens must begin one
+   expression. This makes bare and valued `return` unambiguous without a
+   semicolon or significant newline, and a bare `return` can never be
+   followed by another element of the same block. *)

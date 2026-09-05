@@ -324,8 +324,8 @@ fn bridge_type_mismatch_is_caught_before_linking_by_every_command() {
         let interop = package.join("src/interop.rs");
         let original = fs::read_to_string(&interop).unwrap();
         let mismatched = original.replace(
-            "pub extern \"C\" fn snacc_user_itoa_len(value: i64) -> i64",
-            "pub extern \"C\" fn snacc_user_itoa_len(value: f64) -> i64",
+            "pub fn snacc_user_itoa_len(value: i64) -> i64",
+            "pub fn snacc_user_itoa_len(value: f64) -> i64",
         );
         assert_ne!(
             original, mismatched,
@@ -406,30 +406,30 @@ fn host_missing_assertion_include_reports_a_diagnostic() {
 }
 
 #[test]
-fn bridge_item_without_no_mangle_fails_at_link_not_at_the_assertion() {
-    let workspace = tempfile::tempdir().expect("failed to create no-mangle workspace");
+fn bridge_direct_c_abi_item_is_rejected_in_favor_of_safe_rust() {
+    let workspace = tempfile::tempdir().expect("failed to create direct-c-abi workspace");
     let package = workspace.path().join("package");
     copy_fixture_to(&package);
     let interop = package.join("src/interop.rs");
     let original = fs::read_to_string(&interop).unwrap();
-    let without_no_mangle = original.replacen(
-        "#[unsafe(no_mangle)]\npub extern \"C\" fn snacc_user_itoa_len",
+    let direct_c_abi = original.replacen(
+        "pub fn snacc_user_itoa_len",
         "pub extern \"C\" fn snacc_user_itoa_len",
         1,
     );
-    assert_ne!(original, without_no_mangle);
-    fs::write(&interop, without_no_mangle).unwrap();
+    assert_ne!(original, direct_c_abi);
+    fs::write(&interop, direct_c_abi).unwrap();
 
     let target = tempfile::tempdir().expect("failed to create fixture target directory");
     let output = cargo_snacc_at(target.path(), &package, &["build", "--offline"]);
     assert!(
         !output.status.success(),
-        "build should still fail without #[unsafe(no_mangle)], but at link time:\n{}",
+        "build should reject a direct C ABI item:\n{}",
         combined(&output)
     );
     assert!(
-        !combined(&output).contains("mismatched types"),
-        "removing #[unsafe(no_mangle)] should not trip the type assertion:\n{}",
+        combined(&output).contains("mismatched types"),
+        "a direct C ABI item should fail the safe Rust assertion:\n{}",
         combined(&output)
     );
 }
@@ -442,8 +442,8 @@ fn bridge_result_type_mismatch_fails_before_linking() {
     let interop = package.join("src/interop.rs");
     let original = fs::read_to_string(&interop).unwrap();
     let mismatched = original.replace(
-        "pub extern \"C\" fn snacc_user_itoa_len(value: i64) -> i64",
-        "pub extern \"C\" fn snacc_user_itoa_len(value: i64) -> f64",
+        "pub fn snacc_user_itoa_len(value: i64) -> i64",
+        "pub fn snacc_user_itoa_len(value: i64) -> f64",
     );
     assert_ne!(original, mismatched);
     fs::write(&interop, mismatched).unwrap();
@@ -470,8 +470,8 @@ fn bridge_arity_mismatch_fails_before_linking() {
     let interop = package.join("src/interop.rs");
     let original = fs::read_to_string(&interop).unwrap();
     let mismatched = original.replace(
-        "pub extern \"C\" fn snacc_user_itoa_len(value: i64) -> i64",
-        "pub extern \"C\" fn snacc_user_itoa_len(value: i64, extra: i64) -> i64",
+        "pub fn snacc_user_itoa_len(value: i64) -> i64",
+        "pub fn snacc_user_itoa_len(value: i64, extra: i64) -> i64",
     );
     assert_ne!(original, mismatched);
     fs::write(&interop, mismatched).unwrap();
@@ -615,8 +615,7 @@ fn no_result_bridge_round_trips_through_a_real_run() {
     fs::write(
         package.join("src/interop.rs"),
         concat!(
-            "#[unsafe(no_mangle)]\n",
-            "pub extern \"C\" fn snacc_user_log(value: i64) {\n",
+            "pub fn snacc_user_log(value: i64) {\n",
             "    println!(\"logged {value}\");\n",
             "}\n",
         ),
@@ -736,7 +735,7 @@ fn each_bridge_type_round_trips_through_a_parameter_and_a_result() {
         package.join("src/main.nrs"),
         concat!(
             "extern rust \"snacc_user_echo_int\" fun echo_int(value: Int64): Int64\n",
-            "extern rust \"snacc_user_echo_dec\" fun echo_dec(value: Dec64): Dec64\n",
+            "extern rust \"snacc_user_echo_dec\" fun echo_dec(value: Float64): Float64\n",
             "extern rust \"snacc_user_echo_bool\" fun echo_bool(value: Bool): Bool\n",
             "print(echo_int(1))\n",
             "print(echo_dec(1.5))\n",
@@ -747,12 +746,9 @@ fn each_bridge_type_round_trips_through_a_parameter_and_a_result() {
     fs::write(
         package.join("src/interop.rs"),
         concat!(
-            "#[unsafe(no_mangle)]\n",
-            "pub extern \"C\" fn snacc_user_echo_int(value: i64) -> i64 { value }\n\n",
-            "#[unsafe(no_mangle)]\n",
-            "pub extern \"C\" fn snacc_user_echo_dec(value: f64) -> f64 { value }\n\n",
-            "#[unsafe(no_mangle)]\n",
-            "pub extern \"C\" fn snacc_user_echo_bool(value: u8) -> u8 { value }\n",
+            "pub fn snacc_user_echo_int(value: i64) -> i64 { value }\n\n",
+            "pub fn snacc_user_echo_dec(value: f64) -> f64 { value }\n\n",
+            "pub fn snacc_user_echo_bool(value: u8) -> u8 { value }\n",
         ),
     )
     .unwrap();
@@ -765,15 +761,356 @@ fn each_bridge_type_round_trips_through_a_parameter_and_a_result() {
         combined(&output)
     );
     let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
-    assert!(stdout.lines().any(|line| line == "1"));
+    assert!(stdout.lines().any(|line| line == "true"), "stdout={stdout}");
     assert!(stdout.lines().any(|line| line == "1.5"));
     assert!(stdout.lines().any(|line| line == "true"));
 }
 
+#[test]
+fn immutable_view_bridge_uses_a_generated_slice_adapter() {
+    let workspace = tempfile::tempdir().expect("failed to create view workspace");
+    let package = workspace.path().join("package");
+    copy_fixture_to(&package);
+    fs::write(
+        package.join("src/main.nrs"),
+        concat!(
+            "extern rust \"snacc_user_sum_view\" fun sum(values: View<Int64>): Int64\n",
+            "extern rust \"snacc_user_count_view\" fun count(values: View<Byte>): Int64\n",
+            "let values: Array<Int64, 3> = [1, 2, 3]\n",
+            "let empty: Array<Byte, 0> = []\n",
+            "print(sum(values.view()))\n",
+            "print(count(empty.view()))\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        package.join("src/interop.rs"),
+        concat!(
+            "pub fn snacc_user_sum_view(values: &[i64]) -> i64 { values.iter().sum() }\n\n",
+            "pub fn snacc_user_count_view(values: &[u8]) -> i64 { values.len() as i64 }\n",
+        ),
+    )
+    .unwrap();
+
+    let target = tempfile::tempdir().expect("failed to create view target directory");
+    let output = cargo_snacc_at(target.path(), &package, &["run", "--offline"]);
+    assert!(
+        output.status.success(),
+        "a view bridge should compile, link, and run through its generated adapter:\n{}",
+        combined(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    assert!(stdout.lines().any(|line| line == "6"));
+    assert!(stdout.lines().any(|line| line == "0"));
+
+    let bridges_dir = target.path().join("snacc").join("bridges");
+    let entries: Vec<_> = fs::read_dir(&bridges_dir)
+        .expect("bridges directory was not created")
+        .filter_map(|entry| entry.ok())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    let content = fs::read_to_string(entries[0].path()).unwrap();
+    assert!(content.contains("fn(&[i64]) -> i64"));
+    assert!(content.contains("fn(&[u8]) -> i64"));
+    assert!(content.contains("*const i64"));
+    assert!(content.contains("core::ptr::NonNull::<u8>::dangling()"));
+}
+
+#[test]
+fn move_only_list_elements_use_compiler_drop_and_opaque_runtime_moves() {
+    let workspace = tempfile::tempdir().expect("failed to create move-only list workspace");
+    let package = workspace.path().join("package");
+    copy_fixture_to(&package);
+    fs::write(
+        package.join("src/main.nrs"),
+        concat!(
+            "let mut values: List<Box<Int64>> = [box(1)]\n",
+            "values.push(box(2))\n",
+            "values.insert(1, box(3))\n",
+            "let removed: Box<Int64> = values.remove(0)\n",
+            "let last: Box<Int64> = values.pop()\n",
+            "values.clear()\n",
+            "print(0)\n",
+        ),
+    )
+    .unwrap();
+
+    let target = tempfile::tempdir().expect("failed to create move-only list target");
+    let output = cargo_snacc_at(target.path(), &package, &["run", "--offline"]);
+    assert!(
+        output.status.success(),
+        "a move-only list should compile, run, and clean up:\n{}",
+        combined(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    assert!(stdout.lines().any(|line| line == "0"));
+}
+
+#[test]
+fn generic_map_values_use_compiler_ownership_and_raw_runtime_storage() {
+    let workspace = tempfile::tempdir().expect("failed to create generic map workspace");
+    let package = workspace.path().join("package");
+    copy_fixture_to(&package);
+    fs::write(
+        package.join("src/main.nrs"),
+        concat!(
+            "let mut values: Map<Int64, Box<Int64>> = Map<Int64, Box<Int64>>()\n",
+            "values.insert(1, box(10))\n",
+            "let taken: Box<Int64> = values.take(1)\n",
+            "values.insert(2, box(20))\n",
+            "values.clear()\n",
+            "print(0)\n",
+        ),
+    )
+    .unwrap();
+
+    let target = tempfile::tempdir().expect("failed to create generic map target");
+    let output = cargo_snacc_at(target.path(), &package, &["run", "--offline"]);
+    assert!(
+        output.status.success(),
+        "a generic map value should compile, run, and clean up:\n{}",
+        combined(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    assert!(stdout.lines().any(|line| line == "0"));
+}
+
+#[test]
+fn scalar_maps_and_string_key_maps_use_pointer_safe_descriptors() {
+    let workspace = tempfile::tempdir().expect("failed to create map workspace");
+    let package = workspace.path().join("package");
+    copy_fixture_to(&package);
+    fs::write(
+        package.join("src/main.nrs"),
+        concat!(
+            "let mut numbers: Map<Int64, Int64> = Map<Int64, Int64>()\n",
+            "numbers.insert(7, 42)\n",
+            "print(numbers.contains(7))\n",
+            "print(numbers[7])\n",
+            "for value, key in numbers do\n",
+            "    print(key)\n",
+            "    print(value)\n",
+            "end\n",
+            "let mut names: Map<String, Int64> = Map<String, Int64>()\n",
+            "let name: String = \"Ada\"\n",
+            "names.insert(name.clone(), 3)\n",
+            "print(names.contains(name))\n",
+            "print(names[name])\n",
+            "names.clear()\n",
+        ),
+    )
+    .unwrap();
+
+    let target = tempfile::tempdir().expect("failed to create map target");
+    let output = cargo_snacc_at(target.path(), &package, &["run", "--offline"]);
+    assert!(
+        output.status.success(),
+        "map descriptor calls should compile and run safely:\n{}",
+        combined(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    assert!(stdout.lines().any(|line| line == "true"), "stdout={stdout}");
+    assert!(stdout.lines().any(|line| line == "42"));
+    assert!(stdout.lines().any(|line| line == "7"));
+    assert!(stdout.lines().any(|line| line == "3"));
+}
+
+#[test]
+fn string_sets_and_non_int_map_values_iterate_without_descriptor_abi_corruption() {
+    let workspace = tempfile::tempdir().expect("failed to create set workspace");
+    let package = workspace.path().join("package");
+    copy_fixture_to(&package);
+    fs::write(
+        package.join("src/main.nrs"),
+        concat!(
+            "let mut names: Set<String> = Set<String>()\n",
+            "let name: String = \"Ada\"\n",
+            "names.insert(name.clone())\n",
+            "print(names.contains(name))\n",
+            "for value in names do\n",
+            "    print(value)\n",
+            "end\n",
+            "let mut flags: Map<Byte, Bool> = Map<Byte, Bool>()\n",
+            "flags.insert(1u8, true)\n",
+            "print(flags[1u8])\n",
+            "for flag, flag_key in flags do\n",
+            "    print(flag_key)\n",
+            "    print(flag)\n",
+            "end\n",
+        ),
+    )
+    .unwrap();
+
+    let target = tempfile::tempdir().expect("failed to create set target");
+    let output = cargo_snacc_at(target.path(), &package, &["run", "--offline"]);
+    assert!(
+        output.status.success(),
+        "set and generic map iteration should run safely:\n{}",
+        combined(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    assert!(stdout.lines().any(|line| line == "true"));
+    assert!(stdout.lines().any(|line| line == "Ada"));
+}
+
+#[test]
+fn map_index_assignment_updates_an_existing_key() {
+    let workspace = tempfile::tempdir().expect("failed to create indexed map workspace");
+    let package = workspace.path().join("package");
+    copy_fixture_to(&package);
+    fs::write(
+        package.join("src/main.nrs"),
+        concat!(
+            "let mut values: Map<Int64, Int64> = Map<Int64, Int64>()\n",
+            "values.insert(1, 10)\n",
+            "values[1] = 99\n",
+            "print(values[1])\n",
+        ),
+    )
+    .unwrap();
+
+    let target = tempfile::tempdir().expect("failed to create indexed map target");
+    let output = cargo_snacc_at(target.path(), &package, &["run", "--offline"]);
+    assert!(
+        output.status.success(),
+        "indexed map assignment should compile and run:\n{}",
+        combined(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    assert!(stdout.lines().any(|line| line == "99"));
+}
+
+#[test]
+fn sequence_index_assignment_updates_arrays_and_lists() {
+    let workspace = tempfile::tempdir().expect("failed to create indexed sequence workspace");
+    let package = workspace.path().join("package");
+    copy_fixture_to(&package);
+    fs::write(
+        package.join("src/main.nrs"),
+        concat!(
+            "let mut values: List<Int64> = [1, 2]\n",
+            "values[1] = 9\n",
+            "print(values[1])\n",
+            "let mut fixed: Array<Int64, 2> = [3, 4]\n",
+            "fixed[0] = 8\n",
+            "print(fixed[0])\n",
+        ),
+    )
+    .unwrap();
+
+    let target = tempfile::tempdir().expect("failed to create indexed sequence target");
+    let output = cargo_snacc_at(target.path(), &package, &["run", "--offline"]);
+    assert!(
+        output.status.success(),
+        "indexed sequence assignment should compile and run:\n{}",
+        combined(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    assert!(stdout.lines().any(|line| line == "9"));
+    assert!(stdout.lines().any(|line| line == "8"));
+}
+
+#[test]
+fn string_key_maps_support_opaque_generic_values() {
+    let workspace = tempfile::tempdir().expect("failed to create generic string map workspace");
+    let package = workspace.path().join("package");
+    copy_fixture_to(&package);
+    fs::write(
+        package.join("src/main.nrs"),
+        concat!(
+            "let mut flags: Map<String, Bool> = Map<String, Bool>()\n",
+            "let name: String = \"Ada\"\n",
+            "flags.insert(name.clone(), true)\n",
+            "print(flags.contains(name))\n",
+            "print(flags[name])\n",
+            "for flag, key in flags do\n",
+            "    print(key)\n",
+            "    print(flag)\n",
+            "end\n",
+            "flags.clear()\n",
+        ),
+    )
+    .unwrap();
+
+    let target = tempfile::tempdir().expect("failed to create generic string map target");
+    let output = cargo_snacc_at(target.path(), &package, &["run", "--offline"]);
+    assert!(
+        output.status.success(),
+        "String-keyed generic map should compile and run:\n{}",
+        combined(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    assert!(stdout.lines().filter(|line| *line == "true").count() >= 2);
+    assert!(stdout.lines().any(|line| line == "Ada"));
+}
+
+#[test]
+fn string_values_can_use_generic_list_storage() {
+    let workspace = tempfile::tempdir().expect("failed to create string list workspace");
+    let package = workspace.path().join("package");
+    copy_fixture_to(&package);
+    fs::write(
+        package.join("src/main.nrs"),
+        concat!(
+            "let mut values: List<String> = [\"a\"]\n",
+            "values.push(\"b\")\n",
+            "let removed: String = values.pop()\n",
+            "values.clear()\n",
+            "print(0)\n",
+        ),
+    )
+    .unwrap();
+
+    let target = tempfile::tempdir().expect("failed to create string list target");
+    let output = cargo_snacc_at(target.path(), &package, &["run", "--offline"]);
+    assert!(
+        output.status.success(),
+        "String values should use the generic list path safely:\n{}",
+        combined(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    assert!(stdout.lines().any(|line| line == "0"));
+}
+
+#[test]
+fn string_views_and_concatenation_use_pointer_safe_runtime_calls() {
+    let workspace = tempfile::tempdir().expect("failed to create string view workspace");
+    let package = workspace.path().join("package");
+    copy_fixture_to(&package);
+    fs::write(
+        package.join("src/main.nrs"),
+        concat!(
+            "let text: String = \"hé\"\n",
+            "print(text)\n",
+            "print(text.concat(\"!\"))\n",
+            "let bytes: View<Byte> = text.bytes()\n",
+            "print(bytes.length())\n",
+            "let scalars: View<Unicode> = text.unicode()\n",
+            "print(scalars.length())\n",
+            "let copy: String = String.from_unicode(scalars)\n",
+            "print(copy)\n",
+        ),
+    )
+    .unwrap();
+
+    let target = tempfile::tempdir().expect("failed to create string view target");
+    let output = cargo_snacc_at(target.path(), &package, &["run", "--offline"]);
+    assert!(
+        output.status.success(),
+        "String view operations should compile and run safely:\n{}",
+        combined(&output)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    assert!(stdout.lines().any(|line| line == "hé"));
+    assert!(stdout.lines().any(|line| line == "hé!"));
+    assert!(stdout.lines().any(|line| line == "3"));
+    assert!(stdout.lines().any(|line| line == "2"));
+}
+
 /// Specification 009 conformance 12-13: every ABI version 3 addition
-/// (`UInt8`/`UInt16`/`UInt32`/`UInt64`/`Float32`) round-trips through a real
+/// (`Byte`/`UInt16`/`UInt32`/`UInt64`/`Float32`) round-trips through a real
 /// bridge parameter and result, and the generated Rust assertion signature
-/// uses the exact mapping from spec section 5.2. `UInt8` and `UInt16` are
+/// uses the exact mapping from spec section 5.2. `Byte` and `UInt16` are
 /// exercised at their maxima so a missing `zeroext` attribute on either the
 /// declaration or the call site cannot pass unnoticed (spec section 8 phase 3
 /// step 5).
@@ -785,7 +1122,7 @@ fn each_new_scalar_type_round_trips_through_a_bridge_parameter_and_a_result() {
     fs::write(
         package.join("src/main.nrs"),
         concat!(
-            "extern rust \"snacc_user_echo_u8\" fun echo_u8(value: UInt8): UInt8\n",
+            "extern rust \"snacc_user_echo_u8\" fun echo_u8(value: Byte): Byte\n",
             "extern rust \"snacc_user_echo_u16\" fun echo_u16(value: UInt16): UInt16\n",
             "extern rust \"snacc_user_echo_u32\" fun echo_u32(value: UInt32): UInt32\n",
             "extern rust \"snacc_user_echo_u64\" fun echo_u64(value: UInt64): UInt64\n",
@@ -801,16 +1138,11 @@ fn each_new_scalar_type_round_trips_through_a_bridge_parameter_and_a_result() {
     fs::write(
         package.join("src/interop.rs"),
         concat!(
-            "#[unsafe(no_mangle)]\n",
-            "pub extern \"C\" fn snacc_user_echo_u8(value: u8) -> u8 { value }\n\n",
-            "#[unsafe(no_mangle)]\n",
-            "pub extern \"C\" fn snacc_user_echo_u16(value: u16) -> u16 { value }\n\n",
-            "#[unsafe(no_mangle)]\n",
-            "pub extern \"C\" fn snacc_user_echo_u32(value: u32) -> u32 { value }\n\n",
-            "#[unsafe(no_mangle)]\n",
-            "pub extern \"C\" fn snacc_user_echo_u64(value: u64) -> u64 { value }\n\n",
-            "#[unsafe(no_mangle)]\n",
-            "pub extern \"C\" fn snacc_user_echo_f32(value: f32) -> f32 { value }\n",
+            "pub fn snacc_user_echo_u8(value: u8) -> u8 { value }\n\n",
+            "pub fn snacc_user_echo_u16(value: u16) -> u16 { value }\n\n",
+            "pub fn snacc_user_echo_u32(value: u32) -> u32 { value }\n\n",
+            "pub fn snacc_user_echo_u64(value: u64) -> u64 { value }\n\n",
+            "pub fn snacc_user_echo_f32(value: f32) -> f32 { value }\n",
         ),
     )
     .unwrap();
@@ -838,7 +1170,7 @@ fn each_new_scalar_type_round_trips_through_a_bridge_parameter_and_a_result() {
     let content = fs::read_to_string(entries[0].path()).unwrap();
     assert!(
         content.contains("fn(u8) -> u8"),
-        "missing UInt8 mapping:\n{content}"
+        "missing Byte mapping:\n{content}"
     );
     assert!(
         content.contains("fn(u16) -> u16"),
@@ -872,9 +1204,9 @@ fn every_scalar_referent_round_trips_through_a_real_rust_bridge() {
         package.join("src/main.nrs"),
         concat!(
             "extern rust \"snacc_user_ref_i64\" fun ref_i64(slot: Ref<Int64>)\n",
-            "extern rust \"snacc_user_ref_f64\" fun ref_f64(slot: Ref<Dec64>)\n",
+            "extern rust \"snacc_user_ref_f64\" fun ref_f64(slot: Ref<Float64>)\n",
             "extern rust \"snacc_user_ref_bool\" fun ref_bool(slot: Ref<Bool>)\n",
-            "extern rust \"snacc_user_ref_u8\" fun ref_u8(slot: Ref<UInt8>)\n",
+            "extern rust \"snacc_user_ref_u8\" fun ref_u8(slot: Ref<Byte>)\n",
             "extern rust \"snacc_user_ref_u16\" fun ref_u16(slot: Ref<UInt16>)\n",
             "extern rust \"snacc_user_ref_u32\" fun ref_u32(slot: Ref<UInt32>)\n",
             "extern rust \"snacc_user_ref_u64\" fun ref_u64(slot: Ref<UInt64>)\n",
@@ -883,9 +1215,9 @@ fn every_scalar_referent_round_trips_through_a_real_rust_bridge() {
             // two assertions must differ.
             "extern rust \"snacc_user_echo_i64\" fun echo_i64(value: Int64): Int64\n",
             "let mut whole: Int64 = 1\n",
-            "let mut fraction: Dec64 = 0.5\n",
+            "let mut fraction: Float64 = 0.5\n",
             "let mut flag: Bool = false\n",
-            "let mut byte: UInt8 = 1u8\n",
+            "let mut byte: Byte = 1u8\n",
             "let mut short: UInt16 = 1u16\n",
             "let mut word: UInt32 = 1u32\n",
             "let mut long: UInt64 = 1u64\n",
@@ -913,25 +1245,16 @@ fn every_scalar_referent_round_trips_through_a_real_rust_bridge() {
     fs::write(
         package.join("src/interop.rs"),
         concat!(
-            "#[unsafe(no_mangle)]\n",
-            "pub extern \"C\" fn snacc_user_ref_i64(slot: &mut i64) { *slot += 41; }\n\n",
-            "#[unsafe(no_mangle)]\n",
-            "pub extern \"C\" fn snacc_user_ref_f64(slot: &mut f64) { *slot += 1.0; }\n\n",
+            "pub fn snacc_user_ref_i64(slot: &mut i64) { *slot += 41; }\n\n",
+            "pub fn snacc_user_ref_f64(slot: &mut f64) { *slot += 1.0; }\n\n",
             // Conformance 20: the host must leave a valid Bool representation.
-            "#[unsafe(no_mangle)]\n",
-            "pub extern \"C\" fn snacc_user_ref_bool(slot: &mut u8) { *slot = 1; }\n\n",
-            "#[unsafe(no_mangle)]\n",
-            "pub extern \"C\" fn snacc_user_ref_u8(slot: &mut u8) { *slot = 255; }\n\n",
-            "#[unsafe(no_mangle)]\n",
-            "pub extern \"C\" fn snacc_user_ref_u16(slot: &mut u16) { *slot = 65535; }\n\n",
-            "#[unsafe(no_mangle)]\n",
-            "pub extern \"C\" fn snacc_user_ref_u32(slot: &mut u32) { *slot = 4294967295; }\n\n",
-            "#[unsafe(no_mangle)]\n",
-            "pub extern \"C\" fn snacc_user_ref_u64(slot: &mut u64) { *slot = u64::MAX; }\n\n",
-            "#[unsafe(no_mangle)]\n",
-            "pub extern \"C\" fn snacc_user_ref_f32(slot: &mut f32) { *slot += 1.0; }\n\n",
-            "#[unsafe(no_mangle)]\n",
-            "pub extern \"C\" fn snacc_user_echo_i64(value: i64) -> i64 { value }\n",
+            "pub fn snacc_user_ref_bool(slot: &mut u8) { *slot = 1; }\n\n",
+            "pub fn snacc_user_ref_u8(slot: &mut u8) { *slot = 255; }\n\n",
+            "pub fn snacc_user_ref_u16(slot: &mut u16) { *slot = 65535; }\n\n",
+            "pub fn snacc_user_ref_u32(slot: &mut u32) { *slot = 4294967295; }\n\n",
+            "pub fn snacc_user_ref_u64(slot: &mut u64) { *slot = u64::MAX; }\n\n",
+            "pub fn snacc_user_ref_f32(slot: &mut f32) { *slot += 1.0; }\n\n",
+            "pub fn snacc_user_echo_i64(value: i64) -> i64 { value }\n",
         ),
     )
     .unwrap();
@@ -1206,10 +1529,9 @@ fn concurrent_bridge_assertion_generation_does_not_corrupt_the_file() {
     );
     let content = fs::read_to_string(entries[0].path()).unwrap();
     assert!(content.contains("crate::interop::snacc_user_itoa_len"));
-    // Each rendered line ends in a `// snacc: name (entry:line:column)` trailing
-    // comment (see `render_bridge_assertions`), so a non-corrupted, non-truncated
-    // publish ends with the comment's closing paren, not the statement's `;`.
-    assert!(content.trim_end().ends_with(')'));
+    // The final adapter closes with `}`; a partial publication cannot pass this
+    // check even though the assertion comments themselves precede it.
+    assert!(content.trim_end().ends_with('}'));
 }
 
 #[test]

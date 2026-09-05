@@ -2,11 +2,11 @@
 // they cannot both be referenced by one call.
 
 type Point is struct
-    x: Dec64,
-    y: Dec64,
+    x: Float64,
+    y: Float64,
 end
 
-fun use_both(whole: Ref<Point>, part: Ref<Dec64>) do
+fun use_both(whole: Ref<Point>, part: Ref<Float64>) do
     part = whole.y
 end
 

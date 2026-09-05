@@ -5,11 +5,13 @@ pub type Spanned<T> = (T, Span);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TypeName {
-    Dec64,
+    Float64,
     Int64,
     Bool,
     Nil,
-    UInt8,
+    String,
+    Unicode,
+    Byte,
     UInt16,
     UInt32,
     UInt64,
@@ -19,11 +21,13 @@ pub enum TypeName {
 impl std::fmt::Display for TypeName {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let name = match self {
-            Self::Dec64 => "Dec64",
+            Self::Float64 => "Float64",
             Self::Int64 => "Int64",
             Self::Bool => "Bool",
             Self::Nil => "Nil",
-            Self::UInt8 => "UInt8",
+            Self::String => "String",
+            Self::Unicode => "Unicode",
+            Self::Byte => "Byte",
             Self::UInt16 => "UInt16",
             Self::UInt32 => "UInt32",
             Self::UInt64 => "UInt64",
@@ -46,6 +50,11 @@ impl std::fmt::Display for TypeName {
 pub enum TypeRef<'src> {
     Builtin(TypeName),
     Named(Vec<Spanned<&'src str>>),
+    /// An explicitly applied generic type such as `Pair<Int64, Bool>`.
+    Apply {
+        path: Vec<Spanned<&'src str>>,
+        args: Vec<Spanned<Self>>,
+    },
     Sum(Vec<Spanned<Self>>),
     /// `Box<T>` (Specification 016 section 4.1): a closed, single-argument
     /// built-in parameterized type, parsed with the same closed-angle-bracket
@@ -55,6 +64,16 @@ pub enum TypeRef<'src> {
     /// can appear as a sum member, a nested argument (`Box<Box<T>>`), and
     /// anywhere else this enum's other variants can.
     Box(std::boxed::Box<Spanned<Self>>),
+    /// Closed built-in immutable view family: `View<Byte>` or
+    /// `View<Unicode>`.
+    View(std::boxed::Box<Spanned<Self>>),
+    Array(std::boxed::Box<Spanned<Self>>, u64),
+    List(std::boxed::Box<Spanned<Self>>),
+    Map(
+        std::boxed::Box<Spanned<Self>>,
+        std::boxed::Box<Spanned<Self>>,
+    ),
+    Set(std::boxed::Box<Spanned<Self>>),
 }
 
 impl std::fmt::Display for TypeRef<'_> {
@@ -69,6 +88,19 @@ impl std::fmt::Display for TypeRef<'_> {
                     .join(".");
                 f.write_str(&path)
             }
+            Self::Apply { path, args } => {
+                let path = path
+                    .iter()
+                    .map(|(segment, _)| *segment)
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let args = args
+                    .iter()
+                    .map(|(arg, _)| arg.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "{path}<{args}>")
+            }
             Self::Sum(members) => {
                 let joined = members
                     .iter()
@@ -78,6 +110,11 @@ impl std::fmt::Display for TypeRef<'_> {
                 f.write_str(&joined)
             }
             Self::Box(inner) => write!(f, "Box<{}>", inner.0),
+            Self::View(inner) => write!(f, "View<{}>", inner.0),
+            Self::Array(inner, length) => write!(f, "Array<{}, {}>", inner.0, length),
+            Self::List(inner) => write!(f, "List<{}>", inner.0),
+            Self::Map(key, value) => write!(f, "Map<{}, {}>", key.0, value.0),
+            Self::Set(inner) => write!(f, "Set<{}>", inner.0),
         }
     }
 }
@@ -89,7 +126,7 @@ impl std::fmt::Display for TypeRef<'_> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NumLiteral {
     Int(i64),
-    Dec(f64),
+    F64(f64),
     U8(u8),
     U16(u16),
     U32(u32),
@@ -101,7 +138,7 @@ impl std::fmt::Display for NumLiteral {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::Int(x) => write!(f, "{x}"),
-            Self::Dec(x) => write!(f, "{x}"),
+            Self::F64(x) => write!(f, "{x}"),
             Self::U8(x) => write!(f, "{x}u8"),
             Self::U16(x) => write!(f, "{x}u16"),
             Self::U32(x) => write!(f, "{x}u32"),
@@ -114,20 +151,33 @@ impl std::fmt::Display for NumLiteral {
 /// Syntax retains unsupported literal forms so type checking can own their
 /// diagnostics instead of leaking them into the backend.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Value<'src> {
+pub enum Value {
     Nil,
     Bool(bool),
     Num(NumLiteral),
-    Str(&'src str),
+    /// An interpreted UTF-8 string after escape decoding. The source token is
+    /// borrowed, but the checked literal owns its normalized bytes.
+    Str(String),
+    Unicode(u32),
 }
 
-impl std::fmt::Display for Value<'_> {
+/// One ordered part of an interpreted string. Literal text is decoded by the
+/// lexer; embedded expressions are parsed from the same token stream as every
+/// other expression and never reinterpreted during lowering.
+#[derive(Debug)]
+pub enum StringPart<'src> {
+    Literal(String),
+    Expression(Spanned<Expr<'src>>),
+}
+
+impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::Nil => write!(f, "nil"),
             Self::Bool(x) => write!(f, "{x}"),
             Self::Num(x) => write!(f, "{x}"),
             Self::Str(x) => write!(f, "{x}"),
+            Self::Unicode(x) => write!(f, "U+{x:04X}"),
         }
     }
 }
@@ -144,6 +194,13 @@ pub enum BinaryOp {
     LessEq,
     Greater,
     GreaterEq,
+    And,
+    Or,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum UnaryOp {
+    Not,
 }
 
 /// One call argument. `name` is present for the `identifier : expression` form,
@@ -163,8 +220,11 @@ pub struct Arg<'src> {
 #[derive(Debug)]
 pub enum Expr<'src> {
     Error,
-    Value(Value<'src>),
+    Value(Value),
+    Interpolated(Vec<StringPart<'src>>),
     List(Vec<Spanned<Self>>),
+    MapNew(Spanned<TypeRef<'src>>, Spanned<TypeRef<'src>>),
+    SetNew(Spanned<TypeRef<'src>>),
     Local(&'src str),
     /// The implicit method receiver. Rejected outside a method body.
     SelfRef,
@@ -174,8 +234,19 @@ pub enum Expr<'src> {
     /// `base . name`. Resolution decides whether this is a field, a qualified
     /// type path, or a method that was used without a call.
     Member(Box<Spanned<Self>>, Spanned<&'src str>),
+    Index(Box<Spanned<Self>>, Box<Spanned<Self>>),
     Binary(Box<Spanned<Self>>, BinaryOp, Box<Spanned<Self>>),
+    Unary(UnaryOp, Box<Spanned<Self>>),
+    /// `return_on_error expression` propagates an active Error alternative
+    /// through the enclosing fallible callable.
+    ReturnOnError(Box<Spanned<Self>>),
     Call(Box<Spanned<Self>>, Spanned<Vec<Arg<'src>>>),
+    /// An explicitly monomorphized call such as `identity<Int64>(42)`.
+    GenericCall(
+        Box<Spanned<Self>>,
+        Spanned<Vec<Spanned<TypeRef<'src>>>>,
+        Spanned<Vec<Arg<'src>>>,
+    ),
     Print(Box<Spanned<Self>>),
     /// `box(expression)` (Specification 016 section 4.2): a reserved
     /// allocation expression, not a call. Its operand is evaluated exactly
@@ -270,12 +341,39 @@ pub enum BlockElement<'src> {
         place: PlacePath<'src>,
         value: Spanned<Expr<'src>>,
     },
+    /// An indexed assignment target. It is kept as an expression until type
+    /// checking because only map indexing is writable in the first collection
+    /// slice; ordinary field/root assignments retain `Assign`'s resolved path.
+    IndexedAssign {
+        target: Spanned<Expr<'src>>,
+        value: Spanned<Expr<'src>>,
+    },
     While {
         condition: Spanned<Expr<'src>>,
         body: Block<'src>,
         span: Span,
     },
+    For {
+        value: Spanned<&'src str>,
+        key: Option<Spanned<&'src str>>,
+        iterable: Spanned<Expr<'src>>,
+        body: Block<'src>,
+        span: Span,
+    },
     Break(Span),
+    /// `"return", [ expression ]` (Specification 026 section 4). `None` is a
+    /// bare return; the parser admits it only immediately before a block
+    /// boundary (`end`, `elseif`, `else`, or top-level end of input), so a
+    /// bare return can never be followed by another element of the same
+    /// block (section 4 rule 3).
+    Return(Option<Spanned<Expr<'src>>>, Span),
+    /// A deferred direct call, executed when the containing lexical block
+    /// exits. The checker validates the call shape and result type.
+    Defer {
+        on_error: bool,
+        call: Spanned<Expr<'src>>,
+        span: Span,
+    },
     If(IfForm<'src>),
     Expr(Spanned<Expr<'src>>),
 }
@@ -292,8 +390,22 @@ pub struct IfForm<'src> {
 
 #[derive(Debug)]
 pub struct Func<'src> {
+    /// Explicit type parameters declared between the function name and `(`.
+    pub generic_params: Vec<Spanned<&'src str>>,
     pub args: Vec<Param<'src>>,
     /// `None` declares a function without a result.
+    pub ret: Option<Spanned<TypeRef<'src>>>,
+    pub span: Span,
+    pub body: Block<'src>,
+}
+
+/// `static Type.name(...) do ... end`. Associated functions have no implicit
+/// receiver; the receiver type only provides their namespace.
+#[derive(Debug)]
+pub struct StaticDecl<'src> {
+    pub receiver: Spanned<TypeRef<'src>>,
+    pub name: Spanned<&'src str>,
+    pub args: Vec<Param<'src>>,
     pub ret: Option<Spanned<TypeRef<'src>>>,
     pub span: Span,
     pub body: Block<'src>,
@@ -329,22 +441,23 @@ pub struct Param<'src> {
 
 /// `type N is ...`. Declaration order is preserved so `TypeId` allocation is
 /// deterministic (Specification 010 section 19 phase 2).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct TypeDecl<'src> {
     pub name: &'src str,
     pub name_span: Span,
+    pub generic_params: Vec<Spanned<&'src str>>,
     pub body: TypeBody<'src>,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum TypeBody<'src> {
     Represented(Spanned<TypeRef<'src>>),
     Struct(Vec<FieldDecl<'src>>),
     Union(Vec<UnionMemberDecl<'src>>),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct FieldDecl<'src> {
     pub name: &'src str,
     pub name_span: Span,
@@ -353,7 +466,7 @@ pub struct FieldDecl<'src> {
 
 /// One union alternative. A bare alternative is exactly an empty inline struct
 /// (Specification 010 section 6.2), so both spell out to the same shape here.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct UnionMemberDecl<'src> {
     /// `Nil` for the special member; otherwise the declared identifier.
     pub name: &'src str,
@@ -389,6 +502,8 @@ pub struct Program<'src> {
     pub types: Vec<TypeDecl<'src>>,
     /// Method declarations in source order; their order fixes `MethodId` values.
     pub methods: Vec<MethodDecl<'src>>,
+    /// Static associated-function declarations in source order.
+    pub statics: Vec<StaticDecl<'src>>,
     /// The top-level executable block. An empty program is a block with zero
     /// elements, so this is never optional.
     pub body: Block<'src>,

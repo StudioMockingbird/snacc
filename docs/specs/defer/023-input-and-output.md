@@ -28,17 +28,17 @@ This RFC cannot be implemented before:
 - [RFC 016](archive/016-box-indirection-and-recursive-data.md) for move-only ownership
   and deterministic destruction. A file handle is the archetypal owned
   resource; without 016 there is no way to close one exactly once.
-- [RFC 017](017-utf8-strings-and-views.md) for `String`, `Byte`, and
+- [RFC 017](../archive/017-utf8-strings-and-views.md) for `String`, `Byte`, and
   `View<Byte>`.
 - [Specification 018](archive/018-inline-sum-types.md) for `T | Error`, which is how
   every fallible operation reports failure.
-- [Specification 024](024-error-handling.md) for the predeclared `Error`
+- [Specification 024](../archive/024-error-handling.md) for the predeclared `Error`
   struct, stable categories, and `return_on_error` propagation.
 - [Specification 019](019-collections-and-iteration.md) for `List<Byte>` read
   buffers and for `View<T>`'s physical bridge expansion.
-- [Specification 020](020-literal-cleanup-and-numeric-radices.md) for the
+- [Specification 020](archive/020-literal-cleanup-and-numeric-radices.md) for the
   `Float64` and `Byte` names used throughout.
-- [Specification 026](026-return-statements.md) for the explicit early-return
+- [Specification 026](archive/026-return-statements.md) for the explicit early-return
   path used to propagate `Error` values without failure flags.
 
 It has a two-way relationship with
@@ -769,13 +769,13 @@ in its own specification.
 ## 18. References
 
 - [`LANGUAGE.md`](../../LANGUAGE.md)
-- [RFC 014: Generic Programming](014-generic-programming.md)
+- [RFC 014: Generic Programming](../archive/014-generic-programming.md)
 - [RFC 016: Box Indirection and Recursive Data](archive/016-box-indirection-and-recursive-data.md)
-- [RFC 017: UTF-8 Strings and Views](017-utf8-strings-and-views.md)
+- [RFC 017: UTF-8 Strings and Views](../archive/017-utf8-strings-and-views.md)
 - [Specification 018: Inline Sum Types](archive/018-inline-sum-types.md)
 - [Specification 019: Collections and Iteration](019-collections-and-iteration.md)
-- [Specification 020: Literal Cleanup and Numeric Radices](020-literal-cleanup-and-numeric-radices.md)
+- [Specification 020: Literal Cleanup and Numeric Radices](archive/020-literal-cleanup-and-numeric-radices.md)
 - [Specification 022: Concurrency and Parallelism](022-concurrency-and-parallelism.md)
-- [Specification 024: Error Handling](024-error-handling.md)
-- [Specification 025: Deferred Calls](025-defer.md)
-- [Specification 026: Return Statements](026-return-statements.md)
+- [Specification 024: Error Handling](../archive/024-error-handling.md)
+- [Specification 025: Deferred Calls](../archive/025-defer.md)
+- [Specification 026: Return Statements](archive/026-return-statements.md)

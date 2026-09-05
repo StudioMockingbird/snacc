@@ -33,9 +33,9 @@ fun ref_double(value: Int64): Int64 do
 end
 
 // Conformance 7, 23: an automatic read is an ordinary `Int64` for printing,
-// comparison, a value call, and the `Int64` to `Dec64` widening. No print
+// comparison, a value call, and the `Int64` to `Float64` widening. No print
 // symbol beyond the existing `Int64` one is involved.
-fun ref_observe(value: Ref<Int64>): Dec64 do
+fun ref_observe(value: Ref<Int64>): Float64 do
     print(value)
     print(value > 0)
     print(ref_double(value))

@@ -2,8 +2,8 @@
 // disjoint field references, reborrowing, and value/reference mixing.
 
 type Point is struct
-    x: Dec64,
-    y: Dec64,
+    x: Float64,
+    y: Float64,
 end
 
 fun add_into(x: Int64, y: Int64, result: Ref<Int64>) do
@@ -27,17 +27,17 @@ fun relay(value: Ref<Int64>) do
     show(value)
 end
 
-fun exchange(left: Ref<Dec64>, right: Ref<Dec64>) do
-    let saved: Dec64 = left
+fun exchange(left: Ref<Float64>, right: Ref<Float64>) do
+    let saved: Float64 = left
     left = right
     right = saved
 end
 
-fun move_right(point: Ref<Point>, amount: Dec64) do
+fun move_right(point: Ref<Point>, amount: Float64) do
     point.x = point.x + amount
 end
 
-method Point.give(other: Ref<Dec64>) do
+method Point.give(other: Ref<Float64>) do
     other = self.x
 end
 
@@ -59,6 +59,6 @@ exchange(point.x, point.y)
 move_right(point, 1.0)
 add_into(1, 2, z)
 
-let mut total: Dec64 = 0.0
+let mut total: Float64 = 0.0
 point.give(total)
 print(total)

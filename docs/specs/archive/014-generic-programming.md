@@ -1,6 +1,6 @@
 # RFC 014: Generic Programming
 
-Status: Proposed
+Status: Closed
 
 Document kind: Feature specification (Rust-style RFC)
 
@@ -11,8 +11,8 @@ contract, the compiler's monomorphization model, and the required diagnostics.
 Deferred items are explicitly non-goals for this version and do not leave an
 open design question in the selected scope.
 
-`LANGUAGE.md` remains authoritative. Until this RFC is accepted and its
-decisions are incorporated there, generic syntax is not part of Snacc.
+This RFC is implemented and incorporated into `LANGUAGE.md`, which remains the
+authoritative language contract.
 
 ## Summary
 
@@ -39,8 +39,8 @@ let pair: Pair<Int64, Bool> =
     Pair<Int64, Bool>(first: 42, second: true)
 ~~~
 
-The syntax and semantics in this document are normative for the first generic
-version once copied into `LANGUAGE.md` and `GRAMMAR.ebnf`.
+`LANGUAGE.md` and `GRAMMAR.ebnf` contain the implemented syntax and semantics;
+this RFC records the design and implementation plan that produced them.
 
 ## Motivation
 
@@ -256,11 +256,12 @@ the initial rules ambiguous.
 
 The compiler shall permit recursive and mutually recursive calls. It shall
 track each instantiation as `(declaration identity, concrete type arguments)`
-and enforce a deterministic implementation limit on specialization depth and
-total specializations. A recursive edge that exceeds that fixed limit is a
-compile-time error with the complete instantiation chain. The limit is an
-implementation guard, not a user-visible type-system feature, and must be
-stable for the same source program and compiler version.
+and enforce a fixed maximum specialization depth of 128 active instantiation
+edges and 4,096 unique specializations per compilation. A recursive edge that
+exceeds the depth limit, or a compilation that would create specialization
+number 4,097, is a compile-time error with the complete instantiation chain.
+The limits are implementation guards, not user-visible type-system features,
+and are stable for the same source program and compiler version.
 
 ## Selected scope
 
@@ -407,9 +408,9 @@ future work.
 
 ### Recursion and diagnostics (closed)
 
-- Recursive instantiation is bounded by a deterministic compiler limit on
-  specialization depth and count. Exceeding it is a compile-time diagnostic,
-  not a runtime failure.
+- Recursive instantiation is bounded by a maximum depth of 128 active
+  instantiation edges and 4,096 unique specializations per compilation.
+  Exceeding either limit is a compile-time diagnostic, not a runtime failure.
 - A specialized-body error reports the generic declaration as the primary
   source location and the concrete instantiation use site plus argument list as
   a secondary note. The diagnostic includes the instantiation chain when
@@ -479,8 +480,8 @@ judged against them rather than against abstract examples.
 
 ## References
 
-- [`LANGUAGE.md`](../../LANGUAGE.md)
-- [RFC 016: Box Indirection and Recursive Data Structures](archive/016-box-indirection-and-recursive-data.md)
+- [`LANGUAGE.md`](../../../LANGUAGE.md)
+- [RFC 016: Box Indirection and Recursive Data Structures](016-box-indirection-and-recursive-data.md)
 - [Specification 020: Literal Cleanup and Numeric Radices](020-literal-cleanup-and-numeric-radices.md)
 - [Specification 024: Error Handling](024-error-handling.md)
 - [Specification 027: Boolean and Comparison Operators](027-boolean-and-comparison-operators.md)

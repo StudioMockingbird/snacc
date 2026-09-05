@@ -1,6 +1,6 @@
 # Specification 020: Literal Cleanup and Numeric Radices
 
-Status: Proposed
+Status: Closed
 
 Document kind: Language semantics (ISO/IEC-style specification)
 

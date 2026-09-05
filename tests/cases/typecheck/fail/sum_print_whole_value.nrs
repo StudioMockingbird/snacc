@@ -1,2 +1,2 @@
-let a: UInt8 | Nil = nil
+let a: Byte | Nil = nil
 print(a)

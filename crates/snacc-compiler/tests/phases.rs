@@ -25,6 +25,25 @@ fn terminated_blocks_never_receive_a_second_terminator() {
         "fun pick(flag: Bool): Int64 do if flag then 1 else 2 end end\nprint(pick(true))",
         // A no-result function lowers to LLVM `void`.
         "fun announce(value: Int64) do print(value) end\nannounce(1)",
+        // Specification 026: an early `return` terminates its block exactly
+        // like `break` does, and source after it is not lowered either.
+        "fun stop() do return end\nstop()",
+        "fun stop(): Int64 do return print(1) end\nprint(stop())",
+        // Every branch of a value-form `if` returns, so no merge block value
+        // is ever read.
+        "fun bit(flag: Bool): Int64 do if flag then return 1 else return 0 end end\n\
+         print(bit(true))",
+        // A returning branch beside a value-producing one still merges
+        // through one phi with only the live branch as an incoming edge.
+        "fun normalize(value: Int64): Int64 do if value < 0 then return 0 else value end end\n\
+         print(normalize(0 - 1))",
+        // A `return` inside a `while` body exits the function, not the loop;
+        // the loop's own exit block is still reachable on the untaken edge.
+        "fun first(): Int64 do while true do return 1 end 0 end\nprint(first())",
+        // A `return` inside a method body.
+        "type Point is struct x: Int64, end\n\
+         method Point.x_or_zero(flag: Bool): Int64 do if flag then return self.x end 0 end\n\
+         print(Point(x: 5).x_or_zero(true))",
     ] {
         emit_object(source)
             .unwrap_or_else(|error| panic!("LLVM emission failed for {source:?}: {error:?}"));
@@ -60,6 +79,25 @@ fn boxes_lower_through_the_runtime_allocator_and_cleanup() {
     );
 }
 
+#[test]
+fn floating_results_are_guarded_before_they_become_snacc_values() {
+    let ir = emit_llvm_ir(concat!(
+        "fun divide(left: Float64, right: Float64): Float64 do left / right end\n",
+        "extern rust \"snacc_user_nan\" fun nan(): Float64\n",
+        "print(divide(0.0, 1.0))\n",
+        "print(nan())\n",
+    ))
+    .unwrap_or_else(|error| panic!("LLVM emission failed: {error:?}"));
+    assert!(
+        ir.contains("fcmp uno"),
+        "missing unordered float guard:\n{ir}"
+    );
+    assert!(
+        ir.contains("@snacc_invalid_floating_operation"),
+        "missing invalid-floating-operation import:\n{ir}"
+    );
+}
+
 /// Specification 009 phase 3: every new scalar lowers through its own LLVM
 /// type. `module.verify()` inside `emit_object` rejects a mismatched width,
 /// predicate class, or print signature, so this covers every lowering path the
@@ -67,7 +105,7 @@ fn boxes_lower_through_the_runtime_allocator_and_cleanup() {
 #[test]
 fn every_new_scalar_lowers_to_llvm() {
     for (name, literal) in [
-        ("UInt8", "1u8"),
+        ("Byte", "1u8"),
         ("UInt16", "1u16"),
         ("UInt32", "1u32"),
         ("UInt64", "1u64"),
@@ -195,11 +233,11 @@ fn unions_lower_to_a_tag_and_one_storage_field_per_member() {
 #[test]
 fn inline_sums_lower_to_a_tag_and_one_zero_initialized_storage_field_per_member() {
     let ir = emit_llvm_ir(
-        "fun pick(flag: Bool, byte: UInt8): UInt8 | Nil do\n\
+        "fun pick(flag: Bool, byte: Byte): Byte | Nil do\n\
         \x20   if flag then byte else nil end\n\
          end\n\
-         fun rank(value: UInt8 | Nil): UInt8 do\n\
-        \x20   if value is UInt8(byte) then byte elseif value is Nil then 0u8 end\n\
+         fun rank(value: Byte | Nil): Byte do\n\
+        \x20   if value is Byte(byte) then byte elseif value is Nil then 0u8 end\n\
          end\n\
          print(rank(pick(true, 7u8)))\n",
     )
@@ -214,8 +252,8 @@ fn inline_sums_lower_to_a_tag_and_one_zero_initialized_storage_field_per_member(
         "wrong sum layout in:\n{ir}"
     );
 
-    // Canonical member order sorts `Nil` before `UInt8` (Specification 018
-    // section 4), so `is Nil` and `is UInt8(...)` compare the stored tag
+    // Canonical member order sorts `Nil` before `Byte` (Specification 018
+    // section 4), so `is Nil` and `is Byte(...)` compare the stored tag
     // against 0 and 1 respectively -- not their written source order.
     let mut tags: Vec<&str> = ir
         .lines()
@@ -257,7 +295,7 @@ fn inline_sums_lower_to_a_tag_and_one_zero_initialized_storage_field_per_member(
 #[test]
 fn sub_word_bridge_declarations_and_calls_carry_zeroext() {
     for (name, literal, extended) in [
-        ("UInt8", "1u8", true),
+        ("Byte", "1u8", true),
         ("UInt16", "1u16", true),
         ("Bool", "true", true),
         ("UInt32", "1u32", false),

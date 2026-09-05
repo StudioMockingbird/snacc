@@ -1,6 +1,6 @@
 # Specification 026: Return Statements
 
-Status: Proposed
+Status: Closed
 
 Document kind: Language semantics (ISO/IEC-style specification)
 

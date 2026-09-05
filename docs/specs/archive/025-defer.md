@@ -1,6 +1,6 @@
 # Specification 025: Deferred Calls
 
-Status: Proposed
+Status: Closed
 
 Document kind: Language semantics (ISO/IEC-style specification)
 
@@ -27,9 +27,9 @@ This specification depends on:
 
 - [RFC 016](archive/016-box-indirection-and-recursive-data.md) for move tracking,
   deterministic destruction, and checked scope cleanup;
-- [Specification 024](024-error-handling.md) for the exact predeclared `Error`
+- [Specification 024](archive/024-error-handling.md) for the exact predeclared `Error`
   type, error-result classification, and `return_on_error`; and
-- [Specification 026](026-return-statements.md) for result materialization and
+- [Specification 026](archive/026-return-statements.md) for result materialization and
   cleanup-bearing return edges.
 
 When [Specification 022](022-concurrency-and-parallelism.md) is implemented,
@@ -491,7 +491,7 @@ the condition without an abbreviation.
 
 - [`LANGUAGE.md`](../../LANGUAGE.md)
 - [RFC 016: Box Indirection and Recursive Data](archive/016-box-indirection-and-recursive-data.md)
-- [Specification 021: Truthiness and Equality](021-truthiness-and-equality.md)
+- [Specification 021: Truthiness and Equality](archive/021-truthiness-and-equality.md)
 - [Specification 022: Concurrency and Parallelism](022-concurrency-and-parallelism.md)
-- [Specification 024: Error Handling](024-error-handling.md)
-- [Specification 026: Return Statements](026-return-statements.md)
+- [Specification 024: Error Handling](archive/024-error-handling.md)
+- [Specification 026: Return Statements](archive/026-return-statements.md)

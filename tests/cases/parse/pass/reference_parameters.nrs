@@ -1,19 +1,19 @@
 // Specification 011 sections 4-5: `Ref<T>` in every permitted parameter site.
 
 type Point is struct
-    x: Dec64,
-    y: Dec64,
+    x: Float64,
+    y: Float64,
 end
 
 fun add_into(x: Int64, y: Int64, result: Ref<Int64>) do
     result = x + y
 end
 
-fun move_right(point: Ref<Point>, amount: Dec64) do
+fun move_right(point: Ref<Point>, amount: Float64) do
     point.x = point.x + amount
 end
 
-method Point.give(other: Ref<Dec64>) do
+method Point.give(other: Ref<Float64>) do
     other = self.x
 end
 

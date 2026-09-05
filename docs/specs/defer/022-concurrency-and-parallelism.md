@@ -31,7 +31,7 @@ Later layers depend on:
   value;
 - [Specification 019](019-collections-and-iteration.md) for arrays and index
   places, required before fan-out writes into distinct elements;
-- [RFC 014](014-generic-programming.md) only if a task or channel type is ever
+- [RFC 014](../archive/014-generic-programming.md) only if a task or channel type is ever
   made user-parameterizable. The forms proposed here are closed
   compiler-provided type forms, like `Box<T>`.
 
@@ -40,7 +40,7 @@ but is a dependency of the recommendation in section 4.4: until Snacc has a
 suspending operation, a coroutine scheduler earns nothing. Its phase C is the
 trigger that promotes `may` to the default.
 
-[Specification 026](026-return-statements.md) defines return from ordinary
+[Specification 026](archive/026-return-statements.md) defines return from ordinary
 callables. A return that would cross a live `parallel` scope additionally needs
 the scope-exit join described in section 6.2.
 
@@ -1177,13 +1177,13 @@ language feature.
 ## 18. References
 
 - [`LANGUAGE.md`](../../LANGUAGE.md)
-- [RFC 014: Generic Programming](014-generic-programming.md)
+- [RFC 014: Generic Programming](../archive/014-generic-programming.md)
 - [RFC 016: Box Indirection and Recursive Data](archive/016-box-indirection-and-recursive-data.md)
-- [RFC 017: UTF-8 Strings and Views](017-utf8-strings-and-views.md)
+- [RFC 017: UTF-8 Strings and Views](../archive/017-utf8-strings-and-views.md)
 - [Specification 018: Inline Sum Types](archive/018-inline-sum-types.md)
 - [Specification 019: Collections and Iteration](019-collections-and-iteration.md)
 - [Specification 023: Input and Output](023-input-and-output.md)
-- [Specification 026: Return Statements](026-return-statements.md)
+- [Specification 026: Return Statements](archive/026-return-statements.md)
 - `may` 0.3.51 -- https://github.com/Xudong-Huang/may
 - `may_minihttp` 0.1.11 -- https://github.com/Xudong-Huang/may_minihttp
 - `generator` 0.8.9 -- https://github.com/Xudong-Huang/generator-rs

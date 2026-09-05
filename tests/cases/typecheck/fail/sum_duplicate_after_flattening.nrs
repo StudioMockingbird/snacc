@@ -1,1 +1,1 @@
-let x: (UInt8 | Bool) | UInt8 = 1u8
+let x: (Byte | Bool) | Byte = 1u8

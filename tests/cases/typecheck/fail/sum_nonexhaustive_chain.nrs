@@ -1,5 +1,5 @@
-fun describe(value: UInt8 | Nil): UInt8 do
-    if value is UInt8(byte) then
+fun describe(value: Byte | Nil): Byte do
+    if value is Byte(byte) then
         byte
     end
 end

@@ -7,10 +7,11 @@ use chumsky::prelude::*;
 
 pub use diagnostics::{Diagnostic, DiagnosticPhase, Diagnostics};
 pub use semantics::checker::{Program, TParam, Ty};
+pub use semantics::types::CollectionDef;
 pub use syntax::ast::{ParamMode, Program as AstProgram};
 
 /// Contract version for generated objects, runtime imports, and Rust bridges.
-pub const ABI_VERSION: u32 = 7;
+pub const ABI_VERSION: u32 = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Optimization {

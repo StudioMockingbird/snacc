@@ -1,0 +1,11 @@
+let mut values: List<Int64> = [10, 20, 30]
+values.insert(1, 15)
+print(values[1])
+let removed: Int64 = values.remove(2)
+print(removed)
+let last: Int64 = values.pop()
+print(last)
+values.reserve(10)
+print(values.capacity())
+values.clear()
+print(values.length())

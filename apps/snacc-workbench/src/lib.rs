@@ -978,7 +978,7 @@ mod tests {
     #[test]
     fn compile_failure_yields_null_execution() {
         let token = "p".repeat(64);
-        let body = serde_json::json!({"source": "while 1 do false end", "stdin": ""}).to_string();
+        let body = serde_json::json!({"source": "while nil do false end", "stdin": ""}).to_string();
         let response = request(
             format!(
                 "POST /api/run HTTP/1.1\r\nHost: 127.0.0.1:0\r\nOrigin: http://127.0.0.1:0\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Snacc-Session: {}\r\n\r\n{}",

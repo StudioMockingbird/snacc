@@ -1,6 +1,6 @@
 # Specification 027: Boolean and Comparison Operators
 
-Status: Proposed
+Status: Closed
 
 Document kind: Language semantics (ISO/IEC-style specification)
 
@@ -26,7 +26,7 @@ the operator meanings defined here.
 
 This specification depends on:
 
-- [Specification 020](020-literal-cleanup-and-numeric-radices.md) for the
+- [Specification 020](archive/020-literal-cleanup-and-numeric-radices.md) for the
   numeric types and their arithmetic operands; and
 - [Specification 021](021-truthiness-and-equality.md) for equality admissibility,
   exact operand types, and the NaN invariant.
@@ -270,3 +270,5 @@ Implementation is complete only when:
 8. `LANGUAGE.md`, `GRAMMAR.ebnf`, parser, checker, lowering, diagnostics, and
    tests agree; and
 9. formatting, checking, and the relevant test suites pass.
+
+

@@ -1,6 +1,6 @@
 # Specification 024: Error Handling
 
-Status: Proposed
+Status: Closed
 
 Document kind: Language semantics (ISO/IEC-style specification)
 
@@ -28,7 +28,7 @@ This specification depends on:
   values;
 - [Specification 018](archive/018-inline-sum-types.md) for `T | Error`, injection,
   decomposition, and representation; and
-- [Specification 026](026-return-statements.md) for early return, result
+- [Specification 026](archive/026-return-statements.md) for early return, result
   materialization, reachability, and cleanup-bearing return edges.
 
 [Specification 025](025-defer.md) extends the cleanup performed by an error
@@ -536,7 +536,7 @@ information in `message` when it is relevant.
 - [`LANGUAGE.md`](../../LANGUAGE.md)
 - [RFC 017: UTF-8 Strings and Views](017-utf8-strings-and-views.md)
 - [Specification 018: Inline Sum Types](archive/018-inline-sum-types.md)
-- [Specification 021: Truthiness and Equality](021-truthiness-and-equality.md)
+- [Specification 021: Truthiness and Equality](archive/021-truthiness-and-equality.md)
 - [Specification 023: Input and Output](023-input-and-output.md)
 - [Specification 025: Defer](025-defer.md)
-- [Specification 026: Return Statements](026-return-statements.md)
+- [Specification 026: Return Statements](archive/026-return-statements.md)
